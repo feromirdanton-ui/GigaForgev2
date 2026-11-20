@@ -1471,7 +1471,7 @@ class TaskPipeline:
             kind = classify_task(ctx.state.goal, self._repo_root())
             ctx.extras["task_kind"] = kind.to_dict()
             self._event("pipeline.task_kind", run_id=ctx.run_id,
-                        kind=kind.kind, evidence=kind.evidence[:300])
+                        task_kind=kind.kind, evidence=kind.evidence[:300])
             if kind.is_artifact:
                 # ``--subagents`` used to be a silent no-op on a page goal: the
                 # artifact branch returned the sectional path and the flag was
@@ -1688,7 +1688,7 @@ class TaskPipeline:
                 kind = classify_task(_original_goal(ctx.state.goal), self._repo_root())
                 ctx.extras["task_kind"] = kind.to_dict()
                 self._event("pipeline.task_kind", run_id=ctx.run_id,
-                            kind=kind.kind, evidence=kind.evidence[:300])
+                            task_kind=kind.kind, evidence=kind.evidence[:300])
                 if kind.is_artifact:
                     prefetched = self._sectional_generation(ctx)
             except Exception as exc:  # noqa: BLE001 - fall back to the coder
