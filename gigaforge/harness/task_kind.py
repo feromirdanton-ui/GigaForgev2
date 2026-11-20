@@ -14,16 +14,40 @@ landing-page generation, the model's correct ``db.py`` diff was thrown away, an
 file.  The run did the wrong work and reported the wrong artifact.
 
 The routing question has a deterministic answer, and it is not in the prose: a
-page goal **names an ``.html`` path that does not exist in the repository**.
-That is a filesystem fact.  A code goal names files that are already there.
+page goal **names an ``.html`` path**.  Whether that path is already in the
+repository decides *which* artifact workflow runs, not whether one runs at all:
+
+* absent → ``artifact`` — the run is asked to create the page;
+* present → ``artifact_edit`` — the run is asked to change a page that exists.
+
+**Why the second case is its own kind.**  The first version of this module
+returned ``code`` for an existing ``.html`` path, on the reasoning that "the
+file is there, so this is a change to a file".  Measured on the real pipeline:
+
+    code | Update index.html to add a footer and a hero section
+    code | Add a pricing section to index.html
+    code | Redesign the landing page in index.html
+
+and the consequence chained: ``_sectional_generation`` never ran, so there was
+no section plan; ``ctx.extras["generation"]`` stayed empty, so
+``requirements_from_plan`` was never called; the contract fell back to
+``extract_requirements``, which returns two bare requirements for "add a footer
+and a hero section" and none of ``min_size``/``substance``/``heading`` (those
+are only added at three or more).  A page being *edited* was therefore graded
+more weakly than a page being *created* — and editing is the common case: you
+create a page once and change it many times.
+
+So an existing artifact path is ``artifact_edit``: the same sectional workflow,
+seeded with the file's current content, and the same contract.
+
 Everything else is a guess, and a guess is what produced the defect.
 
 So the decision is made in this order, and each step is evidence:
 
 1. **Paths named in the goal, resolved against the repository.**
-   * an ``.html``/``.htm``/``.css`` path that is *absent* → artifact work
-     (the run is being asked to create it);
-   * a path that *exists* → code work (the run is being asked to change it);
+   * an ``.html``/``.htm``/``.css`` path that is *absent* → ``artifact``;
+   * an ``.html``/``.htm``/``.css`` path that *exists* → ``artifact_edit``;
+   * a code path that exists → code work;
    * a code path that is absent → code work (creating a module is still code).
 2. **Explicit page phrases**, only when no path was named at all:
    ``landing page``, ``web page``, ``webpage``, ``website``, ``web site``,
@@ -89,10 +113,13 @@ PAGE_PHRASES: tuple[str, ...] = (
 class TaskKind:
     """The harness's verdict about what a goal asks for, with its evidence."""
 
-    kind: Literal["code", "artifact", "mixed"]
+    kind: Literal["code", "artifact", "artifact_edit", "mixed"]
     #: Artifact paths the goal names that are **absent** from the repository.
     artifact_paths: tuple[str, ...] = ()
-    #: Paths the goal names that **exist** in the repository.
+    #: Artifact paths the goal names that **exist** in the repository — the
+    #: page is being edited, not created.
+    edit_paths: tuple[str, ...] = ()
+    #: Paths the goal names that **exist** in the repository and are code.
     code_paths: tuple[str, ...] = ()
     #: Why this verdict — written to the ledger, shown in the report.
     evidence: str = ""
@@ -101,7 +128,12 @@ class TaskKind:
 
     @property
     def is_artifact(self) -> bool:
-        return self.kind in ("artifact", "mixed")
+        return self.kind in ("artifact", "artifact_edit", "mixed")
+
+    @property
+    def is_edit(self) -> bool:
+        """True when the artifact already exists and is being changed."""
+        return self.kind == "artifact_edit"
 
     @property
     def is_code(self) -> bool:
@@ -111,6 +143,7 @@ class TaskKind:
         return {
             "kind": self.kind,
             "artifact_paths": list(self.artifact_paths),
+            "edit_paths": list(self.edit_paths),
             "code_paths": list(self.code_paths),
             "unresolved": list(self.unresolved),
             "evidence": self.evidence,
@@ -182,6 +215,7 @@ def classify_task(goal: str, repo_root: Path | str | None = None) -> TaskKind:
     named = _named_paths(goal or "")
 
     artifact_paths: list[str] = []
+    edit_paths: list[str] = []
     code_paths: list[str] = []
     unresolved: list[str] = []
 
@@ -192,7 +226,12 @@ def classify_task(goal: str, repo_root: Path | str | None = None) -> TaskKind:
             exists = bool(root is not None and (root / rel).is_file())
         else:
             exists = tracked
-        if exists:
+        if exists and suffix in _ARTIFACT_SUFFIXES:
+            # An artifact that is already in the repository: the run is asked
+            # to change it.  This is ``artifact_edit``, not ``code`` — see the
+            # module docstring for the measured consequence of conflating them.
+            edit_paths.append(rel)
+        elif exists:
             code_paths.append(rel)
         elif suffix in _ARTIFACT_SUFFIXES:
             # An artifact path that is not in the repository: the run is asked
@@ -204,18 +243,30 @@ def classify_task(goal: str, repo_root: Path | str | None = None) -> TaskKind:
         else:
             unresolved.append(rel)
 
-    if artifact_paths and code_paths:
-        kind: Literal["code", "artifact", "mixed"] = "mixed"
+    if artifact_paths and (code_paths or edit_paths):
+        kind: Literal["code", "artifact", "artifact_edit", "mixed"] = "mixed"
         evidence = (
             "goal names artifact path(s) absent from the repo "
             f"({', '.join(artifact_paths)}) and existing path(s) "
-            f"({', '.join(code_paths)})"
+            f"({', '.join([*edit_paths, *code_paths])})"
+        )
+    elif edit_paths and code_paths:
+        kind = "mixed"
+        evidence = (
+            "goal names an existing page to edit "
+            f"({', '.join(edit_paths)}) and existing code ({', '.join(code_paths)})"
         )
     elif artifact_paths:
         kind = "artifact"
         evidence = (
             "goal names artifact path(s) that do not exist in the repo: "
             + ", ".join(artifact_paths)
+        )
+    elif edit_paths:
+        kind = "artifact_edit"
+        evidence = (
+            "goal names artifact path(s) that already exist in the repo, so the "
+            "page is being edited: " + ", ".join(edit_paths)
         )
     elif code_paths:
         kind = "code"
@@ -236,6 +287,7 @@ def classify_task(goal: str, repo_root: Path | str | None = None) -> TaskKind:
     return TaskKind(
         kind=kind,
         artifact_paths=tuple(artifact_paths),
+        edit_paths=tuple(edit_paths),
         code_paths=tuple(code_paths),
         evidence=evidence,
         unresolved=tuple(unresolved),

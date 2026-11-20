@@ -2388,9 +2388,31 @@ class TaskPipeline:
             generation = ctx.extras.get("generation") or {}
             if generation.get("sections"):
                 try:
-                    from gigaforge.harness.generation import plan_generation
+                    from gigaforge.harness.generation import (
+                        GenerationPlan,
+                        SectionPlan,
+                        plan_generation,
+                    )
 
-                    plan = plan_generation(_original_goal(ctx.state.goal))
+                    # The plan the page was BUILT from, not a fresh derivation
+                    # from the goal text.  Re-deriving was a second source of
+                    # truth: on an edit the build plan is the union of the
+                    # page's existing sections and the goal's, and re-deriving
+                    # from the goal alone produced a different plan — so the
+                    # contract demanded sections the assembler never planned.
+                    stored = ctx.extras.get("generation_plan") or {}
+                    if stored.get("sections"):
+                        plan = GenerationPlan(
+                            path=str(stored.get("path") or "index.html"),
+                            sections=[
+                                SectionPlan(kind=kind, heading=kind.title(), index=index)
+                                for index, kind in enumerate(stored["sections"])
+                            ],
+                            palette=tuple(stored.get("palette") or ()),
+                            title=str(stored.get("title") or ""),
+                        )
+                    else:
+                        plan = plan_generation(_original_goal(ctx.state.goal))
                     requirements = requirements_from_plan(plan)
                     self._event("pipeline.contract_from_plan", run_id=ctx.run_id,
                                 sections=plan.kinds(), palette=list(plan.palette),
@@ -2703,15 +2725,45 @@ class TaskPipeline:
         """
         from gigaforge.harness.generation import (
             assemble_page,
+            existing_sections,
             plan_generation,
             section_prompt,
         )
 
-        plan = plan_generation(_original_goal(ctx.state.goal))
+        # An EDIT of an existing page runs the same sectional workflow as a
+        # creation, seeded with the page that is already there.  Routing an
+        # existing ``.html`` to the code path was the P0 defect: no section
+        # plan, so ``requirements_from_plan`` never ran, so the contract fell
+        # back to two bare regex requirements and graded an edit more weakly
+        # than a creation.  Editing is the common case — you create a page once
+        # and change it many times.
+        kind_info = ctx.extras.get("task_kind") or {}
+        edit_paths = list(kind_info.get("edit_paths") or [])
+        root = self._repo_root()
+        existing_html = ""
+        existing_path = ""
+        if edit_paths:
+            candidate = (root / edit_paths[0]).resolve()
+            try:
+                candidate.relative_to(root)
+            except ValueError:
+                candidate = None  # type: ignore[assignment]
+            if candidate is not None and candidate.is_file():
+                existing_path = edit_paths[0]
+                existing_html = candidate.read_text(encoding="utf-8", errors="replace")
+                self._event("pipeline.generation_edit_mode", run_id=ctx.run_id,
+                            path=existing_path, bytes=len(existing_html))
+
+        plan = plan_generation(_original_goal(ctx.state.goal), existing_html)
         if not plan.ok:
             return ""
+        if existing_path:
+            # The page being edited is the one that exists, whatever the goal
+            # called it.
+            plan = replace(plan, path=existing_path)
         self._event("pipeline.generation_plan", run_id=ctx.run_id,
-                    path=plan.path, sections=plan.kinds(), palette=list(plan.palette))
+                    path=plan.path, sections=plan.kinds(), palette=list(plan.palette),
+                    edit=bool(existing_path))
 
         # Sections are independent by construction — each has its own kind, its
         # own anchor and its own fragment — so they are generated concurrently.
@@ -2721,6 +2773,17 @@ class TaskPipeline:
         # not serialise it.
         fragments: dict[str, str] = {}
         failures: list[str] = []
+        # On an edit, a section the page already has is kept verbatim unless the
+        # goal names it.  Regenerating it would discard work the user already
+        # had — and the goal "add a footer" does not ask for a new hero.
+        present = existing_sections(existing_html) if existing_html else {}
+        goal_low = _original_goal(ctx.state.goal).lower()
+        to_build = [
+            section for section in plan.sections
+            if not (present.get(section.kind) and section.kind not in goal_low)
+        ]
+        if not to_build:
+            to_build = list(plan.sections)
 
         def build_section(section: Any) -> tuple[str, str, list[str]]:
             prompt = section_prompt(plan, section, ctx.state.goal)
@@ -2735,15 +2798,15 @@ class TaskPipeline:
                     return section.kind, answer, errors
             return section.kind, "", errors
 
-        workers = min(len(plan.sections), int(getattr(self.config, "max_workers", 4) or 4))
-        if workers > 1 and len(plan.sections) > 1:
+        workers = min(len(to_build), int(getattr(self.config, "max_workers", 4) or 4))
+        if workers > 1 and len(to_build) > 1:
             from concurrent.futures import ThreadPoolExecutor
 
             with ThreadPoolExecutor(max_workers=workers,
                                     thread_name_prefix="section") as pool:
-                outcomes = list(pool.map(build_section, plan.sections))
+                outcomes = list(pool.map(build_section, to_build))
         else:
-            outcomes = [build_section(section) for section in plan.sections]
+            outcomes = [build_section(section) for section in to_build]
 
         for kind, answer, errors in outcomes:
             for error in errors:
@@ -2761,7 +2824,7 @@ class TaskPipeline:
                         sections=plan.kinds())
             return ""
 
-        page = assemble_page(plan, fragments)
+        page = assemble_page(plan, fragments, existing=present)
         root = self._repo_root()
         target = (root / plan.path).resolve()
         try:
@@ -2777,6 +2840,20 @@ class TaskPipeline:
             "sections": plan.kinds(),
             "written": sorted(fragments),
             "failed": failures,
+            "edit": bool(existing_path),
+            "reused": sorted(k for k in present if k not in fragments),
+        }
+        # The plan itself is kept, not just its section names.  The contract used
+        # to re-derive it from the goal text with ``plan_generation(goal)``, which
+        # is a second source of truth: on an edit the plan is the union of the
+        # page's existing sections and the goal's, and re-deriving it from the
+        # goal alone produced a *different* plan than the one the page was built
+        # from — so the contract demanded sections the assembler never planned.
+        ctx.extras["generation_plan"] = {
+            "path": plan.path,
+            "sections": plan.kinds(),
+            "palette": list(plan.palette),
+            "title": plan.title,
         }
         self._event("pipeline.generation_assembled", run_id=ctx.run_id,
                     path=plan.path, bytes=len(page),

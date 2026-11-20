@@ -67,11 +67,33 @@ class TestArtifactDetection:
         assert kind.kind == "artifact"
         assert kind.artifact_paths == ("index.html",)
 
-    def test_existing_html_path_is_code(self, repo: Path) -> None:
+    def test_existing_html_path_is_an_edit_not_code(self, repo: Path) -> None:
+        """An existing page is EDITED, not treated as a code change.
+
+        This test used to assert ``code``, and that assertion was the P0 defect
+        written down: routing an existing ``.html`` to the code path skipped
+        ``_sectional_generation``, so there was no section plan, so
+        ``requirements_from_plan`` never ran, so the contract fell back to two
+        bare regex requirements and graded an edit more weakly than a creation.
+        """
         (repo / "index.html").write_text("<html></html>", encoding="utf-8")
         kind = classify_task("Fix the broken footer in index.html", repo)
-        assert kind.kind == "code"
-        assert kind.code_paths == ("index.html",)
+        assert kind.kind == "artifact_edit"
+        assert kind.edit_paths == ("index.html",)
+        assert kind.is_artifact and kind.is_edit
+        assert "already exist" in kind.evidence
+
+    def test_editing_a_page_keeps_the_artifact_workflow(self, repo: Path) -> None:
+        """The three ordinary ways to ask for an edit all route to artifact_edit."""
+        (repo / "index.html").write_text("<html></html>", encoding="utf-8")
+        for goal in (
+            "Update index.html to add a footer and a hero section",
+            "Add a pricing section to index.html",
+            "Redesign the landing page in index.html",
+        ):
+            kind = classify_task(goal, repo)
+            assert kind.kind == "artifact_edit", f"{goal!r} -> {kind.kind}"
+            assert kind.is_artifact, f"{goal!r} lost the artifact workflow"
 
     def test_page_phrase_without_a_path_is_an_artifact_goal(self, repo: Path) -> None:
         kind = classify_task("Build a website for my bakery", repo)

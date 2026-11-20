@@ -68,18 +68,26 @@ class TestRoutingIgnoresTheRunsOwnOutput:
         )
         assert kind.artifact_paths == ("index.html",)
 
-    def test_a_committed_page_is_a_code_goal(self, tmp_path: Path) -> None:
+    def test_a_committed_page_is_an_edit_goal(self, tmp_path: Path) -> None:
+        """A committed page is still a page: the run is asked to change it.
+
+        This used to assert ``code``.  The reasoning was "the file is there, so
+        this is a change to a file" — but a change to a *page* is an artifact
+        edit, and routing it to the code path graded it more weakly than a
+        creation (no section plan, no plan-derived contract).
+        """
         _git(tmp_path)
         (tmp_path / "index.html").write_text("<html></html>", encoding="utf-8")
         subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
         subprocess.run(["git", "commit", "-qm", "page"], cwd=tmp_path, check=True)
         kind = classify_task("Fix the broken footer in index.html", tmp_path)
-        assert kind.kind == "code"
+        assert kind.kind == "artifact_edit"
+        assert kind.edit_paths == ("index.html",)
 
     def test_a_non_git_tree_falls_back_to_the_working_tree(self, tmp_path: Path) -> None:
         (tmp_path / "index.html").write_text("<html></html>", encoding="utf-8")
         kind = classify_task("Fix the broken footer in index.html", tmp_path)
-        assert kind.kind == "code"
+        assert kind.kind == "artifact_edit"
 
     def test_the_composite_trap_still_holds(self, tmp_path: Path) -> None:
         _git(tmp_path)

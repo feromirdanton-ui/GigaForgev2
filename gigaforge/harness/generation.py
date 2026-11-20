@@ -134,19 +134,35 @@ def is_page_goal(goal: str, repo_root: "Path | str | None" = None) -> bool:
     return is_artifact_goal(goal, repo_root)
 
 
-def plan_generation(goal: str) -> GenerationPlan:
+def plan_generation(goal: str, existing_html: str = "") -> GenerationPlan:
     """Derive the artifact's shape from the goal, deterministically.
 
     The plan is a checklist of what the brief names.  It is deliberately
     conservative: a section appears only when the goal mentions it, and a goal
     that names none gets the minimum landing-page shape rather than an empty
     plan.
+
+    ``existing_html`` is the page being **edited**.  When it is given, the plan
+    is the union of the sections already on the page and the sections the goal
+    asks for, in catalogue order — so "add a footer and a hero section" to a
+    page that already has a hero and a grid plans ``hero, features, footer``
+    and the child is only asked for what is missing.  Without this, an edit
+    either regenerated the whole page (losing what was there) or fell through
+    to the code path and was graded by a weaker contract.
     """
     low = (goal or "").lower()
     chosen: list[str] = []
     for kind, triggers, _heading in _SECTION_CATALOGUE:
         if any(re.search(rf"\b{re.escape(trigger)}\b", low) for trigger in triggers):
             chosen.append(kind)
+
+    present: list[str] = []
+    if existing_html:
+        present = list(existing_sections(existing_html))
+        for kind in present:
+            if kind not in chosen:
+                chosen.append(kind)
+
     if not chosen:
         chosen = list(_DEFAULT_SHAPE)
     # A page always ends with a footer; a brief that names sections but not a
@@ -168,6 +184,15 @@ def plan_generation(goal: str) -> GenerationPlan:
                           "red", "blue", "yellow", "pink", "gold")
         if re.search(rf"\b{word}\b", low)
     )
+    if not palette and existing_html:
+        # An edit that names no palette keeps the page's own colours rather
+        # than repainting it with the default.  The palette is read from the
+        # page's CSS declarations, which is a string operation.
+        palette = tuple(
+            word for word in ("cyan", "magenta", "purple", "violet", "orange",
+                              "green", "red", "blue", "yellow", "pink", "gold")
+            if re.search(rf"\b{word}\b", existing_html, re.I)
+        )
 
     path = "index.html"
     match = re.search(r"\b([\w./-]+\.html?)\b", goal or "", re.I)
@@ -177,7 +202,62 @@ def plan_generation(goal: str) -> GenerationPlan:
             path = candidate
 
     title = _derive_title(goal)
+    if title == "Landing page" and existing_html:
+        found = re.search(r"<title\b[^>]*>(.*?)</title\s*>", existing_html, re.S | re.I)
+        if found and found.group(1).strip():
+            title = found.group(1).strip()
     return GenerationPlan(path=path, sections=sections, palette=palette, title=title)
+
+
+#: A top-level section of an existing page: ``<section class="hero">…</section>``,
+#: ``<footer>…</footer>``, ``<nav>…</nav>``.  Matched with a depth counter so a
+#: nested ``<section>`` inside a section does not end the outer one early.
+_SECTION_OPEN_RE = re.compile(
+    r"<(section|footer|nav|header)\b([^>]*)>", re.I
+)
+
+
+def existing_sections(html: str) -> dict[str, str]:
+    """The top-level sections of an existing page, keyed by kind.
+
+    The kind is the first class token that the catalogue knows (``hero``,
+    ``features``, ``footer``…), falling back to the tag name.  This is how an
+    edit keeps what the page already has: the assembler reuses these fragments
+    for any section the child was not asked to rewrite.
+    """
+    out: dict[str, str] = {}
+    if not html:
+        return out
+    known = {kind for kind, _t, _h in _SECTION_CATALOGUE}
+    for match in _SECTION_OPEN_RE.finditer(html):
+        tag = match.group(1).lower()
+        attrs = match.group(2) or ""
+        class_match = re.search(r'class\s*=\s*["\']([^"\']*)["\']', attrs, re.I)
+        tokens = (class_match.group(1).split() if class_match else [])
+        kind = next((t for t in tokens if t in known), "")
+        if not kind:
+            kind = {"footer": "footer", "nav": "nav", "header": "nav"}.get(tag, "")
+        if not kind:
+            # A section with no catalogue class: name it by its position so it
+            # is still preserved rather than dropped.
+            kind = f"section{len(out) + 1}"
+        if kind in out:
+            continue
+        # Find the matching close tag with a depth counter.
+        depth = 1
+        cursor = match.end()
+        token = re.compile(rf"<(/?){re.escape(tag)}\b[^>]*>", re.I)
+        end = len(html)
+        while depth and cursor < len(html):
+            step = token.search(html, cursor)
+            if step is None:
+                break
+            depth += -1 if step.group(1) else 1
+            cursor = step.end()
+            if depth == 0:
+                end = step.end()
+        out[kind] = html[match.start():end].strip()
+    return out
 
 
 def _derive_title(goal: str) -> str:
@@ -464,12 +544,23 @@ def _fallback_section(section: "SectionSpec", plan: "GenerationPlan") -> str:
     return ""
 
 
-def assemble_page(plan: GenerationPlan, fragments: dict[str, str], *, css: str = "") -> str:
+def assemble_page(
+    plan: GenerationPlan,
+    fragments: dict[str, str],
+    *,
+    css: str = "",
+    existing: dict[str, str] | None = None,
+) -> str:
     """Assemble the final page from per-section fragments.
 
     The skeleton is the harness's, so the result is structurally valid by
     construction: one doctype, one ``<html>``, one ``<head>``, one ``<style>``,
     one ``<body>``, and each section exactly once in catalogue order.
+
+    ``existing`` holds the sections of the page being edited.  A section the
+    child was not asked to rewrite is reused verbatim from there, so an edit
+    adds what the goal asked for and keeps everything else — the alternative,
+    regenerating the whole page, silently discards work the user already had.
     """
     palette = plan.palette or ("cyan", "magenta")
     accent = palette[0]
@@ -478,6 +569,10 @@ def assemble_page(plan: GenerationPlan, fragments: dict[str, str], *, css: str =
     child_css: list[str] = []
     for section in plan.sections:
         raw = fragments.get(section.kind, "")
+        reused = False
+        if not raw.strip() and existing:
+            raw = existing.get(section.kind, "")
+            reused = bool(raw.strip())
         fragment = _strip_document_wrapper(raw)
         if not fragment:
             # A planned section with no fragment used to be skipped silently, so
@@ -495,6 +590,11 @@ def assemble_page(plan: GenerationPlan, fragments: dict[str, str], *, css: str =
             self_note = f"<!-- {section.kind}: filled by the harness, child returned nothing -->"
             fragment = f"{self_note}\n{fragment}"
         body_parts.append(f"    {section.anchor}\n    {fragment}")
+        if reused:
+            # The section came from the page being edited: its rules are
+            # already in that page's stylesheet, and re-scoping them would
+            # change how it looks.
+            continue
         # The child's own rules are kept, scoped to its section.  Dropping them
         # was the defect: a child told "draw with CSS" had its CSS deleted, so
         # its @keyframes never reached the page.
