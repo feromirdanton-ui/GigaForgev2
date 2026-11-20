@@ -101,4 +101,9 @@ class TestTheSectionalGeneratorRecordsItsContent:
 
         source = inspect.getsource(TaskPipeline._node_act)
         assert "_restore_harness_owned" in source
-        assert source.index("_restore_harness_owned") < source.index("ProposeResult(")
+        # ``ProposeResult(`` also appears in the ``propose`` closure, so the
+        # anchor is the final construction, which is the one that becomes the
+        # node's output.
+        assert source.index("_restore_harness_owned") < source.index(
+            "proposal = ProposeResult("
+        )
