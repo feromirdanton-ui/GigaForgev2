@@ -420,12 +420,69 @@ def build_goal_graph(
         else:
             payload = {"decision": str(decision or "apply")}
         payload.setdefault("decision", "apply")
+
+        # ``abort`` ends the whole task, so the record must say so.  Routing it
+        # to ``stop`` without recording a reason left the run reporting
+        # "cycle limit reached before verification passed" — a statement about
+        # the cycle budget that is simply false when the user said stop.
+        if str(payload.get("decision")) == "abort":
+            reason = str(payload.get("reason") or "aborted by the user")
+            _emit(
+                "goal.approval_abort",
+                node="\u0421\u043e\u0433\u043b\u0430\u0441\u043e\u0432\u0430\u043d\u0438\u0435",
+                status="\u0417\u0430\u0434\u0430\u0447\u0430 \u043f\u0440\u0435\u0440\u0432\u0430\u043d\u0430",
+                goal_id=state.get("goal_id"),
+                summary=_safe_excerpt(reason, limit=400),
+            )
+            return {
+                "approval": payload,
+                "status": "cancelled",
+                "accepted": False,
+                "error": reason,
+            }
+
+        # ``edit``: the human's diff replaces the pipeline's.  It is applied to
+        # the workspace copy here, inside the node, so the publish step that
+        # follows publishes what was actually approved.  A diff that does not
+        # apply is refused and the run records why \u2014 publishing a diff that was
+        # never applied is the failure this gate exists to prevent.
+        if str(payload.get("decision")) == "edit":
+            edited = str(payload.get("edited_diff") or "")
+            ok, paths, error = _apply_edited_diff(
+                edited,
+                root=root,
+                workspace=workspace,
+                changed_files=list(state.get("changed_files") or []),
+            )
+            if not ok:
+                _emit(
+                    "goal.approval_edit_failed",
+                    node="\u0421\u043e\u0433\u043b\u0430\u0441\u043e\u0432\u0430\u043d\u0438\u0435",
+                    status="\u041f\u0440\u0430\u0432\u043a\u0430 \u043e\u0442\u043a\u043b\u043e\u043d\u0435\u043d\u0430",
+                    goal_id=state.get("goal_id"),
+                    summary=_safe_excerpt(error, limit=400),
+                )
+                return {
+                    "approval": {"decision": "abort", "reason": error},
+                    "error": error,
+                }
+            payload["changed_files"] = paths
+            return {
+                "approval": payload,
+                "pending_diff": edited,
+                "changed_files": paths,
+            }
+
         return {"approval": payload}
 
     def publish(state: GoalState) -> dict[str, Any]:
         """Publish verified files atomically, or record why we did not."""
         decision = str((state.get("approval") or {}).get("decision") or "apply")
-        if decision != "apply":
+        # ``edit`` is an approval: the human changed the diff and said go.  It
+        # used to fall into the refusal branch, so an edited diff was applied to
+        # the workspace and then never published — the run reported "declined by
+        # the user: edit" for a decision that meant the opposite.
+        if decision not in ("apply", "edit"):
             return {
                 "status": "needs_attention",
                 "accepted": False,
@@ -475,6 +532,12 @@ def build_goal_graph(
 
     def after_approve(state: GoalState) -> str:
         decision = str((state.get("approval") or {}).get("decision") or "apply")
+        if decision == "abort":
+            # ``abort`` is the one decision that ends the whole task: the user
+            # said stop, not "try again".  Routing it to ``publish`` would
+            # record a refusal and end the run anyway, but it would also run
+            # the publish node, which is not what "abort" means.
+            return "stop"
         if decision != "apply":
             # A declined diff is final for this cycle: ``publish`` records the
             # refusal and ends the run, so the reason survives in the record.
@@ -504,15 +567,125 @@ def build_goal_graph(
     return graph.compile(checkpointer=checkpointer)
 
 
-def _decide(payload: Mapping[str, Any], approve: Optional[Callable[[str], bool]]) -> dict[str, Any]:
-    """Turn the existing ``approve`` callable into an ``interrupt()`` answer."""
-    if approve is None:
+def _parse_diff_paths(diff: str) -> list[str]:
+    """The file paths a unified diff touches, from its ``+++`` headers.
+
+    Used to derive ``changed_files`` from a human-edited diff.  ``/dev/null``
+    (a file creation) is skipped: it is not a path.
+    """
+    paths: list[str] = []
+    for line in str(diff or "").splitlines():
+        if not line.startswith("+++ "):
+            continue
+        raw = line[4:].strip()
+        if raw.startswith("b/"):
+            raw = raw[2:]
+        if raw in ("", "/dev/null"):
+            continue
+        if raw not in paths:
+            paths.append(raw)
+    return paths
+
+
+def _apply_edited_diff(
+    edited: str,
+    *,
+    root: Path,
+    workspace: Any,
+    changed_files: Sequence[str],
+) -> tuple[bool, list[str], str]:
+    """Put a human-edited diff onto the workspace copy.
+
+    Returns ``(ok, paths, error)``.
+
+    The pipeline has already applied *its* diff to the workspace copy, so the
+    edited diff cannot simply be applied on top \u2014 it would conflict with the
+    changes it is meant to replace.  The changed files are therefore restored
+    from the untouched destination first, and the edited diff is applied to that
+    clean state.  If it does not apply, the edit is refused and the run records
+    why: publishing a diff that was never applied is exactly the failure mode
+    this gate exists to prevent.
+    """
+    from gigaforge.core.diff_validator import DiffValidator
+
+    paths = _parse_diff_paths(edited)
+    if not paths:
+        return False, [], "the edited diff has no +++ headers, so it changes nothing"
+    if workspace is None:
+        return False, [], "no isolated workspace to apply the edited diff to"
+
+    # Restore the files the pipeline changed, so the edited diff applies to the
+    # same base the pipeline started from.
+    for relative in list(changed_files) + paths:
+        source = Path(workspace.destination) / relative
+        target = Path(workspace.root) / relative
+        try:
+            if source.is_file():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(source.read_bytes())
+            elif target.exists():
+                target.unlink()
+        except OSError as exc:
+            return False, [], f"could not restore {relative!r}: {exc}"
+
+    result = DiffValidator().validate_and_apply(
+        edited, Path(root), worktree=Path(workspace.root)
+    )
+    if not getattr(result, "ok", False):
+        return False, [], f"the edited diff did not apply: {getattr(result, 'reason', '')}"[:400]
+    return True, paths, ""
+
+
+def _decide(
+    payload: Mapping[str, Any],
+    approve: Optional[Callable[[str], bool]],
+    gate: Any = None,
+) -> dict[str, Any]:
+    """Turn the configured gate into an ``interrupt()`` answer.
+
+    Two shapes are accepted, and the richer one wins:
+
+    * ``gate`` \u2014 an :class:`~gigaforge.core.approval.ApprovalGate`.  Its
+      ``review`` returns an :class:`ApprovalResult`, so all four decisions
+      (apply / reject / edit / abort) are reachable, and ``edit`` carries the
+      human's diff back into the graph.
+    * ``approve`` \u2014 the older ``Callable[[str], bool]``.  Kept because it is
+      the documented signature and callers depend on it; it can only express
+      apply and reject.
+
+    A gate that raises is treated as ``abort``: a broken gate must not publish.
+    """
+    if gate is None and approve is None:
         return {"decision": "apply", "reason": "no gate configured"}
+
     diff = str(payload.get("diff") or "")
     files = ", ".join(payload.get("changed_files") or [])
     summary = f"Goal {payload.get('goal_id')} cycle {payload.get('cycle_index')}: {files}"
+    prompt = f"{summary}\n\n{diff}"
+
+    if gate is not None:
+        try:
+            from gigaforge.core.sync_adapter import await_blocking
+
+            result = await_blocking(
+                gate.review(
+                    diff,
+                    payload.get("verification") or {},
+                    task_id=str(payload.get("goal_id") or ""),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - a broken gate must not publish
+            return {"decision": "abort", "reason": f"gate raised: {exc}"}
+        decision = getattr(result, "decision", None)
+        decision = getattr(decision, "value", decision) or "apply"
+        return {
+            "decision": str(decision),
+            "edited_diff": str(getattr(result, "edited_diff", "") or ""),
+            "reason": str(getattr(result, "reason", "") or "gate"),
+        }
+
     try:
-        ok = bool(approve(f"{summary}\n\n{diff}"))
+        ok = bool(approve(prompt))  # type: ignore[misc]
     except Exception as exc:  # noqa: BLE001 - a broken gate must not publish
         return {"decision": "abort", "reason": f"gate raised: {exc}"}
     return {"decision": "apply" if ok else "reject", "reason": "gate"}
@@ -532,6 +705,7 @@ def run_goal_graph(
     symbols: Sequence[str] = (),
     budget_tokens: int = 0,
     approve: Optional[Callable[[str], bool]] = None,
+    gate: Any = None,
     cancellation: Optional[CancellationToken] = None,
     verifier: Optional[Verifier] = None,
     store: Optional[GoalStore] = None,
@@ -630,7 +804,7 @@ def run_goal_graph(
                 "files": list(files),
                 "symbols": list(symbols),
                 "budget_tokens": int(budget_tokens),
-                "require_approval": approve is not None,
+                "require_approval": approve is not None or gate is not None,
                 "cycles": [],
                 "status": "running",
                 "accepted": False,
@@ -658,7 +832,7 @@ def run_goal_graph(
                 "files": list(files),
                 "symbols": list(symbols),
                 "budget_tokens": int(budget_tokens),
-                "require_approval": approve is not None,
+                "require_approval": approve is not None or gate is not None,
                 "cycles": [],
                 "status": "running",
                 "accepted": False,
@@ -687,7 +861,7 @@ def run_goal_graph(
                 break
             if not snapshot["interrupts"]:
                 break
-            answer = _decide(snapshot["interrupts"][0].get("value") or {}, approve)
+            answer = _decide(snapshot["interrupts"][0].get("value") or {}, approve, gate)
             graph_input = Command(resume=answer)
 
         values = graph_state_summary(graph, config)["values"]
