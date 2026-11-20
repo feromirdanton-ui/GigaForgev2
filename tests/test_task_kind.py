@@ -1,6 +1,6 @@
 """Routing by fact, not by substring.
 
-The defect these tests pin: ``is_page_goal`` was
+The defect these tests pin: ``is_artifact_goal`` was
 ``any(hint in low for hint in _PAGE_HINTS)`` with ``"site"`` and ``"html"`` in
 the tuple.  ``"site" in "fix the composite index"`` is True, so a code goal was
 routed to landing-page generation, the model's correct diff was discarded, and
@@ -17,8 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from gigaforge.harness.generation import is_page_goal
-from gigaforge.harness.task_kind import classify_task
+from gigaforge.harness.task_kind import classify_task, is_artifact_goal
 
 #: Goals that contain "site" or "html" as a *substring* of another word.  The
 #: old implementation called every one of them a page goal.
@@ -45,14 +44,14 @@ def repo(tmp_path: Path) -> Path:
 class TestSubstringTraps:
     @pytest.mark.parametrize("goal", SUBSTRING_TRAPS)
     def test_not_a_page_goal_with_a_repo(self, goal: str, repo: Path) -> None:
-        assert not is_page_goal(goal, repo)
+        assert not is_artifact_goal(goal, repo)
 
     @pytest.mark.parametrize("goal", SUBSTRING_TRAPS)
     def test_not_a_page_goal_without_a_repo(self, goal: str) -> None:
         # Without a tree the decision falls back to explicit page phrases, and
         # none of these contains one.  The conservative direction matters: a
         # wrong "artifact" verdict writes a stray page and discards real work.
-        assert not is_page_goal(goal)
+        assert not is_artifact_goal(goal)
 
     def test_composite_goal_is_code(self, repo: Path) -> None:
         kind = classify_task("Fix the composite index in db.py", repo)
@@ -138,7 +137,7 @@ class TestSiteGoalStillRoutes:
         assert kind.artifact_paths == ("index.html",)
 
     def test_site_goal_without_a_repo_still_routes(self) -> None:
-        assert is_page_goal("Create a single-file index.html about the harness")
+        assert is_artifact_goal("Create a single-file index.html about the harness")
 
 
 class TestTaskKindRecord:

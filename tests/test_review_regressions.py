@@ -298,21 +298,52 @@ def test_python_bin_resolves_and_gives_a_bare_argv_name():
 
 
 def test_format_code_degrades_when_ruff_is_absent(tmp_path, monkeypatch):
-    """``lint()`` was fixed for this; ``format_code()`` one function below was not."""
+    """``lint()`` was fixed for this; ``format_code()`` one function below was not.
+
+    **This test was not hermetic.**  It patched ``lint_module.resolve_tool``, but
+    ``format_code`` imports ``resolve_tool`` from ``gigaforge.l0.toolchain``
+    *inside* the function, so the patch never took effect.  On a machine with
+    ruff installed the real formatter ran, rewrote ``x=1`` to ``x = 1``, and the
+    assertion ``text == "x=1\\n"`` failed — the suite reported 795 passed and 1
+    failed depending on what happened to be installed.  A test whose result
+    depends on the machine is not a test of the code.
+
+    The patch now targets the module the function actually reads, so the test
+    exercises the degradation path whether or not ruff is present.
+    """
     from gigaforge.l0 import lint as lint_module
+    from gigaforge.l0 import toolchain
 
     monkeypatch.setattr(
-        lint_module, "resolve_tool",
-        lambda name, override="": __import__(
-            "gigaforge.l0.toolchain", fromlist=["ResolvedTool"]
-        ).ResolvedTool(name=name, reason="not installed"),
-        raising=False,
+        toolchain,
+        "resolve_tool",
+        lambda name, override="": toolchain.ResolvedTool(
+            name=name, reason="not installed"
+        ),
+        raising=True,
     )
     target = tmp_path / "x.py"
     target.write_text("x=1\n", encoding="utf-8")
     ok, text = lint_module.format_code(target)
     assert ok, "a missing formatter must not fail the file"
-    assert text == "x=1\n"
+    assert text == "x=1\n", "the file must be returned unchanged, not reformatted"
+
+
+def test_format_code_uses_the_real_formatter_when_it_is_present(tmp_path):
+    """The other half of the same contract: present ruff must actually format.
+
+    Without this, the test above could pass by never formatting at all.
+    """
+    from gigaforge.l0 import lint as lint_module
+    from gigaforge.l0.toolchain import resolve_tool
+
+    if not resolve_tool("ruff").found:
+        pytest.skip("ruff is not installed on this machine")
+    target = tmp_path / "y.py"
+    target.write_text("y=1\n", encoding="utf-8")
+    ok, text = lint_module.format_code(target)
+    assert ok
+    assert text == "y = 1\n", "ruff format should have normalised the spacing"
 
 
 # --------------------------------------------------------------------------

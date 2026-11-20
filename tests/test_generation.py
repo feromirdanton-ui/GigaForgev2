@@ -13,11 +13,11 @@ import pytest
 
 from gigaforge.harness.generation import (
     assemble_page,
-    is_page_goal,
     plan_generation,
     section_prompt,
 )
 from gigaforge.harness.html_structure import audit_html_structure
+from gigaforge.harness.task_kind import classify_task
 
 SITE_GOAL = (
     "Create a single-file index.html: a futuristic cyberpunk landing page about "
@@ -29,12 +29,20 @@ SITE_GOAL = (
 CODE_GOAL = "Fix the failing test in tests/test_calc.py: mul returns the wrong value."
 
 
-class TestIsPageGoal:
-    def test_site_goal_is_a_page_goal(self) -> None:
-        assert is_page_goal(SITE_GOAL)
+class TestRouting:
+    """Routing is decided once, in ``classify_task``.
 
-    def test_code_goal_is_not_a_page_goal(self) -> None:
-        assert not is_page_goal(CODE_GOAL)
+    These two tests used to call ``is_page_goal`` — a second entry point that
+    answered the same question as ``classify_task`` and was kept alive only by
+    the tests that asserted on it.  Two sources of truth is two chances to fix
+    one of them, so the tests now go through the one the product uses.
+    """
+
+    def test_site_goal_is_an_artifact_goal(self) -> None:
+        assert classify_task(SITE_GOAL).is_artifact
+
+    def test_code_goal_is_not_an_artifact_goal(self) -> None:
+        assert not classify_task(CODE_GOAL).is_artifact
 
 
 class TestPlan:

@@ -66,24 +66,12 @@ _DEFAULT_SHAPE = ("hero", "features", "footer")
 
 #: Words that mean "this goal produces a single self-contained page".
 #:
-#: ``site`` and ``html`` used to be in this tuple, and they are substrings of
-#: *composite*, *parasite*, *opposite* and *html parser* — so "Fix the composite
-#: index in db.py" was routed to landing-page generation and the model's correct
-#: diff was discarded.  Routing is now decided by :mod:`gigaforge.harness.task_kind`
-#: from the filesystem; this tuple survives only as the phrase list that module
-#: consults when a goal names no path at all.
-_PAGE_HINTS = (
-    "landing page",
-    "single-file",
-    "single file",
-    "index.html",
-    "web page",
-    "webpage",
-    "website",
-    "web site",
-    "static page",
-    "home page",
-)
+#: The phrase list lives in :mod:`gigaforge.harness.task_kind` and is consulted
+#: there when a goal names no path at all.  It used to be duplicated here, and
+#: the duplicate was the defect: ``"site"`` is a substring of *composite*,
+#: *parasite*, *opposite* and *html parser*, so "Fix the composite index in
+#: db.py" was routed to landing-page generation and the model's correct diff was
+#: discarded.  Two copies of a rule is two chances to fix one of them.
 
 
 @dataclass(frozen=True)
@@ -117,17 +105,15 @@ class GenerationPlan:
 
 
 def is_page_goal(goal: str, repo_root: "Path | str | None" = None) -> bool:
-    """True when the goal asks for a self-contained page rather than a code change.
+    """Deprecated alias for :func:`gigaforge.harness.task_kind.is_artifact_goal`.
 
-    Delegates to :func:`gigaforge.harness.task_kind.classify_task`, which decides
-    from the filesystem instead of from a substring.  The old implementation was
-    ``any(hint in low for hint in _PAGE_HINTS)`` with ``"site"`` and ``"html"``
-    in the tuple, so "Fix the composite index in db.py" was a page goal and the
-    correct diff was thrown away.
+    Kept only so an external caller does not break.  The product does not call
+    it: routing is decided once, in ``classify_task``, and a second entry point
+    that answers the same question is a second source of truth — the review
+    found this one alive in the module while the product used the other, with
+    three tests still asserting on it.
 
-    ``repo_root`` is optional for callers that only have the text; without it
-    the decision falls back to explicit page phrases, which is the conservative
-    direction (no tree to check → do not invent an artifact).
+    New code must call ``classify_task`` and read ``TaskKind.is_artifact``.
     """
     from gigaforge.harness.task_kind import is_artifact_goal
 
