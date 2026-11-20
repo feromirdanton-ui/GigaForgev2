@@ -127,6 +127,18 @@ class PipelineResult:
     commits: list[str] = field(default_factory=list)
     escalation: Optional[dict[str, Any]] = None
     metrics: dict[str, Any] = field(default_factory=dict)
+    #: Did the plan the exploration phase produced reach the executor?  This is
+    #: the field that makes N1 a fact a caller can check instead of a review
+    #: finding.  It was added to the ledger and then never populated by the
+    #: pipeline — the same "field exists, product never reaches it" shape the
+    #: field was added to expose.  The live probe caught it: ``plan_used: false``
+    #: on a run whose plan had demonstrably been used.
+    plan_used: bool = False
+    plan_steps_executed: int = 0
+    plan_salvaged: bool = False
+    #: Files whose creation hunk was rewritten into a modification because the
+    #: file already existed (see ``harness.diff_repair``).
+    diff_repaired: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.success and not self.accepted:
@@ -980,6 +992,16 @@ class TaskPipeline:
         # declared inputs between nodes.
         ctx.extras["plan_structured"] = list(getattr(outcome, "structured", None) or [])
         ctx.extras["localization"] = dict(getattr(outcome, "localization", None) or {})
+        # Record the plan's fate where the result assembly can read it.  A plan
+        # that came from the ReAct episode is "used" only if it produced steps;
+        # a fallback to the linear plan is not.
+        ctx.extras["plan_used"] = bool(outcome.steps) and outcome.strategy != "linear"
+        ctx.extras["plan_steps_executed"] = len(outcome.steps or [])
+        ctx.extras["plan_salvaged"] = bool(
+            getattr(outcome, "structured", None) is None
+            and getattr(outcome, "steps", None)
+            and outcome.strategy != "linear"
+        )
         plan = [s.description for s in ctx.state.plan]
         self._event(
             "pipeline.plan",
@@ -1355,6 +1377,7 @@ class TaskPipeline:
         )
         ctx.extras["fix_result"] = result
         result.diff = self._ensure_creations(ctx, result.diff, slice_text, ctx)
+        result.diff = self._repair_creation_hunks(ctx, result.diff)
 
         route = self.router.last_route if self.router else None
         proposal = ProposeResult(
@@ -1368,6 +1391,34 @@ class TaskPipeline:
             "proposal": proposal,
             "proposal_source": "model",
         }
+
+    def _repair_creation_hunks(self, ctx: RunContext, diff: str) -> str:
+        """Turn a creation hunk for an existing file into a real modification.
+
+        The live probe found this on its first real run: asked to *fix*
+        ``math_utils.py``, the model returned the corrected function as a **new
+        file** (``--- /dev/null``).  ``git apply`` rejects that — the file
+        exists — so the run reported a diff that looked right and did not apply.
+
+        Deterministic, no model call: see :mod:`gigaforge.harness.diff_repair`.
+        """
+        if not diff:
+            return diff
+        try:
+            from gigaforge.harness.diff_repair import normalize_creation_hunks
+
+            root = Path(str(getattr(self.config, "repo_root", ".") or ".")).resolve()
+            repaired, report = normalize_creation_hunks(diff, root)
+        except Exception as exc:  # noqa: BLE001 - a repair must never fail a run
+            self._event("pipeline.diff_repair_error", run_id=ctx.run_id,
+                        error=str(exc)[:200])
+            return diff
+        if report.changed:
+            ctx.extras["diff_repaired"] = report.to_dict()
+            ctx.state.add_note(f"diff repaired: {', '.join(report.repaired)}")
+            self._event("pipeline.diff_repaired", run_id=ctx.run_id,
+                        files=report.repaired)
+        return repaired
 
     def _ensure_creations(self, ctx: RunContext, diff: str, slice_text: str,
                           ctx_any: Any = None) -> str:
@@ -1904,6 +1955,18 @@ class TaskPipeline:
             duration_ms=(self.clock.timestamp() - started_ms) * 1000.0,
             error=error[:1500],
             dag=dag,
+            # The plan's fate, read from the run context where the nodes put it.
+            # These were added to the result and to the ledger and then never
+            # populated — the live probe reported ``plan_used: false`` on a run
+            # whose plan had demonstrably been used, which is the same
+            # "field exists, product never reaches it" shape the field was added
+            # to expose.
+            plan_used=bool(ctx.extras.get("plan_used")),
+            plan_steps_executed=int(ctx.extras.get("plan_steps_executed") or 0),
+            plan_salvaged=bool(ctx.extras.get("plan_salvaged")),
+            diff_repaired=list(
+                (ctx.extras.get("diff_repaired") or {}).get("repaired") or []
+            ),
         )
 
     def _event(self, kind: str, **payload: Any) -> None:

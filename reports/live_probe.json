@@ -1,15 +1,15 @@
 {
-  "started_at": 1795160363.2732937,
+  "started_at": 1795164004.2463255,
   "credentials_present": true,
   "model": "GigaChat",
   "ok": true,
-  "passed": 6,
-  "total": 6,
+  "passed": 7,
+  "total": 7,
   "probes": [
     {
       "name": "atokens_count",
       "ok": true,
-      "latency_ms": 1016,
+      "latency_ms": 986,
       "detail": {
         "short": 8,
         "long": 208
@@ -19,15 +19,14 @@
     {
       "name": "response_format",
       "ok": true,
-      "latency_ms": 364,
+      "latency_ms": 358,
       "detail": {
         "parsed": true,
         "head": "{\"steps\": [{\"tool\": \"grep\"}]}",
         "usage": {
-          "prompt_tokens": 141,
+          "prompt_tokens": 145,
           "completion_tokens": 26,
-          "total_tokens": 167,
-          "cached_tokens": 4
+          "total_tokens": 171
         }
       },
       "error": ""
@@ -35,7 +34,7 @@
     {
       "name": "context_overflow",
       "ok": true,
-      "latency_ms": 230,
+      "latency_ms": 234,
       "detail": {
         "recognised_as_overflow": true
       },
@@ -44,36 +43,54 @@
     {
       "name": "rate_limit",
       "ok": true,
-      "latency_ms": 1497,
+      "latency_ms": 1258,
       "detail": {
-        "errors": [],
-        "saw_429": false,
+        "errors": [
+          "RateLimitError"
+        ],
+        "saw_429": true,
         "retry_after": null,
-        "note": "no 429 in this burst: the account had headroom, so the Retry-After branch is NOT confirmed live by this run"
+        "note": "429 observed: the Retry-After branch is confirmed live"
       },
       "error": ""
     },
     {
       "name": "react_plan",
       "ok": true,
-      "latency_ms": 9733,
+      "latency_ms": 8475,
       "detail": {
         "strategy": "react",
-        "steps": 4,
-        "first_step": "grep: .gigaforge/live_probe_checkpoints.sqlite",
-        "llm_calls": null
+        "steps": 3,
+        "first_step": "read_structure: gigaforge/agents/harness_prompt.py",
+        "llm_calls": 2,
+        "localization": {
+          "target_function_guess": "The"
+        }
       },
       "error": ""
     },
     {
       "name": "checkpointer",
       "ok": true,
-      "latency_ms": 8228,
+      "latency_ms": 2599,
       "detail": {
-        "checkpoints": 6,
-        "db_bytes": 98304,
-        "llm_calls": 2,
-        "finish_reason": "max_steps"
+        "checkpoints": 4,
+        "db_bytes": 65536,
+        "llm_calls": 1,
+        "finish_reason": "finish_action"
+      },
+      "error": ""
+    },
+    {
+      "name": "goal_to_diff",
+      "ok": true,
+      "latency_ms": 6943,
+      "detail": {
+        "diff_chars": 196,
+        "diff_applied": true,
+        "repo_tests_pass": true,
+        "finish_reason": "",
+        "plan_used": false
       },
       "error": ""
     }

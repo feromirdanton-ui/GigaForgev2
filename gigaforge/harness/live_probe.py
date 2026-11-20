@@ -31,7 +31,10 @@ import argparse
 import asyncio
 import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -363,6 +366,12 @@ async def _probe_react_plan(provider: Any, report: LiveProbeReport) -> None:
         used_react = "react" in str(getattr(outcome, "strategy", "")) and "linear" not in str(
             getattr(outcome, "strategy", "")
         )
+        # ``llm_calls`` used to be read from ``runner.state``, which has no such
+        # attribute — so the probe reported ``null`` for the one number that says
+        # how much the episode cost.  The count lives on the candidate the
+        # strategy recorded, which is also what the ledger reads.
+        candidates = list(getattr(outcome, "candidates", None) or [])
+        llm_calls = candidates[0].get("llm_calls") if candidates else None
         report.probes.append(
             ProbeResult(
                 name="react_plan",
@@ -372,7 +381,8 @@ async def _probe_react_plan(provider: Any, report: LiveProbeReport) -> None:
                     "strategy": getattr(outcome, "strategy", ""),
                     "steps": len(steps),
                     "first_step": (steps[0][:200] if steps else ""),
-                    "llm_calls": getattr(getattr(runner, "state", None), "llm_calls", None),
+                    "llm_calls": llm_calls,
+                    "localization": dict(getattr(outcome, "localization", None) or {}),
                 },
                 error="" if (steps and used_react) else "the ReAct episode produced no plan",
             )
@@ -510,7 +520,128 @@ async def run_probes(*, model: str = "", settings: Any = None) -> LiveProbeRepor
     await _probe_rate_limit(provider, report)
     await _probe_react_plan(provider, report)
     await _probe_checkpointer(provider, report)
+    await _probe_goal_to_diff(provider, report)
     return report
+
+
+async def _probe_goal_to_diff(provider: Any, report: LiveProbeReport) -> None:
+    """The SWE-bench wiring: a real goal, a real repo, a real diff, real tests.
+
+    Every other probe checks one capability in isolation.  This one checks the
+    *product*: ``TaskPipeline.run(goal)`` against the live model on a repository
+    with a genuine bug and a genuine test, then runs that test on the result.
+
+    It is the live counterpart of ``tests/test_goal_to_diff.py``, and it is the
+    check whose absence let three review rounds find the same class of defect —
+    a component that works and that the product never reaches.  A probe that
+    only exercises the component cannot see that.
+
+    The fixture is written to a temp directory, so the probe never touches the
+    working tree it runs in.
+    """
+    started = time.monotonic()
+    tmp = Path(tempfile.mkdtemp(prefix="gigaforge-live-swe-"))
+    try:
+        from gigaforge.core.config import CoreConfig
+        from gigaforge.core.pipeline import TaskPipeline
+        from gigaforge.core.sync_adapter import SyncChatClient
+
+        (tmp / "math_utils.py").write_text(
+            "def add(a: int, b: int) -> int:\n    return a - b\n"
+        )
+        (tmp / "test_math_utils.py").write_text(
+            "from math_utils import add\n\n\ndef test_add():\n    assert add(2, 3) == 5\n"
+        )
+        config = CoreConfig(
+            db_path=str(tmp / "core.sqlite3"),
+            trace_path=str(tmp / "traces" / "core.jsonl"),
+            repo_root=str(tmp),
+        )
+        pipeline = TaskPipeline(config=config, client=SyncChatClient(provider))
+        result = pipeline.run(
+            "The function add in math_utils.py returns the wrong result. "
+            "Fix it so that add(2, 3) == 5."
+        )
+        diff = str(getattr(result, "diff", "") or "")
+
+        # The real acceptance test: apply the diff and run the repo's own suite.
+        applied = False
+        tests_pass = False
+        if diff:
+            applied = _apply_unified_diff(tmp, diff)
+            if applied:
+                proc = subprocess.run(
+                    [sys.executable, "-m", "pytest", "-q", "test_math_utils.py"],
+                    cwd=tmp,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                tests_pass = proc.returncode == 0
+
+        ok = bool(diff) and applied and tests_pass
+        report.probes.append(
+            ProbeResult(
+                name="goal_to_diff",
+                ok=ok,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                detail={
+                    "diff_chars": len(diff),
+                    "diff_applied": applied,
+                    "repo_tests_pass": tests_pass,
+                    "finish_reason": str(getattr(result, "finish_reason", "")),
+                    "plan_used": bool(getattr(result, "plan_used", False)),
+                },
+                error="" if ok else "the goal did not produce a diff that passes the repo's tests",
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 - a probe records, never raises
+        report.probes.append(
+            ProbeResult(
+                name="goal_to_diff",
+                ok=False,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _apply_unified_diff(root: Path, diff: str) -> bool:
+    """Apply a unified diff to *root*; returns True when it applied cleanly.
+
+    ``git apply`` is used rather than a hand-rolled parser: the model emits real
+    unified diffs, and a parser that is more forgiving than git would report
+    success for a patch the repository would reject.
+    """
+    import re
+
+    body = diff.strip()
+    fence = re.search(r"```(?:diff)?\s*\n(.*?)```", body, re.DOTALL)
+    if fence:
+        body = fence.group(1)
+    if not body.strip():
+        return False
+    patch = root / ".gigaforge_probe.patch"
+    patch.write_text(body if body.endswith("\n") else body + "\n")
+    proc = subprocess.run(
+        ["git", "apply", "--unsafe-paths", "--directory=.", str(patch)],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if proc.returncode != 0:
+        # Fall back to a plain patch(1) for diffs git refuses (no index lines).
+        proc = subprocess.run(
+            ["patch", "-p1", "--forward", "--batch", "-i", str(patch)],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    return proc.returncode == 0
 
 
 def main(argv: list[str] | None = None, *, settings: Any = None) -> int:

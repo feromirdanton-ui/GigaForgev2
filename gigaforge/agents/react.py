@@ -424,9 +424,9 @@ class ReActRunner:
     # -- public collaborators -------------------------------------------------
     # The LangGraph engine drives this runner from outside, so it needs the
     # runner's collaborators.  Reaching for ``_router`` / ``_budgets`` /
-    # ``_tracer`` / ``_client`` with ``# noqa: SLF001`` made every refactor of
-    # this class a silent breakage of the graph; these accessors are the
-    # supported seam.
+    # ``_tracer`` / ``_client`` with a private-access suppression made every
+    # refactor of this class a silent breakage of the graph; these accessors are
+    # the supported seam.
     @property
     def client(self) -> GigaClient:
         return self._client
@@ -1157,13 +1157,32 @@ class ReActRunner:
                 loc["target_function"] = str(step.args["name"])
                 break
         if not loc.get("target_function") and last_thought:
-            # Fall back to extracting a `def NAME(` or bare NAME mention.
+            # Fall back to a *code-shaped* mention only.  The previous regex took
+            # the first word of the thought, so a live run reported
+            # ``target_function_guess: "The"`` — the first word of an English
+            # sentence.  A guess that is obviously not an identifier is worse
+            # than no guess: it is rendered into the coder's prompt as a target.
             import re
 
-            m = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", last_thought)
-            if m:
+            m = re.search(r"\bdef\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", last_thought)
+            if not m:
+                m = re.search(r"`([A-Za-z_][A-Za-z0-9_]*)`", last_thought)
+            if m and m.group(1) not in _STOPWORDS:
                 loc["target_function_guess"] = m.group(1)
         return loc
+
+
+#: Words that are never a symbol name, however identifier-shaped they look.
+#: Used to reject a localisation guess taken from prose.
+_STOPWORDS = frozenset(
+    {
+        "the", "this", "that", "there", "then", "these", "those", "and", "but",
+        "for", "with", "from", "into", "when", "where", "which", "while", "will",
+        "should", "must", "need", "needs", "have", "has", "was", "were", "are",
+        "is", "it", "its", "a", "an", "to", "of", "in", "on", "at", "by", "as",
+        "now", "next", "first", "last", "done", "ok", "okay", "yes", "no",
+    }
+)
 
 
 def _kind_for_tool(action: str) -> str:
