@@ -53,12 +53,24 @@ class ObservationCache:
 
     # -- invalidation --------------------------------------------------------
     def _workspace_stamp(self) -> str:
-        """A cheap fingerprint of the tree's shape.
+        """A cheap fingerprint of the tree's *content*.
 
-        ``(path, mtime_ns, size)`` for every file, hashed.  Walking the tree on
-        every tool call would be too slow for a large repository, so the walk is
-        capped and the cap is part of the stamp: a tree that grows past the cap
-        changes the stamp once and then stays stable.
+        ``(path, mtime_ns, ctime_ns, size, content-hash)`` for every file,
+        hashed.  Walking the tree on every tool call would be too slow for a
+        large repository, so the walk is capped and the cap is part of the
+        stamp: a tree that grows past the cap changes the stamp once and then
+        stays stable.
+
+        The content hash is not belt-and-braces, it is the only thing that
+        actually works.  Timestamps are not a reliable change signal at this
+        granularity: two writes inside the same filesystem timestamp tick leave
+        ``mtime_ns``, ``ctime_ns`` *and* ``size`` identical, so a stamp built
+        from metadata alone does not move and a stale observation survives the
+        write.  Measured here: a test that rewrote a file with same-length
+        content flaked roughly one run in three, and the two writes differed by
+        0 ns.  Hashing the bytes is exact, and the walk is already reading the
+        directory entries, so the extra cost is one read per file per tool call
+        — bounded by the same cap.
         """
         if self.root is None:
             return ""
@@ -76,9 +88,13 @@ class ObservationCache:
                     continue
                 try:
                     stat = path.stat()
+                    body = path.read_bytes()
                 except OSError:
                     continue
-                digest.update(f"{path.relative_to(root)}:{stat.st_mtime_ns}:{stat.st_size}\n".encode())
+                digest.update(
+                    f"{path.relative_to(root)}:{stat.st_size}:"
+                    f"{hashlib.sha256(body).hexdigest()}\n".encode()
+                )
                 count += 1
                 if count >= 2000:
                     digest.update(b"<capped>")

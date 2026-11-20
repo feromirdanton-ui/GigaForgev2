@@ -59,7 +59,18 @@ EDIT_TOOLS = frozenset(
 )
 
 #: Argument keys that name what an edit step acts on.
-_TARGET_KEYS = ("name", "symbol", "path", "file", "target", "function")
+#:
+#: The list is deliberately generous.  The guard's job is to reject an edit
+#: that names *nothing* — "edit something" cannot be executed or checked — not
+#: to police the model's vocabulary.  Measured live: the model emitted
+#: ``{"tool": "edit_file", "args": {"location": "index.html", ...}}``, the guard
+#: did not recognise ``location``, dropped the only step of the plan, and the
+#: run fell back to a linear plan while the model's real plan was discarded.
+_TARGET_KEYS = (
+    "name", "symbol", "path", "file", "target", "function",
+    "location", "filename", "filepath", "file_path", "target_file",
+    "symbol_name", "function_name",
+)
 
 
 @dataclass

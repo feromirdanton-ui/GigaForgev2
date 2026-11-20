@@ -1535,8 +1535,26 @@ class ReActRunner:
                 data = json.loads(json_repair(action_input))
             except json.JSONDecodeError:
                 return []
+        # A double-encoded payload: the model put the plan in as a *string*
+        # inside the string.  ``_parse_step`` already unwraps one level, but a
+        # model that emits ``"action_input": "{\"steps\": ...}"`` twice is
+        # common enough to be worth one more attempt.
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except json.JSONDecodeError:
+                return []
         if isinstance(data, dict) and "steps" in data:
             data = data["steps"]
+        # ``json_repair`` extracts from the first ``{`` to the last ``}``, so a
+        # *list* payload that needed repair comes back as a bare object: the
+        # wrapping ``[ ]`` is gone.  Measured live — the model returned a
+        # one-step plan for "build a cyberpunk site", the repair collapsed it to
+        # a dict, this function returned ``[]``, and the episode's whole plan
+        # was discarded while the run still reported ``finish_action``.  A dict
+        # that names a tool *is* a one-step plan; accept it as such.
+        if isinstance(data, dict) and str(data.get("tool", "")).strip():
+            data = [data]
         if not isinstance(data, list):
             return []
         steps: list[PlanStep] = []

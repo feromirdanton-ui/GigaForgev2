@@ -246,6 +246,21 @@ class TaskPipeline:
         self.plan_strategy: PlanStrategy = plan_strategy or build_plan_strategy(
             react_runner_factory=self._build_react_runner
         )
+        # An *injected* strategy arrives without the factory, because the
+        # composition root builds it with ``build_plan_strategy()`` and has no
+        # pipeline to take the factory from.  That made the ReAct layer
+        # unreachable on the product path: ``runtime.build_runtime`` always
+        # injects a strategy, so the branch above never ran, ``_build_runner``
+        # returned ``None``, and every live run silently degraded to the
+        # one-shot linear plan while the trace still said ``strategy: react``.
+        # Measured live: a "build a cyberpunk site" goal produced a single
+        # 2.5 KB page in one model call, with ``react->linear`` in the trace.
+        #
+        # Attaching the factory here is the one place that covers every
+        # construction path, and it is a no-op for a strategy that does not
+        # explore (linear, ToT) or one that already has a factory.
+        if getattr(self.plan_strategy, "_runner_factory", None) is None:
+            setattr(self.plan_strategy, "_runner_factory", self._build_react_runner)
         self.review_strategy: ReviewStrategy = review_strategy or build_review_strategy()
 
         self._owns_metrics = metrics is None
@@ -377,6 +392,12 @@ class TaskPipeline:
                 self.router.reconfigure(client=self.client)
         if "plan_strategy" in changes:
             self.plan_strategy = changes["plan_strategy"]
+            # A strategy swapped in at runtime arrives from
+            # ``build_plan_strategy(name)`` with no factory, exactly like the
+            # injected one in ``__init__``.  Without this the switch to ``react``
+            # would look applied and still plan linearly.
+            if getattr(self.plan_strategy, "_runner_factory", None) is None:
+                setattr(self.plan_strategy, "_runner_factory", self._build_react_runner)
         if "review_strategy" in changes:
             self.review_strategy = changes["review_strategy"]
 
