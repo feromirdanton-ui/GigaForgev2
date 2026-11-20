@@ -7,7 +7,7 @@ name = "gigaforge"
 version = "6.0.0"
 description = "Agentic orchestration harness for GigaChat with a standalone desktop control room"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.27",
     "pydantic>=2.6",
@@ -40,7 +40,13 @@ languages = [
 ]
 # Official GigaChat SDK transport (GigaChatSDKProvider). Optional: the legacy
 # httpx client remains the default and needs no extra install.
-gigachat = ["gigachat>=0.3"]
+#
+# The SDK has no stable release yet — only pre-releases — so the pin is exact
+# and the extra must be installed with ``--pre``:
+#     pip install --pre "gigaforge[gigachat]"
+# ``gigachat>=0.3`` resolves to nothing on PyPI and made this extra
+# uninstallable.
+gigachat = ["gigachat==0.3.0a1"]
 # Level-2 agent runtime: goal mode, chat, ReAct and sub-agents on LangGraph.
 # Optional so a bare install keeps the deterministic core working; the classic
 # GoalRunner/ReActRunner loops are used when it is absent.
@@ -50,9 +56,9 @@ langgraph = [
 ]
 # deepagents brings the harness middleware the merge plan borrows from
 # ai-forever/deepagents-gigachat. It pins langchain>=1.5 and langgraph>=1.2.24.
-# NOTE: the *harness profile* (deepagents-gigachat) requires Python 3.12+, which
-# is why this project's floor moved from 3.11 to 3.12; deepagents itself only
-# needs 3.11.
+# deepagents itself supports Python 3.11, so the project floor stays at 3.11;
+# only the *harness profile* (deepagents-gigachat) wants 3.12+, and that is a
+# separate, optional install.
 deepagents = [
     "deepagents>=0.7",
     "langchain-gigachat>=0.5",
@@ -68,7 +74,14 @@ agent = [
 browser = []
 # Local lint/build tooling. Pytest is a core runtime dependency because Goal mode
 # executes an existing project's suite as part of verification.
-dev = ["ruff>=0.4", "pillow>=10.0"]
+dev = [
+    "ruff>=0.4",
+    "pillow>=10.0",
+    # The level-2 agent layer is part of the product, so its tests must run in
+    # the default dev install instead of being skipped for a missing package.
+    "langgraph>=1.2,<2",
+    "langgraph-checkpoint-sqlite>=2.0",
+]
 
 [project.scripts]
 gigaforge = "gigaforge.cli:main"
@@ -82,7 +95,7 @@ gigaforge = ["assets/*.png", "assets/*.ico", "desktop/qml/*.qml"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]

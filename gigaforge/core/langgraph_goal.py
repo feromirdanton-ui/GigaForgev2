@@ -132,12 +132,16 @@ def build_goal_graph(
     workspace: Optional[GoalWorkspace] = None,
     checkpointer: Any = None,
     emit: Optional[Callable[[str, dict[str, Any]], None]] = None,
+    cancellation: Optional[CancellationToken] = None,
 ) -> Any:
     """Compile the goal graph.
 
     ``pipeline`` is the deterministic core; ``verifier``/``store``/``workspace``
     default to the same objects ``GoalRunner`` would build, so a graph run and a
     classic run leave identical artefacts on disk.
+
+    ``cancellation`` is closed over rather than carried in the state: the state
+    is serialised by the checkpointer, and a token is not JSON-safe.
     """
     if not LANGGRAPH_AVAILABLE:  # pragma: no cover - guarded by the caller
         raise RuntimeError("langgraph is not installed")
@@ -159,7 +163,11 @@ def build_goal_graph(
         _writer()(body)
 
     def _persist(state: Mapping[str, Any], **overrides: Any) -> None:
-        """Write the durable record the UI and ``--resume`` read."""
+        """Write the durable record the UI and ``--resume`` read.
+
+        Called at the end of every node, so a crash mid-run leaves a record that
+        says which cycle was in flight instead of only the pre-run snapshot.
+        """
         record = {
             "schema_version": 1,
             "goal_id": state.get("goal_id", ""),
@@ -184,6 +192,35 @@ def build_goal_graph(
         except Exception:  # noqa: BLE001 - persistence is best effort per node
             pass
 
+    def _persist_node(state: Mapping[str, Any], **overrides: Any) -> None:
+        """Persist the state a node just produced, merged over the live state.
+
+        LangGraph hands a node only its *own* return value, so the record is
+        rebuilt from the accumulated state plus that delta — otherwise a node
+        would overwrite the durable record with a partial view.
+        """
+        merged = dict(state)
+        merged.update(overrides)
+        _persist(merged)
+
+    def _persisting(fn: Callable[[Any], dict[str, Any]]) -> Callable[[Any], dict[str, Any]]:
+        """Wrap a node so its result is written to the durable record.
+
+        Without this the record was only written once, at the very end of the
+        run, so a crash mid-cycle left the UI and ``--resume`` looking at the
+        pre-run snapshot.
+        """
+
+        def wrapped(state: Any) -> dict[str, Any]:
+            delta = fn(state) or {}
+            merged = dict(state)
+            merged.update(delta)
+            _persist(merged)
+            return delta
+
+        wrapped.__name__ = getattr(fn, "__name__", "node")
+        return wrapped
+
     # ── nodes ────────────────────────────────────────────────────────────────
     def author(state: GoalState) -> dict[str, Any]:
         """One implementation cycle: the deterministic pipeline, unchanged."""
@@ -193,6 +230,23 @@ def build_goal_graph(
         feedback = str(state.get("feedback") or "")
         run_id = f"{state.get('goal_id')}-c{cycle_index}-{uuid.uuid4().hex[:6]}"
         prompt = GoalRunner._cycle_prompt(goal, feedback)
+        # The graph path must honour the same cooperative cancellation the
+        # classic runner does; without this a cancelled goal kept spending
+        # model calls until the cycle limit.
+        cancel = cancellation
+        if cancel is not None and getattr(cancel, "cancelled", False):
+            _emit(
+                "goal.cancelled",
+                node="Цикл из прерван",
+                status="Отменено",
+                goal_id=state.get("goal_id"),
+            )
+            return {
+                "status": "cancelled",
+                "accepted": False,
+                "error": str(getattr(cancel, "reason", "") or "cancelled"),
+                "updated_at": _now(),
+            }
 
         _emit(
             "goal.cycle_start",
@@ -215,7 +269,7 @@ def build_goal_graph(
                 use_subagents=bool(state.get("use_subagents")),
                 react=True,
                 max_fix_iterations=int(state.get("max_fix_iterations") or 2),
-                cancellation=None,
+                cancellation=cancel,
                 resume=False,
             )
         except Exception as exc:  # noqa: BLE001 - a failed cycle is a state, not a crash
@@ -246,6 +300,7 @@ def build_goal_graph(
                 "changed_files": [],
                 "pending_diff": "",
                 "verification": None,
+                "updated_at": _now(),
             }
 
         accepted = bool(getattr(result, "accepted", False)) and str(
@@ -388,6 +443,13 @@ def build_goal_graph(
                     "accepted": False,
                     "error": f"publish failed: {type(exc).__name__}: {exc}"[:900],
                 }
+            # The classic runner releases the project copy once the verified
+            # files are published; the graph path must do the same or every
+            # completed goal leaks a full copy of the project on disk.
+            try:
+                workspace.cleanup_project_copy()
+            except Exception:  # noqa: BLE001 - cleanup is best effort
+                pass
         _emit(
             "goal.publish",
             node="Публикация",
@@ -422,10 +484,10 @@ def build_goal_graph(
         return "retry" if int(state.get("cycle_index") or 0) < int(state.get("max_cycles") or 8) else "stop"
 
     graph = StateGraph(GoalState)
-    graph.add_node("author", author)
-    graph.add_node("verify", verify)
-    graph.add_node("approve", approve)
-    graph.add_node("publish", publish)
+    graph.add_node("author", _persisting(author))
+    graph.add_node("verify", _persisting(verify))
+    graph.add_node("approve", _persisting(approve))
+    graph.add_node("publish", _persisting(publish))
     graph.add_edge(START, "author")
     graph.add_edge("author", "verify")
     graph.add_conditional_edges(
@@ -523,8 +585,37 @@ def run_goal_graph(
         workspace=workspace,
         checkpointer=checkpointer,
         emit=emit,
+        cancellation=cancellation,
     )
     config = thread_config(goal_id)
+
+    # The classic runner provisions its verifier runtime before spending a single
+    # model call; the graph path must do the same, or a goal burns its whole
+    # cycle budget and only then discovers the verifier cannot run.
+    preflight = _preflight(verifier)
+    if preflight:
+        detail = "Goal runtime is not ready: " + "; ".join(preflight)
+        record = {
+            "schema_version": 1,
+            "goal_id": goal_id,
+            "goal": goal,
+            "status": "blocked",
+            "accepted": False,
+            "cycles": [],
+            "tokens": 0,
+            "calls": 0,
+            "started_at": _now(),
+            "updated_at": _now(),
+            "error": detail,
+            "workspace_root": str(getattr(workspace, "root", "") or ""),
+            "published_files": [],
+            "engine": "langgraph",
+        }
+        try:
+            goal_store.save(record)
+        except Exception:  # noqa: BLE001
+            pass
+        return _result_from_record(record)
 
     try:
         if resume:
@@ -626,11 +717,38 @@ def run_goal_graph(
     if record["status"] == "running":
         record["status"] = "needs_attention"
         record["error"] = record["error"] or "cycle limit reached before verification passed"
+    if cancellation is not None and cancellation.cancelled and record["status"] != "completed":
+        record["status"] = "cancelled"
+        record["error"] = str(cancellation.reason or "cancelled")
     try:
         goal_store.save(record)
     except Exception:  # noqa: BLE001
         pass
     return _result_from_record(record)
+
+
+def _preflight(verifier: Optional[Verifier]) -> tuple[str, ...]:
+    """Provision the verifier's runtime, mirroring ``GoalRunner._runtime_preflight``.
+
+    Only the default :class:`WorkspaceVerifier` needs provisioning; a custom
+    verifier is the caller's responsibility.
+    """
+    if verifier is not None and not isinstance(verifier, WorkspaceVerifier):
+        return ()
+    try:
+        from gigaforge.runtime_dependencies import (
+            ensure_browser_runtime,
+            ensure_goal_support_packages,
+        )
+    except Exception:  # noqa: BLE001 - a missing helper must not block a run
+        return ()
+    issues = list(ensure_goal_support_packages(auto_install=True, timeout_s=60))
+    probe = verifier if isinstance(verifier, WorkspaceVerifier) else WorkspaceVerifier()
+    if getattr(probe, "require_browser", False):
+        status = ensure_browser_runtime(auto_install=True, timeout_s=180)
+        if not status.available:
+            issues.append("browser runtime: " + status.detail)
+    return tuple(issues)
 
 
 def _result_from_record(record: Mapping[str, Any]) -> GoalResult:

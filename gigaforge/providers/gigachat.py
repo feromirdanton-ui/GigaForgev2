@@ -62,6 +62,11 @@ class GigaChatProvider:
     switches to later in the run.
     """
 
+    #: The legacy ``GigaClient`` owns its own retry loop
+    #: (:class:`~gigaforge.client.retry.RetryPolicy`), so the runtime must NOT
+    #: wrap this provider again — that would double the attempts.
+    owns_retries = True
+
     def __init__(
         self,
         client: GigaClient,

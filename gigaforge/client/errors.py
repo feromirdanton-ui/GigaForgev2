@@ -153,19 +153,56 @@ def error_for_status(
     return RequestError(message, status=status, payload=payload)
 
 
+#: Official ``gigachat`` SDK exception class names → the HTTP status they carry.
+#: The SDK raises typed exceptions (``RateLimitError``, ``ServerError``, …) that
+#: are NOT subclasses of :class:`GigaForgeError`, so without this table a 429 on
+#: the SDK transport looked like an unclassified, non-retryable failure.
+_SDK_STATUS_NAMES: dict[str, int] = {
+    "AuthenticationError": 401,
+    "ForbiddenError": 403,
+    "NotFoundError": 404,
+    "BadRequestError": 400,
+    "UnprocessableEntityError": 422,
+    "RequestEntityTooLargeError": 413,
+    "RateLimitError": 429,
+    "ServerError": 500,
+}
+
+#: SDK transport failures that are always worth another attempt.
+_SDK_TIMEOUT_NAMES = frozenset({"APITimeoutError", "ReadTimeout", "ConnectTimeout"})
+_SDK_NETWORK_NAMES = frozenset(
+    {"APIConnectionError", "ConnectError", "ReadError", "WriteError", "PoolTimeout"}
+)
+
+
 def error_for_exception(exc: BaseException) -> GigaForgeError:
     """Map an arbitrary transport exception onto the taxonomy.
 
     Type names are used instead of an ``isinstance`` check against ``requests``
-    so the mapping also works with any duck-typed transport (and in tests).
+    so the mapping also works with any duck-typed transport (and in tests).  The
+    official ``gigachat`` SDK's exception classes are recognised by name too, so
+    the retry policy behaves identically on both transports.
     """
     if isinstance(exc, GigaForgeError):
         return exc
     name = type(exc).__name__
-    if name in _TIMEOUT_NAMES:
+    if name in _TIMEOUT_NAMES or name in _SDK_TIMEOUT_NAMES:
         return RequestTimeout(str(exc) or name, retryable=True)
-    if name in _NETWORK_NAMES:
+    if name in _NETWORK_NAMES or name in _SDK_NETWORK_NAMES:
         return NetworkError(str(exc) or name, retryable=True)
+    if name in _SDK_STATUS_NAMES:
+        return error_for_status(
+            _SDK_STATUS_NAMES[name],
+            str(exc) or name,
+            retry_after=getattr(exc, "retry_after", None),
+        )
+    if name == "ResponseError":
+        # The SDK's generic HTTP error carries the status on the instance.
+        status = getattr(exc, "status_code", None)
+        if isinstance(status, int):
+            return error_for_status(
+                status, str(exc) or name, retry_after=getattr(exc, "retry_after", None)
+            )
     return GigaForgeError(str(exc) or name, retryable=False)
 
 

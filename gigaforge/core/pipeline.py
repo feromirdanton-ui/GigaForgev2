@@ -1718,6 +1718,8 @@ class TaskPipeline:
         parallel: bool = True,
     ) -> list[Any]:
         """Run sub-agents in isolated worktrees; results come back in spawn order."""
+        from gigaforge.agents.engine import run_subagents
+
         runner = SubAgentRunner(
             self._subagent_body,
             config=self.config,
@@ -1725,7 +1727,17 @@ class TaskPipeline:
             trace=self.metrics.trace,
             clock=self.clock,
         )
-        return runner.spawn(specs, parent_ctx=parent_ctx, parallel=parallel)
+        # Routed through the engine dispatcher so ``GIGAFORGE_SUBAGENT_ENGINE``
+        # can move the fan-out onto the LangGraph graph without touching this
+        # call site.  The classic path is unchanged: the production runner owns
+        # the worktrees and takes the specs directly.
+        return run_subagents(
+            runner,
+            specs,
+            self._subagent_body,
+            parent_ctx=parent_ctx,
+            parallel=parallel,
+        )
 
     def _subagent_body(self, spec: SubAgentSpec, ctx: RunContext) -> Mapping[str, Any]:
         """Default sub-agent: the same task pipeline, scoped to its private copy.

@@ -112,7 +112,13 @@ def _usage_dict(usage: Any) -> Optional[dict[str, int]]:
             "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
             "total_tokens": getattr(usage, "total_tokens", 0) or 0,
         }
+        # The SDK's ``Usage`` names the prompt-cache counter
+        # ``precached_prompt_tokens`` (verified against gigachat 0.3.0a1);
+        # ``cached_tokens`` is accepted too so a future rename does not silently
+        # drop the cache accounting and inflate the cost estimate.
         cached = getattr(usage, "precached_prompt_tokens", None)
+        if cached is None:
+            cached = getattr(usage, "cached_tokens", None)
         if cached:
             data["cached_tokens"] = int(cached)
     return {str(k): int(v) for k, v in data.items() if isinstance(v, (int, float))}
@@ -153,6 +159,12 @@ class GigaChatSDKProvider:
     from ``credentials`` / ``scope`` / ``base_url`` on first use.
     """
 
+    #: This adapter does NOT own a retry loop: it builds the SDK client with
+    #: ``max_retries=0`` so the policy is not doubled.  The runtime therefore
+    #: wraps it in :class:`~gigaforge.providers.retrying.RetryingProvider`,
+    #: which is the single retry owner on this transport.
+    owns_retries = False
+
     def __init__(
         self,
         client: Any = None,
@@ -184,7 +196,8 @@ class GigaChatSDKProvider:
         if not SDK_AVAILABLE:
             raise ProviderNotConfigured(
                 "the official 'gigachat' SDK is not installed; "
-                "run `pip install gigachat>=0.3` or use the legacy GigaClient provider"
+                "run `pip install --pre gigachat==0.3.0a1` (the SDK has no stable "
+                "release yet) or use the legacy GigaClient provider"
             )
         return _gigachat
 
@@ -228,17 +241,96 @@ class GigaChatSDKProvider:
         if stream:
             raise ValueError("Use stream_chat() for streaming responses")
         client = self._ensure_client()
-        payload: dict[str, Any] = {
+        payload = self._build_chat(
+            messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            functions=functions,
+        )
+        try:
+            completion = await client.achat(payload)
+        except BaseException as exc:  # noqa: BLE001 - re-raised, possibly translated
+            # Translate the provider's overflow error into the one typed
+            # exception the caller catches, so a 422/413 does not surface as a
+            # raw SDK error the harness cannot classify.
+            #
+            # Imported here, not at module scope: ``context_window_guard``
+            # imports ``providers.context_windows``, which imports this package's
+            # ``__init__`` — a top-level import would close that cycle.
+            from gigaforge.core.context_window_guard import (
+                ContextOverflowError,
+                is_context_overflow_error,
+            )
+
+            if is_context_overflow_error(exc):
+                raise ContextOverflowError(
+                    "GigaChat rejected the request because its context window "
+                    f"was exceeded: {type(exc).__name__}",
+                    context_window=self.max_context_for(model),
+                    proactive=False,
+                ) from exc
+            raise
+        return from_sdk_completion(completion)
+
+    def _build_chat(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str,
+        temperature: float,
+        max_tokens: int | None,
+        functions: list[dict[str, Any]] | None,
+    ) -> Any:
+        """Build the SDK's typed ``Chat`` request model.
+
+        The SDK is Pydantic-based; sending a raw dict works but skips validation
+        and the field names it would catch.  Building ``Chat``/``Messages``
+        explicitly is what §7.2 of the merge plan asks for, and it keeps the
+        request shape honest when the SDK adds fields.
+        """
+        try:
+            from gigachat.models import Chat, Function, Messages, MessagesRole
+        except Exception:  # noqa: BLE001 - older SDK: fall back to the wire dict
+            payload: dict[str, Any] = {
+                "model": model or self._model,
+                "messages": to_sdk_messages(messages),
+                "temperature": temperature,
+            }
+            if max_tokens is not None:
+                payload["max_tokens"] = max_tokens
+            if functions:
+                payload["functions"] = functions
+            return payload
+
+        role_map = {
+            "system": MessagesRole.SYSTEM,
+            "user": MessagesRole.USER,
+            "assistant": MessagesRole.ASSISTANT,
+            "tool": MessagesRole.FUNCTION,
+            "function": MessagesRole.FUNCTION,
+        }
+        sdk_messages = []
+        for message in normalize_messages(messages):
+            role = role_map.get(str(message.get("role", "user")).lower(), MessagesRole.USER)
+            sdk_messages.append(
+                Messages(role=role, content=message.get("content", "") or "")
+            )
+        kwargs: dict[str, Any] = {
             "model": model or self._model,
-            "messages": to_sdk_messages(messages),
+            "messages": sdk_messages,
             "temperature": temperature,
         }
         if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
+            kwargs["max_tokens"] = max_tokens
         if functions:
-            payload["functions"] = functions
-        completion = await client.achat(payload)
-        return from_sdk_completion(completion)
+            allowed = set(Function.model_fields)
+            kwargs["functions"] = [
+                Function(**{k: v for k, v in fn.items() if k in allowed})
+                for fn in functions
+                if isinstance(fn, Mapping)
+            ]
+        return Chat(**kwargs)
 
     async def list_models(self) -> list[dict[str, Any]]:
         client = self._ensure_client()
@@ -266,15 +358,13 @@ class GigaChatSDKProvider:
         task_id: str = "",
         phase: str = "unknown",
     ) -> StreamAccumulator:
-        payload: dict[str, Any] = {
-            "model": model or self._model,
-            "messages": to_sdk_messages(messages),
-            "temperature": temperature,
-        }
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
-        if functions:
-            payload["functions"] = functions
+        payload = self._build_chat(
+            messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            functions=functions,
+        )
 
         async def _gen() -> AsyncIterator[StreamChunk]:
             client = self._ensure_client()

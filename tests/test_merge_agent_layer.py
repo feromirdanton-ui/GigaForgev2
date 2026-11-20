@@ -15,6 +15,7 @@ the suite is deterministic and free.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -29,9 +30,26 @@ from gigaforge.core.langgraph_runtime import (
     thread_config,
 )
 
+# The level-2 agent layer is part of the product, not an optional extra: the
+# goal engine defaults to LangGraph.  Skipping this suite silently when the
+# package is missing is how the whole layer stayed unverified, so the skip is
+# now opt-in — set ``GIGAFORGE_ALLOW_MISSING_LANGGRAPH=1`` to run a bare
+# install, and CI (which installs the ``dev`` extra) fails loudly instead.
+_ALLOW_MISSING = os.environ.get("GIGAFORGE_ALLOW_MISSING_LANGGRAPH") == "1"
+
 pytestmark = pytest.mark.skipif(
-    not LANGGRAPH_AVAILABLE, reason="langgraph is an optional dependency"
+    not LANGGRAPH_AVAILABLE and _ALLOW_MISSING,
+    reason="langgraph is not installed (allowed by GIGAFORGE_ALLOW_MISSING_LANGGRAPH)",
 )
+
+
+def test_langgraph_is_installed() -> None:
+    """A bare install must not silently drop the agent layer's coverage."""
+    assert LANGGRAPH_AVAILABLE, (
+        "langgraph is required for the level-2 agent layer; install the 'dev' "
+        "extra (pip install -e '.[dev]') or set "
+        "GIGAFORGE_ALLOW_MISSING_LANGGRAPH=1 to skip this suite deliberately"
+    )
 
 
 # ── fakes ────────────────────────────────────────────────────────────────────

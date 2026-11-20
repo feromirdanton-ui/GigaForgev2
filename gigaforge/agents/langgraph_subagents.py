@@ -19,8 +19,7 @@ Design notes that matter:
 """
 from __future__ import annotations
 
-import asyncio
-from typing import Annotated, Any, Callable, Mapping, Optional, Sequence, TypedDict
+from typing import Annotated, Any, Callable, Mapping, Sequence, TypedDict
 
 from .subagents import SubAgentRunner, SubAgentSpawn
 
@@ -102,13 +101,20 @@ def build_subagent_graph(
         """Run one sub-agent through the runner's isolation rules."""
         from pathlib import Path
 
+        from gigaforge.core.sync_adapter import await_blocking
+
         spawn = SubAgentSpawn(
             payload=dict(state.get("payload") or {}),
             budget_tokens=int(state.get("budget_tokens") or 0),
             worktree=Path(str(state.get("worktree") or ".")),
             resource_files=list(state.get("resource_files") or []),
         )
-        result = asyncio.run(runner.run_one(spawn, agent_factory))
+        # ``asyncio.run`` here raised "asyncio.run() cannot be called from a
+        # running event loop" whenever the graph was driven from inside one
+        # (a notebook, an async server, or ``run_subagents_graph`` itself when
+        # called from async code).  ``await_blocking`` submits to the adapter's
+        # dedicated loop thread, which is safe from any thread.
+        result = await_blocking(runner.run_one(spawn, agent_factory))
         return {"results": [{**dict(result), "spawn_index": int(state.get("index") or 0)}]}
 
     def collect(state: SubAgentGraphState) -> dict[str, Any]:

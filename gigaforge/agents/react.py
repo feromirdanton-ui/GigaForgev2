@@ -291,6 +291,7 @@ class ReActRunner:
         registry: ToolRegistry | None = None,
         max_steps: int | None = None,
         settings: Settings | None = None,
+        guards: Any | None = None,
     ) -> None:
         self._client = client
         self._router = router
@@ -299,10 +300,23 @@ class ReActRunner:
         self._s = settings or get_settings()
         self._registry = registry or ToolRegistry()
         self._max_steps = max_steps or _env_max_steps()
+        # The ported middleware (tool contract, shell safety, specification
+        # audit, think tool).  Built lazily so a caller that does not pass one
+        # still gets the guards rather than silently running without them.
+        self._guards = guards
 
     @property
     def registry(self) -> ToolRegistry:
         return self._registry
+
+    @property
+    def guards(self) -> Any:
+        """The wired middleware, created on first use."""
+        if self._guards is None:
+            from gigaforge.agents.guards import ReActGuards
+
+            self._guards = ReActGuards(tool_names=self._registry.names())
+        return self._guards
 
     async def run(
         self,
@@ -321,11 +335,16 @@ class ReActRunner:
         """
         if not self._registry.names():
             self._registry.install_defaults(sandbox=ctx.sandbox)
+        # The think tool is a real tool, not a prompt trick: registering it is
+        # what lets the model externalise a reasoning step.
+        self.guards.install(self._registry)
 
         result = ReActResult()
         trajectory: list[dict[str, str]] = []  # role-tagged messages for the LLM
         base_user = self._compose_initial_prompt(task, state, bootstrap_hint)
         trajectory.append({"role": "user", "content": base_user})
+        # ToolContract: tell the model which tools exist, exactly once.
+        trajectory.extend(self.guards.opening_messages(trajectory))
 
         for step_idx in range(self._max_steps):
             # Pre-budget check. Phase = "plan" (L1 Lite caps).
@@ -444,6 +463,31 @@ class ReActRunner:
                 )
                 continue
 
+            # ShellSafety: screen the call before it reaches the sandbox.  A
+            # blocked command becomes an observation, so the model can correct
+            # course instead of the harness executing it.
+            blocked = self.guards.screen_tool_call(action, action_input)
+            if blocked is not None:
+                kind = _kind_for_tool(action)
+                compressed = compress(kind, blocked, limit_tokens=_OBS_TOKEN_BUDGET)
+                observation = json.dumps(compressed, ensure_ascii=False)
+                trajectory.append({"role": "assistant", "content": text})
+                trajectory.append(
+                    {"role": "user", "content": f"Observation ({kind}):\n{observation}"}
+                )
+                result.steps.append(
+                    {
+                        "step_idx": step_idx,
+                        "thought": thought,
+                        "action": action,
+                        "action_input": action_input,
+                        "ok": True,
+                        "observation": observation,
+                        "blocked": True,
+                    }
+                )
+                continue
+
             try:
                 raw_obs = await tool.run(action_input, ctx=ctx)
             except Exception as exc:  # noqa: BLE001 — best-effort
@@ -464,6 +508,11 @@ class ReActRunner:
                     "content": f"Observation ({kind}):\n{observation}",
                 }
             )
+            # SpecificationAudit: after the model inspects a file it just
+            # created, nudge it once to check the output against the contract.
+            audit = self.guards.after_observation(trajectory)
+            if audit is not None:
+                trajectory.append(audit)
 
         # Reached the step cap without finishing.
         result.finish_reason = "max_steps"

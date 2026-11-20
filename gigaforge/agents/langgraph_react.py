@@ -25,16 +25,17 @@ keeps its own name.  Conflating the two is the easiest way to break this file.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import time
 from typing import Annotated, Any, Callable, Mapping, Optional, TypedDict
 
 from gigaforge.core.context_window_guard import ContextOverflowError, ContextWindowGuard
 from gigaforge.core.loop_breaker import LoopBreaker
+from gigaforge.core.sync_adapter import await_blocking
 from gigaforge.core.task_state import PlanStep
 from gigaforge.firewall import compress
 from gigaforge.firewall.tokens import estimate_tokens
+from gigaforge.providers.messages import nudge
 
 from .react import FINISH_ACTION, ReActContext, ReActResult, ReActRunner, _kind_for_tool
 
@@ -100,14 +101,25 @@ def _writer() -> Callable[[dict[str, Any]], None]:
         return lambda _payload: None
 
 
-def _breaker_view(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _breaker_view(
+    steps: list[dict[str, Any]],
+    nudges: Optional[list[str]] = None,
+) -> list[dict[str, Any]]:
     """Rebuild the tool-shaped history the LoopBreaker inspects.
 
     Each successful step becomes an assistant turn with one ``tool_calls`` entry
     plus the matching ``tool`` result.  Failed parses are skipped: they are not
     tool rounds and would only dilute the signatures.
+
+    ``nudges`` are the markers already injected this run.  They are replayed as
+    real nudge messages **in the position they were emitted**, because
+    :meth:`LoopBreaker.inspect` bounds every signature with
+    ``count_nudges(messages, marker)``.  Without them the counter is always 0,
+    every signature fires on every turn, and ``max_injections`` never applies —
+    the exact self-loop the module's own docstring warns about.
     """
     view: list[dict[str, Any]] = []
+    pending = list(nudges or [])
     for step in steps:
         if not step.get("ok"):
             continue
@@ -130,6 +142,11 @@ def _breaker_view(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "tool_call_id": call_id,
             "content": str(step.get("observation") or ""),
         })
+        # A nudge emitted after this round belongs here, before the next one.
+        if pending:
+            view.append(nudge("", marker=pending.pop(0)))
+    for marker in pending:
+        view.append(nudge("", marker=marker))
     return view
 
 
@@ -155,6 +172,10 @@ def build_react_graph(
         runner.registry.install_defaults(sandbox=ctx.sandbox)
     window_guard = guard or ContextWindowGuard()
     loop_breaker = breaker or LoopBreaker()
+    # The same four ported guards the classic loop uses, so both engines behave
+    # identically: tool contract, shell safety, specification audit, think tool.
+    guards = runner.guards
+    guards.install(runner.registry)
     settings = runner._s  # noqa: SLF001 - the runner owns these
     task_state = state
 
@@ -174,6 +195,8 @@ def build_react_graph(
                     gstate.get("bootstrap_hint") or None,
                 ),
             }]
+            # ToolContract: injected once, with the opening prompt.
+            trajectory.extend(guards.opening_messages(trajectory))
             seed = trajectory
         else:
             seed = []
@@ -278,6 +301,21 @@ def build_react_graph(
                     "content": f"Инструмент {action!r} неизвестен. Доступны: {available}.",
                 }],
             }
+        # ShellSafety: screen the call before it reaches the sandbox.
+        blocked = guards.screen_tool_call(action, action_input)
+        if blocked is not None:
+            kind = _kind_for_tool(action)
+            compressed = compress(kind, blocked, limit_tokens=_OBS_TOKEN_BUDGET)
+            observation = json.dumps(compressed, ensure_ascii=False)
+            _emit("react.shell_blocked", action=action, detail=blocked[:200])
+            return {
+                "observation": observation,
+                "steps": [{"step_idx": int(gstate.get("step_idx") or 1) - 1,
+                           "observation": observation, "blocked": True}],
+                "trajectory": [
+                    {"role": "user", "content": f"Observation ({kind}):\n{observation}"}
+                ],
+            }
         try:
             raw = await tool.run(action_input, ctx=ctx)
         except Exception as exc:  # noqa: BLE001 - a tool failure is an observation
@@ -288,11 +326,20 @@ def build_react_graph(
         if estimate_tokens(observation) > _OBS_TOKEN_BUDGET:
             observation = observation[: _OBS_TOKEN_BUDGET * 4] + "\n[truncated]"
         _emit("react.observation", action=action, kind=kind, chars=len(observation))
+        delta: list[dict[str, str]] = [
+            {"role": "user", "content": f"Observation ({kind}):\n{observation}"}
+        ]
+        # SpecificationAudit: nudge once after the model inspects a new file.
+        audit = guards.after_observation(
+            list(gstate.get("trajectory") or []) + delta
+        )
+        if audit is not None:
+            delta.append(audit)
         return {
             "observation": observation,
             "steps": [{"step_idx": int(gstate.get("step_idx") or 1) - 1,
                        "observation": observation}],
-            "trajectory": [{"role": "user", "content": f"Observation ({kind}):\n{observation}"}],
+            "trajectory": delta,
         }
 
     def observe(gstate: ReActState) -> dict[str, Any]:
@@ -301,15 +348,18 @@ def build_react_graph(
         The breaker reads a *tool-shaped* history (assistant turns carrying
         ``tool_calls`` followed by ``tool`` results), while the wire trajectory
         is plain role/content.  :func:`_breaker_view` rebuilds that shape from
-        the recorded steps, so the breaker sees exactly what it was written for
-        without the provider ever receiving a non-GigaChat message form.
+        the recorded steps **and the nudges already injected**, so the breaker
+        sees exactly what it was written for — including its own markers, which
+        are what bound each signature to ``max_injections``.
         """
-        view = _breaker_view(list(gstate.get("steps") or []))
+        view = _breaker_view(
+            list(gstate.get("steps") or []), list(gstate.get("nudges") or [])
+        )
         signal = loop_breaker.inspect(view)
         if signal is None:
             return {}
         _emit("react.loop_breaker", kind=signal.kind, detail=signal.detail)
-        return {"trajectory": [signal.message()], "nudges": [signal.kind]}
+        return {"trajectory": [signal.message()], "nudges": [signal.marker]}
 
     def finish(gstate: ReActState) -> dict[str, Any]:
         """Terminal node: parse the plan out of the finish payload."""
@@ -393,7 +443,7 @@ def run_react_graph(
             pass
         return graph.get_state(config).values or {}
 
-    values = asyncio.run(_drive())
+    values = await_blocking(_drive())
 
     result = ReActResult()
     result.llm_calls = int(values.get("llm_calls") or 0)

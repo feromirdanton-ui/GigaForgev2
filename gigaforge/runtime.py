@@ -131,16 +131,30 @@ def build_provider(
 ) -> Provider:
     """Return the provider the harness should talk to.
 
-    For the built-in GigaChat path the provider is constructed **from the client
+    Three selections, all resolved from ``GIGAFORGE_PROVIDER``:
+
+    ``gigachat-sdk`` (aliases ``sdk``, ``gigachat_sdk``)
+        The **official** ``gigachat`` SDK transport
+        (:class:`~gigaforge.providers.gigachat_sdk_adapter.GigaChatSDKProvider`).
+        This is the transport §7.2 of the merge plan prescribes; it is opt-in
+        because the SDK is an optional dependency, and it falls back to the
+        legacy client with a logged warning when the package is absent.
+
+    ``giga`` / ``gigachat`` (default)
+        The legacy :class:`GigaChatProvider` over the in-repo ``GigaClient``.
+
+    ``openai``
+        The OpenAI-compatible adapter, taken from the registry.
+
+    For the built-in GigaChat paths the provider is constructed **from the client
     passed here** and then registered as the ``"giga"`` instance.  That ordering
     matters: the registry caches instances, so returning ``registry.default()``
     after a credential change handed back a provider wrapping the *previous*
     (now closed) client — every call then failed with "Cannot send a request, as
     the client has been closed" right after a successful login.
 
-    A non-GigaChat selection (``GIGAFORGE_PROVIDER=openai``) still comes from the
-    registry, and an unusable selection falls back to GigaChat instead of taking
-    the process down: a typo in an env var must not make the harness unrunnable.
+    An unusable selection falls back to GigaChat instead of taking the process
+    down: a typo in an env var must not make the harness unrunnable.
     """
     import os
 
@@ -149,7 +163,19 @@ def build_provider(
     attach_giga_client(client)
     registry = default_registry()
     selected = (os.environ.get("GIGAFORGE_PROVIDER") or "giga").strip().lower()
-    if selected in {"", "giga", "gigachat"}:
+
+    if selected in {"gigachat-sdk", "gigachat_sdk", "sdk"}:
+        provider = _build_sdk_provider(settings, max_context=max_context)
+        if provider is not None:
+            registry.register_instance("giga", provider)
+            return provider
+        log.warning(
+            "GIGAFORGE_PROVIDER=%s requested but the official 'gigachat' SDK is "
+            "unavailable; using the legacy GigaClient transport",
+            selected,
+        )
+
+    if selected in {"", "giga", "gigachat", "gigachat-sdk", "gigachat_sdk", "sdk"}:
         provider = GigaChatProvider(client, max_context=max_context)
         registry.register_instance("giga", provider)
         return provider
@@ -160,6 +186,41 @@ def build_provider(
         provider = GigaChatProvider(client, max_context=max_context)
         registry.register_instance("giga", provider)
         return provider
+
+
+def _build_sdk_provider(
+    settings: Optional[Settings],
+    *,
+    max_context: Optional[int] = None,
+) -> Optional[Provider]:
+    """Construct the official-SDK provider, or ``None`` when it cannot be used.
+
+    Returns ``None`` (never raises) when the SDK is not installed or the
+    credential is missing, so :func:`build_provider` can fall back cleanly.
+    """
+    from gigaforge.providers.gigachat_sdk_adapter import (
+        GigaChatSDKProvider,
+        sdk_available,
+    )
+
+    if not sdk_available():
+        return None
+    s = settings or get_settings()
+    if not s.auth_key:
+        return None
+    try:
+        return GigaChatSDKProvider(
+            credentials=s.auth_key,
+            scope=s.scope,
+            base_url=s.base_url,
+            model=s.default_model or "GigaChat-2-Pro",
+            max_context=max_context,
+            verify_ssl=s.verify_tls,
+            timeout=float(s.timeout_total),
+        )
+    except Exception as exc:  # noqa: BLE001 - a bad SDK config must not be fatal
+        log.warning("could not construct the official-SDK provider: %s", exc)
+        return None
 
 
 def build_client(
@@ -189,7 +250,31 @@ def build_client(
         # value pins one window for every model.
         max_context=config.max_context or None,
     )
+    # The SDK transport has no retry layer of its own (the adapter builds the
+    # SDK client with ``max_retries=0`` so the policy is not doubled), so the
+    # single owner of retries is applied here, around whichever provider was
+    # selected.  Without this a lone 429/5xx on the SDK path was a hard failure.
+    provider = _with_retries(provider, s)
     return SyncChatClient(provider), raw, token_provider, provider
+
+
+def _with_retries(provider: Provider, settings: Settings) -> Provider:
+    """Wrap *provider* in the project's retry policy.
+
+    The legacy ``GigaClient`` already retries internally, so wrapping it again
+    would double the attempts (the exact hazard the official SDK's MIGRATION.md
+    warns about).  Only providers that do **not** own a retry loop are wrapped —
+    today that is the official-SDK adapter.
+    """
+    if getattr(provider, "owns_retries", False):
+        return provider
+    try:
+        from gigaforge.providers.retrying import RetryingProvider
+
+        return RetryingProvider(provider, settings=settings)
+    except Exception as exc:  # noqa: BLE001 - retries are an optimisation
+        log.warning("retry wrapper unavailable (%s); using the raw provider", exc)
+        return provider
 
 
 # ══════════════════════════════════════════════════════════════════════════
