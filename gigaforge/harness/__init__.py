@@ -294,7 +294,14 @@ class Harness:
         return max(0.0, min(backoff, self.policy.max_wait))
 
     def _record_result(self, ledger: RunLedger, result: Any) -> None:
-        """Copy the runner's own accounting into the ledger."""
+        """Copy the runner's own accounting into the ledger.
+
+        ``ReActResult`` carries ``llm_calls`` and per-step records but not the
+        token totals — those live in the ``BudgetTracker`` the runner shares
+        with the router.  Reading them from there is what makes the ledger's
+        token columns real instead of zero: a cost report that always says
+        ``0+0 tok`` is worse than no report, because it looks authoritative.
+        """
         for step in getattr(result, "steps", None) or []:
             if not isinstance(step, dict):
                 continue
@@ -306,3 +313,16 @@ class Harness:
         calls = int(getattr(result, "llm_calls", 0) or 0)
         for index in range(calls):
             ledger.llm(name=f"step_{index}")
+
+        # Token totals: prefer the shared budget tracker, which the runner
+        # commits to after every call.  The ledger's run id *is* the task id —
+        # the pipeline binds them together before planning.
+        task_id = ledger.run_id
+        budgets = self._budgets
+        if budgets is not None and task_id:
+            try:
+                used = budgets._task_used_in(task_id)  # noqa: SLF001 - same package
+                ledger.tokens_in_override = int(used.get("in", 0))
+                ledger.tokens_out_override = int(used.get("out", 0))
+            except Exception:  # noqa: BLE001 - accounting is best-effort
+                pass

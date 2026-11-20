@@ -775,6 +775,76 @@ class ReActPlan:
             }],
         )
 
+    def plan_under_harness(
+        self,
+        goal: str,
+        slice_text: str,
+        *,
+        ask: AskFn,
+        parse: Callable[[str], list[str]],
+        policy: Any = None,
+    ) -> tuple[PlanOutcome, Any]:
+        """Plan through the :class:`~gigaforge.harness.Harness`.
+
+        The harness is what makes a ReAct plan *survivable*: it retries a 429
+        with the server's own ``Retry-After``, compacts and retries on a context
+        overflow instead of ending the episode, and records a ledger of what the
+        exploration cost.
+
+        Without this method the harness would be another inert layer — built,
+        tested, and never called by the product.  ``plan()`` keeps its old
+        behaviour for callers that do not want a policy; this is the entry point
+        the pipeline uses.
+
+        Returns ``(outcome, ledger)``; the ledger is ``None`` when the runner
+        could not be built (the linear fallback has no episode to account for).
+        """
+        from gigaforge.harness import Harness, HarnessPolicy
+
+        runner = self._build_runner(goal)
+        if runner is None:
+            return self._linear(goal, slice_text, ask=ask, parse=parse), None
+
+        harness = Harness(policy=policy or HarnessPolicy(), budgets=getattr(runner, "_budgets", None))
+        outcome = harness.run(
+            runner,
+            goal,
+            runner.state,
+            ctx=runner.ctx,
+            run_id=self._run_id or "react-plan",
+            engine="react",
+        )
+        if not outcome.ok:
+            log.warning(
+                "ReAct planning stopped (%s: %s); falling back to linear",
+                outcome.finish_reason,
+                outcome.error,
+            )
+            return self._linear(goal, slice_text, ask=ask, parse=parse), outcome.ledger
+
+        result = outcome.result
+        steps = [_describe_plan_step(step) for step in (getattr(result, "plan", None) or [])]
+        steps = [step for step in steps if step]
+        if not steps:
+            return self._linear(goal, slice_text, ask=ask, parse=parse), outcome.ledger
+        return (
+            PlanOutcome(
+                steps=steps,
+                strategy=self.name,
+                score=score_steps(steps),
+                candidates=[{
+                    "branch": "react",
+                    "steps": steps,
+                    "score": score_steps(steps),
+                    "finish_reason": getattr(result, "finish_reason", ""),
+                    "llm_calls": getattr(result, "llm_calls", 0),
+                    "compactions": outcome.ledger.compactions if outcome.ledger else 0,
+                    "retries": outcome.ledger.retries if outcome.ledger else 0,
+                }],
+            ),
+            outcome.ledger,
+        )
+
 
 PLAN_STRATEGIES: dict[str, Callable[[], PlanStrategy]] = {
     "linear": LinearPlan,

@@ -895,15 +895,31 @@ class TaskPipeline:
         if callable(binder):
             binder(ctx.run_id)
 
-        outcome: PlanOutcome = self.plan_strategy.plan(
-            ctx.state.goal,
-            slice_text,
-            ask=lambda phase, prompt, temperature=None: self._ask(
-                phase, prompt, ctx, temperature=temperature
-            ),
-            parse=_parse_plan,
-            budget_remaining=budget_remaining,
-        )
+        # A strategy that can run under the harness does so: the harness owns
+        # the retry policy, the overflow recovery and the ledger.  A strategy
+        # that cannot (linear, ToT) keeps the plain call — the harness is for
+        # episodes, and those strategies have none.
+        harness_plan = getattr(self.plan_strategy, "plan_under_harness", None)
+        ledger = None
+        if callable(harness_plan):
+            outcome, ledger = harness_plan(
+                ctx.state.goal,
+                slice_text,
+                ask=lambda phase, prompt, temperature=None: self._ask(
+                    phase, prompt, ctx, temperature=temperature
+                ),
+                parse=_parse_plan,
+            )
+        else:
+            outcome = self.plan_strategy.plan(
+                ctx.state.goal,
+                slice_text,
+                ask=lambda phase, prompt, temperature=None: self._ask(
+                    phase, prompt, ctx, temperature=temperature
+                ),
+                parse=_parse_plan,
+                budget_remaining=budget_remaining,
+            )
         ctx.state.set_plan(outcome.steps)
         plan = [s.description for s in ctx.state.plan]
         self._event(
@@ -913,7 +929,16 @@ class TaskPipeline:
             strategy=outcome.strategy,
             score=outcome.score,
             judge=outcome.judge_used,
+            compactions=getattr(ledger, "compactions", 0) if ledger else 0,
+            retries=getattr(ledger, "retries", 0) if ledger else 0,
         )
+        if ledger is not None:
+            # The ledger is the run's cost record; keep it next to the trace so
+            # a report can read one file instead of grepping three.
+            try:
+                ledger.write(Path(str(getattr(self.config, "trace_path", ".gigaforge/traces/core.jsonl"))).parent / f"{ctx.run_id}.ledger.json")
+            except Exception as exc:  # noqa: BLE001 - reporting must not fail a run
+                log.debug("could not write the run ledger: %s", exc)
         return {"plan": plan, "plan_meta": outcome.to_dict()}
 
     def _file_context(self, goal: str, *, limit: int = 4, max_chars: int = 12000) -> str:

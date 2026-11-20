@@ -61,6 +61,11 @@ class RunLedger:
     retries: int = 0
     rate_limit_waits: float = 0.0
     error: str = ""
+    #: Authoritative token totals from the shared budget tracker.  ``None``
+    #: means "sum the steps"; a number means the tracker knows better, because
+    #: the runner commits real usage there after every call.
+    tokens_in_override: Optional[int] = None
+    tokens_out_override: Optional[int] = None
 
     # -- recording -----------------------------------------------------------
     def add(self, record: StepRecord) -> StepRecord:
@@ -124,10 +129,14 @@ class RunLedger:
 
     @property
     def tokens_in(self) -> int:
+        if self.tokens_in_override is not None:
+            return int(self.tokens_in_override)
         return sum(step.tokens_in for step in self.steps)
 
     @property
     def tokens_out(self) -> int:
+        if self.tokens_out_override is not None:
+            return int(self.tokens_out_override)
         return sum(step.tokens_out for step in self.steps)
 
     @property
