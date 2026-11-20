@@ -35,6 +35,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 #: Colour words a goal may name, mapped to the CSS spellings that satisfy them.
 #:
@@ -380,6 +381,74 @@ def extract_requirements(goal: str) -> list[Requirement]:
     return reqs
 
 
+def requirements_from_plan(plan: Any) -> list[Requirement]:
+    """The contract for a page goal, taken from the plan the harness itself made.
+
+    **Why this exists.**  ``extract_requirements`` reads the goal text with
+    regexes, and it returns **zero** requirements for "Create a single-file
+    index.html", "Build a landing page" and "Make a website for my bakery" —
+    three of the four ordinary ways to ask for a page.  So the gate was absent
+    exactly where it was needed most, and a page with no hero, no palette and
+    four "Feature Card 1" divs passed.
+
+    The harness already knows what the page should be: ``plan_generation``
+    decided the sections, the palette and the path.  A contract built from that
+    plan exists for every page goal, and it checks what the harness itself
+    ordered — which is also the fix for "the contract rejects correct work":
+    it can no longer demand something the plan never asked for.
+
+    ``plan`` is a :class:`gigaforge.harness.generation.GenerationPlan`; it is
+    typed loosely to keep this module free of a circular import.
+    """
+    reqs: list[Requirement] = []
+    kinds = list(getattr(plan, "kinds", lambda: [])() or [])
+    palette = tuple(getattr(plan, "palette", ()) or ())
+
+    for kind in kinds:
+        needles = _SECTION_WORDS.get(kind)
+        if needles is None:
+            # A section the catalogue knows but the word table does not: the
+            # section's own class name is the marker the assembler writes.
+            needles = (f'class="{kind}"', f"<{kind}")
+        reqs.append(Requirement("section", f"section '{kind}'", tuple(needles)))
+
+    for word in palette:
+        needles = _COLOUR_WORDS.get(word)
+        if needles:
+            reqs.append(Requirement("colour", f"colour '{word}'", needles))
+
+    # Every page the harness assembles is one self-contained file: the skeleton
+    # is the harness's, and a child is told not to emit external assets.
+    reqs.append(Requirement("self_contained", "no external assets"))
+    reqs.append(Requirement("heading", "a headline (<h1>)"))
+    reqs.append(
+        Requirement("min_size", f"artifact of at least {_MIN_ARTIFACT_BYTES} bytes")
+    )
+    reqs.append(
+        Requirement(
+            "substance",
+            "real content, not placeholders (no 'Feature Card 1', 'Footer "
+            "Content', 'lorem ipsum', 'TODO'; at least "
+            f"{_MIN_VISIBLE_TEXT_CHARS} characters of visible text)",
+        )
+    )
+    if "features" in kinds:
+        # The grid is the section most likely to be a skeleton: measured live,
+        # a page reported "cards: 0" while four cards were on screen, because
+        # the children wrote ``.feature-item`` and the base sheet styled
+        # ``.feature-card``.  The count is checked on the markup, and both
+        # spellings are accepted — the harness must not fail a page over a
+        # class name it did not fix.
+        reqs.append(
+            Requirement(
+                "card_count",
+                "at least 3 feature cards in the grid",
+                ("feature-card", "feature-item", "card"),
+            )
+        )
+    return reqs
+
+
 def check_artifacts(
     requirements: list[Requirement],
     worktree: Path,
@@ -456,6 +525,26 @@ def check_artifacts(
                 verdict.met.append(req.label)
             else:
                 verdict.unmet.append(f"{req.label} — no non-empty <h1> in the page")
+            continue
+        if req.kind == "card_count":
+            # Count the cards in the markup, accepting every spelling a child
+            # plausibly writes.  Measured live: the report said "cards: 0"
+            # while four cards were on screen, because the children wrote
+            # ``.feature-item`` and the base sheet styled ``.feature-card``.
+            # The count is a fact about the file; the class name is not.
+            best = 0
+            for text in texts.values():
+                found = 0
+                for needle in req.needles:
+                    found = max(found, len(re.findall(
+                        rf'class="[^"]*\b{re.escape(needle)}\b', text, re.I)))
+                best = max(best, found)
+            if best >= 3:
+                verdict.met.append(req.label)
+            else:
+                verdict.unmet.append(
+                    f"{req.label} (found {best} card(s) in the markup)"
+                )
             continue
         if req.kind == "substance":
             # Name the offending phrases: "add real content" is not actionable,

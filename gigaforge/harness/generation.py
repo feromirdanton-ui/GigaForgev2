@@ -214,9 +214,102 @@ def section_prompt(plan: GenerationPlan, section: SectionPlan, goal: str) -> str
         f"* use the palette: {palette};\n"
         "* write real, specific copy about the subject — no lorem ipsum, no "
         "\"Feature 1\", no placeholder text;\n"
-        "* self-contained: no external images, fonts or scripts; draw with CSS.\n\n"
+        "* the feature grid needs at least three cards, each with "
+        "`class=\"feature-card\"` (the base sheet styles it);\n"
+        "* self-contained: no external images, fonts or scripts; draw with CSS. "
+        "If you need rules of your own, put them in a single <style> block — the "
+        "harness collects it into the page's one stylesheet, scoped to your "
+        "section.\n\n"
         "Return the markup and nothing else."
     )
+
+
+def _extract_css(fragment: str) -> tuple[str, str]:
+    """Split a child's answer into ``(markup, css)``.
+
+    **Why the CSS is kept.**  ``_strip_document_wrapper`` used to delete every
+    ``<style>`` block a child emitted::
+
+        text = re.sub(r"<style\\b[^>]*>.*?</style\\s*>", "", text, flags=re.S | re.I)
+
+    The child is told "self-contained: no external images, fonts or scripts;
+    draw with CSS" — so it was asked to do exactly the thing that was then
+    thrown away.  Measured: a child's ``@keyframes glitch`` never reached the
+    page, and the report's "glitch in the render" claim had no mechanism behind
+    it.
+
+    The harness still owns the *single* ``<style>`` block — that is what stops
+    a second stylesheet in the body — but the rules a child wrote are collected
+    and concatenated into it, scoped by section so two children cannot collide.
+    """
+    text = (fragment or "").strip()
+    if not text:
+        return "", ""
+    blocks = re.findall(r"<style\b[^>]*>(.*?)</style\s*>", text, re.S | re.I)
+    css = "\n".join(block.strip() for block in blocks if block.strip())
+    markup = re.sub(r"<style\b[^>]*>.*?</style\s*>", "", text, flags=re.S | re.I)
+    return markup.strip(), css
+
+
+def _scope_css(css: str, section: str) -> str:
+    """Prefix a child's selectors with its section, so sections cannot collide.
+
+    ``@keyframes`` and ``@font-face`` are global by definition and are left
+    alone; everything else is scoped under ``.<section>``.  A selector that is
+    already scoped, or that targets ``:root``/``body``/``html``, is left as the
+    child wrote it — those are page-level rules and prefixing them would break
+    the page rather than protect it.
+    """
+    if not css.strip():
+        return ""
+    out: list[str] = []
+    # Walk top-level blocks with a depth counter.  A regex cannot do this: an
+    # ``@keyframes`` block contains ``0% { ... }`` blocks, and a flat
+    # ``selector { body }`` match turned the keyframes into ``.hero 0% {...}``
+    # — which is not a keyframe and not a rule, so the animation silently died.
+    index = 0
+    length = len(css)
+    while index < length:
+        open_at = css.find("{", index)
+        if open_at < 0:
+            break
+        selector = css[index:open_at].strip()
+        depth = 0
+        cursor = open_at
+        end = -1
+        while cursor < length:
+            if css[cursor] == "{":
+                depth += 1
+            elif css[cursor] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = cursor
+                    break
+            cursor += 1
+        if end < 0:
+            break
+        body = css[open_at + 1:end].strip()
+        index = end + 1
+        if not selector:
+            continue
+        if selector.startswith("@"):
+            # At-rules are global by definition: ``@keyframes``, ``@font-face``,
+            # ``@media``.  Prefixing them breaks them.
+            out.append(f"{selector} {{ {body} }}")
+            continue
+        parts: list[str] = []
+        for one in selector.split(","):
+            one = one.strip()
+            if not one:
+                continue
+            if one.startswith((".", "#", ":", "[")) or one.split()[0] in {
+                "body", "html", ":root", "*"
+            }:
+                parts.append(one)
+            else:
+                parts.append(f".{section} {one}")
+        out.append(f"{', '.join(parts)} {{ {body} }}")
+    return "\n".join(out)
 
 
 def _strip_document_wrapper(fragment: str) -> str:
@@ -226,8 +319,11 @@ def _strip_document_wrapper(fragment: str) -> str:
     common failure, and it is exactly what produced the doubled stylesheet.  The
     harness keeps the body content and drops everything else, so the assembly
     cannot inherit a second document.
+
+    The child's ``<style>`` content is *not* dropped — see :func:`_extract_css`;
+    the caller collects it and the assembler puts it in the one ``<style>``.
     """
-    text = (fragment or "").strip()
+    text, _css = _extract_css(fragment)
     if not text:
         return ""
     # Drop a fenced wrapper if the model added one.
@@ -240,7 +336,6 @@ def _strip_document_wrapper(fragment: str) -> str:
     # Remove any document-level tags the child emitted.
     text = re.sub(r"<!DOCTYPE[^>]*>", "", text, flags=re.I)
     text = re.sub(r"</?(?:html|head|body)\b[^>]*>", "", text, flags=re.I)
-    text = re.sub(r"<style\b[^>]*>.*?</style\s*>", "", text, flags=re.S | re.I)
     text = re.sub(r"<meta\b[^>]*>", "", text, flags=re.I)
     text = re.sub(r"<title\b[^>]*>.*?</title\s*>", "", text, flags=re.S | re.I)
     return text.strip()
@@ -257,13 +352,24 @@ def assemble_page(plan: GenerationPlan, fragments: dict[str, str], *, css: str =
     accent = palette[0]
     secondary = palette[1] if len(palette) > 1 else palette[0]
     body_parts: list[str] = []
+    child_css: list[str] = []
     for section in plan.sections:
-        fragment = _strip_document_wrapper(fragments.get(section.kind, ""))
+        raw = fragments.get(section.kind, "")
+        fragment = _strip_document_wrapper(raw)
         if not fragment:
             continue
         body_parts.append(f"    {section.anchor}\n    {fragment}")
+        # The child's own rules are kept, scoped to its section.  Dropping them
+        # was the defect: a child told "draw with CSS" had its CSS deleted, so
+        # its @keyframes never reached the page.
+        _markup, section_css = _extract_css(raw)
+        scoped = _scope_css(section_css, section.kind)
+        if scoped:
+            child_css.append(f"/* {section.kind} */\n{scoped}")
 
     base_css = css.strip() or _default_css(accent, secondary)
+    if child_css:
+        base_css = base_css + "\n" + "\n".join(child_css)
     return (
         "<!DOCTYPE html>\n"
         '<html lang="en">\n'
@@ -318,10 +424,19 @@ def _default_css(accent: str, secondary: str) -> str:
         a {{ color: var(--accent); }}
         .hero {{ min-height: 70vh; display: grid; place-content: center; text-align: center; }}
         .features {{ display: grid; gap: 1.5rem; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }}
-        .feature-card {{
+        .feature-card, .feature-item {{
             border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
             border-radius: 12px;
             padding: 1.5rem;
             background: rgba(255, 255, 255, 0.03);
         }}
+        @keyframes glitch {{
+            0% {{ transform: translate(0); text-shadow: 0 0 0 transparent; }}
+            20% {{ transform: translate(-2px, 2px); text-shadow: 2px 0 var(--secondary); }}
+            40% {{ transform: translate(2px, -2px); text-shadow: -2px 0 var(--accent); }}
+            60% {{ transform: translate(-1px, 1px); text-shadow: 1px 0 var(--secondary); }}
+            80% {{ transform: translate(1px, -1px); text-shadow: -1px 0 var(--accent); }}
+            100% {{ transform: translate(0); text-shadow: 0 0 0 transparent; }}
+        }}
+        .glitch {{ animation: glitch 2.4s infinite steps(2, end); }}
         footer {{ border-top: 1px solid rgba(255, 255, 255, 0.1); text-align: center; }}"""

@@ -2288,13 +2288,35 @@ class TaskPipeline:
             from gigaforge.harness.goal_contract import (
                 check_artifacts,
                 extract_requirements,
+                requirements_from_plan,
             )
 
-            requirements = extract_requirements(ctx.state.goal)
-            if not requirements:
-                return None
             files = [str(p) for p in changed if str(p).strip()]
             if not files:
+                return None
+            # A page goal is graded against the plan the harness itself made.
+            # ``extract_requirements`` returns nothing for "Create a single-file
+            # index.html", "Build a landing page" and "Make a website for my
+            # bakery" — so the gate was absent exactly where it was needed, and
+            # a page with no hero and four "Feature Card 1" divs passed.  The
+            # plan always exists for a page goal, so the contract always exists.
+            requirements = []
+            generation = ctx.extras.get("generation") or {}
+            if generation.get("sections"):
+                try:
+                    from gigaforge.harness.generation import plan_generation
+
+                    plan = plan_generation(_original_goal(ctx.state.goal))
+                    requirements = requirements_from_plan(plan)
+                    self._event("pipeline.contract_from_plan", run_id=ctx.run_id,
+                                sections=plan.kinds(), palette=list(plan.palette),
+                                requirements=len(requirements))
+                except Exception as exc:  # noqa: BLE001 - fall back to the goal text
+                    self._event("pipeline.contract_plan_error", run_id=ctx.run_id,
+                                error=str(exc)[:200])
+            if not requirements:
+                requirements = extract_requirements(ctx.state.goal)
+            if not requirements:
                 return None
             # The repair is NOT done here.  It used to be, after these two early
             # returns — and ``extract_requirements`` returns nothing for "Create
