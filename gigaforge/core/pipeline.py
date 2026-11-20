@@ -2145,11 +2145,63 @@ class TaskPipeline:
             files = [str(p) for p in changed if str(p).strip()]
             if not files:
                 return None
+            self._repair_html_artifacts(ctx, files)
             return check_artifacts(requirements, self._repo_root(), files=files)
         except Exception as exc:  # noqa: BLE001 - a broken check must not fail a run
             self._event("pipeline.contract_error", run_id=ctx.run_id,
                         error=str(exc)[:300])
             return None
+
+    def _repair_html_artifacts(self, ctx: RunContext, files: Sequence[str]) -> None:
+        """Fix structural HTML defects that have exactly one correct repair.
+
+        Measured live: a goal run produced a page whose stylesheet appeared twice
+        — once in ``<style>`` and once as 1956 characters of raw text in
+        ``<body>`` — with a stray ``</style>`` in the body and the feature grid
+        and footer each emitted twice.  Every check the harness had passed it.
+
+        The repair is deterministic and conservative (see
+        :mod:`gigaforge.harness.html_structure`): it only moves CSS that is
+        provably CSS and only deletes blocks that are byte-identical after
+        whitespace normalisation.  Anything it cannot prove is left alone and
+        reported by the verifier instead.
+
+        This runs *before* the contract check so the contract grades the page the
+        browser will actually render, not the broken source.
+        """
+        try:
+            from gigaforge.harness.html_structure import repair_html_structure
+        except Exception:  # pragma: no cover - import guard
+            return
+        root = self._repo_root()
+        for raw in files:
+            path = (root / str(raw)).resolve()
+            try:
+                path.relative_to(root)
+            except ValueError:
+                continue
+            if path.suffix.lower() not in {".html", ".htm"} or not path.is_file():
+                continue
+            try:
+                original = path.read_text(encoding="utf-8", errors="replace")
+                repaired, actions = repair_html_structure(original)
+            except Exception as exc:  # noqa: BLE001 - repair is best-effort
+                self._event("pipeline.html_repair_error", run_id=ctx.run_id,
+                            file=str(raw), error=str(exc)[:300])
+                continue
+            if not actions or repaired == original:
+                continue
+            try:
+                path.write_text(repaired, encoding="utf-8")
+            except OSError as exc:
+                self._event("pipeline.html_repair_error", run_id=ctx.run_id,
+                            file=str(raw), error=str(exc)[:300])
+                continue
+            ctx.extras.setdefault("html_repairs", []).append(
+                {"file": str(raw), "actions": actions}
+            )
+            self._event("pipeline.html_repaired", run_id=ctx.run_id,
+                        file=str(raw), actions=actions[:6])
 
     def _node_summarize(self, ctx: RunContext, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
         diff = str(inputs.get("final_diff", "") or "")

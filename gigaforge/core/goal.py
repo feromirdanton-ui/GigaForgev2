@@ -448,6 +448,17 @@ class WorkspaceVerifier:
             issues.append("duplicate id values: " + ", ".join(sorted(parser.duplicate_ids)[:8]))
         if parser.duplicate_scripts:
             issues.append("scripts loaded more than once: " + ", ".join(sorted(parser.duplicate_scripts)[:5]))
+        # Structural defects a browser shows but the tag counters above cannot
+        # see: a stylesheet printed as prose in <body>, and a block emitted
+        # twice.  Measured live: a page with 1956 characters of CSS in its body
+        # and a doubled <section>/<footer> passed every check above.
+        try:
+            from gigaforge.harness.html_structure import audit_html_structure
+
+            structure = audit_html_structure(path.read_text(encoding="utf-8", errors="replace"))
+            issues.extend(structure.issues())
+        except Exception as exc:  # noqa: BLE001 - a broken audit must not pass silently
+            issues.append(f"structural audit could not run: {type(exc).__name__}: {exc}")
         missing: list[str] = []
         for source in parser.script_srcs:
             parts = urlsplit(source)
