@@ -398,6 +398,36 @@ def _strip_document_wrapper(fragment: str) -> str:
     return text.strip()
 
 
+def _layout_invariants() -> str:
+    """The structural rules the harness owns, emitted after every child's CSS.
+
+    A child styles its own section; it does not get to decide the page's
+    structure.  Measured live, a child emitted::
+
+        .feature-grid { display: flex; gap: 20px; justify-content: center; }
+
+    with no ``flex-wrap``, so four cards sat in one 1440px row, each squeezed to
+    a quarter of the width with its text clipped — the page "had four cards" and
+    was unreadable.  The harness owns the grid: it wraps, it has a minimum card
+    width, and it is a grid rather than a row.
+
+    Emitted last so it wins on equal specificity; a child that wants a different
+    *look* can still change colours, borders, shadows and typography.
+    """
+    return (
+        "/* harness layout invariants */\n"
+        ".feature-grid, .features-grid, .features:not(section) {\n"
+        "    display: grid !important;\n"
+        "    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)) !important;\n"
+        "    gap: 1.5rem;\n"
+        "}\n"
+        ".feature-grid > *, .features-grid > *, .features > * {\n"
+        "    min-width: 0;\n"
+        "    overflow-wrap: anywhere;\n"
+        "}\n"
+    )
+
+
 def assemble_page(plan: GenerationPlan, fragments: dict[str, str], *, css: str = "") -> str:
     """Assemble the final page from per-section fragments.
 
@@ -427,6 +457,15 @@ def assemble_page(plan: GenerationPlan, fragments: dict[str, str], *, css: str =
     base_css = css.strip() or _default_css(accent, secondary)
     if child_css:
         base_css = base_css + "\n" + "\n".join(child_css)
+    # The layout invariant goes last, so it wins on equal specificity.  A child
+    # is free to style its own section, but it may not decide that the feature
+    # grid is a single row: measured live, a child emitted
+    # ``.feature-grid { display: flex; gap: 20px; justify-content: center; }``
+    # with no wrap, and four cards were laid out in one 1440px row, each
+    # squeezed to a quarter of the width with its text clipped.  The harness
+    # owns the *structure* — one grid, wrapping, a minimum card width — and the
+    # child owns the look.
+    base_css = base_css + "\n" + _layout_invariants()
     return (
         "<!DOCTYPE html>\n"
         '<html lang="en">\n'
