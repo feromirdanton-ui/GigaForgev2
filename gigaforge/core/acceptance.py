@@ -261,6 +261,24 @@ def merge_diffs(
                 "paths": paths[:4],
             })
             continue
+        # Applicability is not validity.  A diff can apply cleanly and still
+        # leave the file unparseable — measured live: a child's diff applied,
+        # the merge reported success, and the next cycle's verifier failed with
+        # "IndentationError: expected an indented block after function
+        # definition on line 4 (calc.py)".  The run then spent two more cycles
+        # repairing damage the merge had just certified.
+        #
+        # The check is cheap and deterministic: apply to a scratch copy and ask
+        # the language whether the result parses.  A child whose work does not
+        # parse has not done its work, whatever the diff looks like.
+        broken = _syntax_errors(diff, root, config)
+        if broken:
+            report.rejected.append({
+                "name": name,
+                "reason": "merged result does not parse",
+                "paths": broken[:4],
+            })
+            continue
         claimed.extend(paths)
         parts.append(diff)
         report.accepted.append(name)
@@ -302,6 +320,71 @@ def _applies(diff: str, root: Path | str, config: Any) -> bool:
         return bool(Applier(cfg).apply(parsed, dry_run=True).ok)
     except Exception:  # noqa: BLE001 - an unverifiable diff is not merged
         return False
+
+
+def _syntax_errors(diff: str, root: Path | str, config: Any) -> list[str]:
+    """Paths whose merged content would not parse.
+
+    Applies the diff to a scratch copy of the tree and asks the language
+    whether each touched file still parses.  Only Python is checked — it is the
+    language this project's own verifier checks, and a check that guesses at
+    other languages would reject correct work.
+
+    Returns the offending paths, empty when everything parses.  A file that
+    cannot be read is not reported: that is the applier's problem, and it has
+    already been checked by the dry run.
+    """
+    import ast
+    import shutil
+    import tempfile
+
+    try:
+        from gigaforge.firewall.diff import Applier, parse
+        from gigaforge.firewall.config import FirewallConfig
+
+        scratch = Path(tempfile.mkdtemp(prefix="gigaforge-accept-"))
+    except Exception:  # noqa: BLE001 - an unverifiable diff is not merged
+        return []
+    try:
+        source = Path(root)
+        for item in source.iterdir():
+            if item.name in {".git", ".gigaforge", "__pycache__", "node_modules", ".venv"}:
+                continue
+            target = scratch / item.name
+            try:
+                if item.is_dir():
+                    shutil.copytree(item, target, symlinks=True)
+                else:
+                    shutil.copy2(item, target)
+            except OSError:
+                continue
+        cfg = config
+        try:
+            from dataclasses import replace
+
+            cfg = replace(config, root=str(scratch)) if config is not None else FirewallConfig(root=str(scratch))
+        except Exception:  # noqa: BLE001
+            cfg = FirewallConfig(root=str(scratch))
+        parsed = parse(diff, cfg)
+        if not parsed.ok:
+            return []
+        applied = Applier(cfg).apply(parsed, dry_run=False)
+        if not applied.ok:
+            return []
+        broken: list[str] = []
+        for f in parsed.files:
+            path = scratch / str(f.path)
+            if path.suffix != ".py" or not path.is_file():
+                continue
+            try:
+                ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+            except SyntaxError:
+                broken.append(str(f.path))
+        return broken
+    except Exception:  # noqa: BLE001 - a check that cannot run must not reject
+        return []
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def allocate_work(
