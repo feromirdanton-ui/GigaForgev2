@@ -255,3 +255,23 @@ class TestPlanStability:
 
         assert _original_goal(SITE_GOAL) == SITE_GOAL
         assert _original_goal(SITE_GOAL + "\n\nLONG-LIVED GOAL MODE — x") == SITE_GOAL
+
+
+class TestEveryModeGetsTheSectionalPath:
+    """A page goal is built section by section in every mode, not only --subagents.
+
+    Measured live: ``run`` on the site goal produced a 2549-byte skeleton —
+    "Feature 1 / Feature 2 / Feature 3" — because one model call was asked to
+    write a whole page in one shot.
+    """
+
+    def test_the_act_node_reaches_sectional_generation(self) -> None:
+        import inspect
+
+        from gigaforge.core.pipeline import TaskPipeline
+
+        source = inspect.getsource(TaskPipeline._node_act)
+        assert "_sectional_generation" in source, (
+            "the plain run path must build a page section by section too"
+        )
+        assert "is_page_goal" in source

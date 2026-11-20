@@ -1643,6 +1643,22 @@ class TaskPipeline:
         if episode_diff:
             prefetched = "\n".join(p for p in (prefetched, episode_diff) if p)
 
+        # A page goal is built section by section in every mode, not only under
+        # ``--subagents``.  Measured live: ``run`` on the site goal produced a
+        # 2549-byte skeleton — "Feature 1 / Feature 2 / Feature 3" — because one
+        # model call was asked to write a whole page in one shot.  The harness
+        # owns the plan and the skeleton; that is true whether or not the user
+        # asked for sub-agents.
+        if not prefetched:
+            try:
+                from gigaforge.harness.generation import is_page_goal
+
+                if is_page_goal(_original_goal(ctx.state.goal)):
+                    prefetched = self._sectional_generation(ctx)
+            except Exception as exc:  # noqa: BLE001 - fall back to the coder
+                self._event("pipeline.generation_plan_error", run_id=ctx.run_id,
+                            error=str(exc)[:300])
+
         def propose(phase: str, prompt_text: str, iteration: int, hint: str) -> ProposeResult:
             text = self._ask(phase, prompt_text, ctx)
             route = self.router.last_route if self.router else None
