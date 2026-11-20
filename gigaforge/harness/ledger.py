@@ -76,6 +76,56 @@ class RunLedger:
     #: True when the plan had to be rebuilt from the episode's observations
     #: because the model's own finish payload was unusable.
     salvaged: bool = False
+    #: Cost of the run in integer micro-USD, accumulated from the price table.
+    #: Tokens alone do not answer the question a budget owner asks; a run that
+    #: is cheap in tokens on an expensive model is not a cheap run.
+    cost_micros: int = 0
+    #: Cache accounting.  ``cache_hit_rate`` is the fraction of lookups that
+    #: were served from cache — the number that says whether the cache is
+    #: earning its keep, which a bare ``cache_hit: bool`` cannot.
+    cache_hits: int = 0
+    cache_lookups: int = 0
+    #: Per-phase cost, so a report can say WHERE the money went.
+    phase_cost_micros: dict[str, int] = field(default_factory=dict)
+
+    def note_cost(self, *, model: str, phase: str, tokens_in: int, tokens_out: int,
+                  prices: Any = None) -> int:
+        """Add one call's cost; returns the micro-USD it added.
+
+        ``prices`` is a :class:`gigaforge.core.cost.PriceTable`; when it is
+        omitted the default table is used.  An unknown model costs zero — the
+        tokens are still counted, but a price is never invented.
+        """
+        if prices is None:
+            from gigaforge.core.cost import PriceTable
+
+            prices = PriceTable()
+        micros = int(prices.cost_micros(model, tokens_in, tokens_out))
+        self.cost_micros += micros
+        self.phase_cost_micros[phase] = self.phase_cost_micros.get(phase, 0) + micros
+        return micros
+
+    def note_cache(self, *, hit: bool) -> None:
+        """Record one cache lookup and whether it was served from cache."""
+        self.cache_lookups += 1
+        if hit:
+            self.cache_hits += 1
+
+    @property
+    def cache_hit_rate(self) -> float:
+        """Fraction of cache lookups served from cache (0.0 when none)."""
+        if self.cache_lookups <= 0:
+            return 0.0
+        return self.cache_hits / self.cache_lookups
+
+    @property
+    def cost_usd(self) -> float:
+        return self.cost_micros / 1_000_000
+
+    @property
+    def cost_per_task_usd(self) -> float:
+        """Cost of this run, which IS one task.  Named for the report column."""
+        return self.cost_usd
 
     def note_plan(self, *, used: bool, steps: int = 0, salvaged: bool = False) -> None:
         """Record what happened to the plan, for the report and the benchmark."""
@@ -188,6 +238,13 @@ class RunLedger:
             "plan_used": self.plan_used,
             "plan_steps_executed": self.plan_steps_executed,
             "salvaged": self.salvaged,
+            "cost_micros": self.cost_micros,
+            "cost_usd": round(self.cost_usd, 6),
+            "cost_per_task_usd": round(self.cost_per_task_usd, 6),
+            "phase_cost_micros": dict(self.phase_cost_micros),
+            "cache_hits": self.cache_hits,
+            "cache_lookups": self.cache_lookups,
+            "cache_hit_rate": round(self.cache_hit_rate, 4),
             "steps": [step.to_dict() for step in self.steps],
         }
 
@@ -207,6 +264,8 @@ class RunLedger:
             f"{self.run_id}: {self.finish_reason or 'running'} | "
             f"{self.llm_calls} llm / {self.tool_calls} tool | "
             f"{self.tokens_in}+{self.tokens_out} tok | "
+            f"${self.cost_usd:.4f} | "
+            f"cache {self.cache_hit_rate:.0%} | "
             f"{self.compactions} compact | "
             f"plan {'used' if self.plan_used else 'unused'}"
             f"{f' (salvaged)' if self.salvaged else ''} | "

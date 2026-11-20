@@ -546,7 +546,11 @@ class ModelRouter:
             )
 
         if ctx is not None and getattr(ctx, "state", None) is not None:
-            ctx.state.record_phase_usage(phase, usage)
+            # The model travels with the usage so the state can price the call:
+            # the same token count on a different model is a different bill.
+            priced = dict(usage)
+            priced.setdefault("model", model)
+            ctx.state.record_phase_usage(phase, priced)
 
     def _record_failure(
         self, phase: str, model: str, exc: BaseException, ctx: Optional[RunContext]

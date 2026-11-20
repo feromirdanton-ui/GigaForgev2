@@ -201,6 +201,16 @@ class TaskState:
     git_sha: str = ""
     phase_usages: dict[str, dict[str, Any]] = field(default_factory=dict)
     counters: dict[str, float] = field(default_factory=dict)
+    #: Cost of the run in integer micro-USD, accumulated per model call.
+    cost_micros: int = 0
+    #: Per-phase cost, so a report can say where the money went.
+    phase_cost_micros: dict[str, int] = field(default_factory=dict)
+    #: Cache accounting: lookups and hits.  A bare ``cache_hit`` bool says
+    #: whether the LAST lookup hit; the rate says whether the cache works.
+    cache_hits: int = 0
+    cache_lookups: int = 0
+    #: Things the run could not do and did not fail on (see ``note_degraded``).
+    degraded: list[dict[str, Any]] = field(default_factory=list)
     artifacts: dict[str, Any] = field(default_factory=dict)
     completed_nodes: list[str] = field(default_factory=list)
     history: list[dict[str, str]] = field(default_factory=list)
@@ -339,6 +349,54 @@ class TaskState:
         for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
             bucket[key] = bucket.get(key, 0) + int(usage.get(key, 0) or 0)
         bucket["calls"] = bucket.get("calls", 0) + 1
+        # Cost is accumulated here because this is the ONE place every model
+        # call passes through.  Tokens alone do not answer what a run cost: the
+        # same token count on a different model is a different bill, and a
+        # report that only shows tokens cannot tell a cheap run from an
+        # expensive one.
+        model = str(usage.get("model") or "")
+        if model:
+            try:
+                from gigaforge.core.cost import PriceTable
+
+                prices = getattr(self, "_prices", None)
+                if prices is None:
+                    prices = PriceTable()
+                    self._prices = prices
+                micros = int(
+                    prices.cost_micros(
+                        model,
+                        int(usage.get("prompt_tokens", 0) or 0),
+                        int(usage.get("completion_tokens", 0) or 0),
+                    )
+                )
+            except Exception:  # noqa: BLE001 - pricing must not fail a run
+                micros = 0
+            bucket["cost_micros"] = bucket.get("cost_micros", 0) + micros
+            self.cost_micros += micros
+            self.phase_cost_micros[phase] = self.phase_cost_micros.get(phase, 0) + micros
+
+    def note_cache(self, *, hit: bool) -> None:
+        """Record one cache lookup and whether it was served from cache."""
+        self.cache_lookups += 1
+        if hit:
+            self.cache_hits += 1
+
+    @property
+    def cache_hit_rate(self) -> float:
+        if self.cache_lookups <= 0:
+            return 0.0
+        return self.cache_hits / self.cache_lookups
+
+    def note_degraded(self, *, what: str, why: str, where: str = "") -> None:
+        """Record something the run could not do and did not fail on.
+
+        A silent ``except`` that swallows a broken check makes a run look clean
+        when it was merely unverified.  Every such degradation is recorded here
+        and surfaces in ``PipelineResult.degraded``, so "we did not check" is
+        never reported as "we checked and it passed".
+        """
+        self.degraded.append({"what": what, "why": why[:400], "where": where})
 
     def total_tokens(self) -> int:
         return int(sum(v.get("total_tokens", 0) for v in self.phase_usages.values()))

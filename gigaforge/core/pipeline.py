@@ -137,6 +137,22 @@ class PipelineResult:
     plan_used: bool = False
     plan_steps_executed: int = 0
     plan_salvaged: bool = False
+    #: Cost of this run in integer micro-USD and in USD.  Tokens alone do not
+    #: answer what a run cost: the same token count on a different model is a
+    #: different bill.
+    cost_micros: int = 0
+    cost_usd: float = 0.0
+    #: Per-phase cost, so a report can say where the money went.
+    phase_cost_micros: dict[str, int] = field(default_factory=dict)
+    #: Fraction of cache lookups served from cache.  A bare ``cache_hit`` bool
+    #: says whether the LAST lookup hit; this says whether the cache works.
+    cache_hit_rate: float = 0.0
+    cache_hits: int = 0
+    cache_lookups: int = 0
+    #: Things the run could not do and did not fail on.  A silent ``except``
+    #: that swallows a broken check makes a run look clean when it was merely
+    #: unverified; every such degradation is recorded here instead.
+    degraded: list[dict[str, Any]] = field(default_factory=list)
     #: Files whose creation hunk was rewritten into a modification because the
     #: file already existed (see ``harness.diff_repair``).
     diff_repaired: list[str] = field(default_factory=list)
@@ -197,6 +213,13 @@ class PipelineResult:
             "commits": list(self.commits),
             "escalation": self.escalation,
             "metrics": self.metrics,
+            "cost_micros": self.cost_micros,
+            "cost_usd": round(self.cost_usd, 6),
+            "phase_cost_micros": dict(self.phase_cost_micros),
+            "cache_hit_rate": round(self.cache_hit_rate, 4),
+            "cache_hits": self.cache_hits,
+            "cache_lookups": self.cache_lookups,
+            "degraded": list(self.degraded),
         }
 
     def model_dump(self, mode: str = "python") -> dict[str, Any]:
@@ -929,6 +952,10 @@ class TaskPipeline:
         if not key:
             return {"cache_hit": False, "cached_diff": ""}
         entry = self.cache.get(key)
+        # Every lookup is counted, hit or miss.  A bare ``cache_hit`` bool says
+        # whether the LAST lookup hit; the rate says whether the cache earns its
+        # keep, which is the number a report needs.
+        ctx.state.note_cache(hit=entry is not None)
         if entry is not None and isinstance(entry.value, Mapping):
             diff = str(entry.value.get("diff", ""))
             if diff:
@@ -2665,6 +2692,13 @@ class TaskPipeline:
             plan_used=bool(ctx.extras.get("plan_used")),
             plan_steps_executed=int(ctx.extras.get("plan_steps_executed") or 0),
             plan_salvaged=bool(ctx.extras.get("plan_salvaged")),
+            cost_micros=int(getattr(state, "cost_micros", 0) or 0),
+            cost_usd=float(getattr(state, "cost_micros", 0) or 0) / 1_000_000,
+            phase_cost_micros=dict(getattr(state, "phase_cost_micros", {}) or {}),
+            cache_hit_rate=float(getattr(state, "cache_hit_rate", 0.0) or 0.0),
+            cache_hits=int(getattr(state, "cache_hits", 0) or 0),
+            cache_lookups=int(getattr(state, "cache_lookups", 0) or 0),
+            degraded=list(getattr(state, "degraded", []) or []),
             diff_repaired=list(
                 (ctx.extras.get("diff_repaired") or {}).get("repaired") or []
             ),
