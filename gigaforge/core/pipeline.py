@@ -227,7 +227,9 @@ class TaskPipeline:
         self._sleep = sleeper or time.sleep
         # Policy stages.  Resolved from the environment when not injected, so a
         # deployment can switch reasoning style without touching call sites.
-        self.plan_strategy: PlanStrategy = plan_strategy or build_plan_strategy()
+        self.plan_strategy: PlanStrategy = plan_strategy or build_plan_strategy(
+            react_runner_factory=self._build_react_runner
+        )
         self.review_strategy: ReviewStrategy = review_strategy or build_review_strategy()
 
         self._owns_metrics = metrics is None
@@ -797,6 +799,50 @@ class TaskPipeline:
                 self._event("pipeline.cache_hit", run_id=ctx.run_id, key=key[:16])
                 return {"cache_hit": True, "cached_diff": diff}
         return {"cache_hit": False, "cached_diff": ""}
+
+    def _build_react_runner(self, goal: str = "") -> Any:
+        """Build a :class:`ReActRunner` from this pipeline's own collaborators.
+
+        This is the seam that makes the ReAct layer reachable from the product.
+        The runner is constructed lazily, only when ``GIGAFORGE_PLAN_STRATEGY``
+        selects ``react``, so a default run pays nothing for it.
+
+        Returns ``None`` when the pipeline cannot supply what the runner needs
+        (no client, no router, no sandbox).  :class:`ReActPlan` then degrades to
+        the one-shot plan instead of failing the run.
+        """
+        if self.client is None or self.router is None:
+            return None
+        try:
+            from gigaforge.agents.react import ReActContext, ReActRunner, ToolRegistry
+            from gigaforge.core.budgets import BudgetTracker
+            from gigaforge.core.state import TaskState
+            from gigaforge.core.trace import Tracer
+            from gigaforge.sandbox.allowlist import DEFAULT_ALLOWLIST
+            from gigaforge.sandbox.executor import SandboxExecutor
+
+            root = Path(str(getattr(self.config, "repo_root", ".") or ".")).resolve()
+            sandbox = SandboxExecutor(worktree=root, allowlist=DEFAULT_ALLOWLIST)
+            runner = ReActRunner(
+                self.client,
+                self.router,
+                BudgetTracker(),
+                Tracer(),
+                registry=ToolRegistry(),
+                settings=getattr(self, "_settings", None),
+            )
+            # The strategy adapter reads these two attributes off the runner.
+            runner.state = TaskState(run_id="react-plan", goal=goal)
+            runner.ctx = ReActContext(
+                repo_root=root,
+                worktree=root,
+                index=self.index,
+                sandbox=sandbox,
+            )
+            return runner
+        except Exception as exc:  # noqa: BLE001 - exploration is optional
+            log.warning("could not build the ReAct runner (%s)", exc)
+            return None
 
     def _node_plan(self, ctx: RunContext, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
         if inputs.get("cache_hit"):

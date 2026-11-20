@@ -47,6 +47,7 @@ __all__ = [
     "PlanStrategy",
     "LinearPlan",
     "TreeOfThoughtPlan",
+    "ReActPlan",
     "ReviewOutcome",
     "ReviewStrategy",
     "NoReview",
@@ -629,9 +630,102 @@ def _slice_proxy(slice_obj: Any) -> Any:
 # ══════════════════════════════════════════════════════════════════════════
 # selection
 # ══════════════════════════════════════════════════════════════════════════
+class ReActPlan:
+    """Plan by *exploring* the repository, not by guessing from a slice.
+
+    This is the strategy that makes the LangGraph ReAct layer reachable from the
+    product.  Before it existed, ``run_react_graph`` and ``ReActRunner`` were
+    only ever constructed by tests: the DAG's ``plan`` node always called a
+    one-shot prompt, so the whole observe/act/observe engine — and the four
+    guards wired into it — could not run in a real pipeline.
+
+    The strategy is a thin adapter: it builds a :class:`ReActRunner` from the
+    pipeline's own collaborators (client, router, budgets, tracer, sandbox) and
+    runs it through :func:`gigaforge.agents.engine.run_react`, which dispatches
+    to the classic loop or the LangGraph graph according to
+    ``GIGAFORGE_REACT_ENGINE``.  Both engines return the same
+    :class:`~gigaforge.agents.react.ReActResult`, so the DAG sees one shape.
+
+    Opt-in, because every ReAct step is a model call:
+
+        GIGAFORGE_PLAN_STRATEGY=react
+
+    When the runner cannot be built (no sandbox, no index, no client) the
+    strategy degrades to :class:`LinearPlan` rather than failing the run — a
+    missing exploration capability must not make the harness unrunnable.
+    """
+
+    name = "react"
+
+    def __init__(
+        self,
+        *,
+        runner_factory: Optional[Callable[[], Any]] = None,
+        max_steps: int = 6,
+    ) -> None:
+        self._runner_factory = runner_factory
+        self._max_steps = max_steps
+
+    def _linear(
+        self,
+        goal: str,
+        slice_text: str,
+        *,
+        ask: AskFn,
+        parse: Callable[[str], list[str]],
+        strategy: str = "react->linear",
+    ) -> PlanOutcome:
+        from .prompt import build_phase_prompt
+
+        prompt = build_phase_prompt("plan", goal=goal, slice_text=slice_text).render()
+        steps = parse(ask("plan", prompt))
+        return PlanOutcome(steps=steps, strategy=strategy, score=score_steps(steps))
+
+    def plan(
+        self,
+        goal: str,
+        slice_text: str,
+        *,
+        ask: AskFn,
+        parse: Callable[[str], list[str]],
+        budget_remaining: int = 0,
+    ) -> PlanOutcome:
+        runner = self._runner_factory(goal) if self._runner_factory is not None else None
+        if runner is None:
+            # No exploration capability wired in: fall back to the one-shot plan.
+            return self._linear(goal, slice_text, ask=ask, parse=parse)
+
+        from gigaforge.agents.engine import run_react
+
+        try:
+            result = run_react(runner, goal, runner.state, ctx=runner.ctx)
+        except Exception as exc:  # noqa: BLE001 - exploration is best-effort
+            log.warning("ReAct planning failed (%s); falling back to linear", exc)
+            return self._linear(goal, slice_text, ask=ask, parse=parse)
+
+        steps = [step.description for step in (getattr(result, "plan", None) or [])]
+        if not steps:
+            # The loop explored but never produced a plan: the slice-based plan
+            # is still better than an empty one.
+            return self._linear(goal, slice_text, ask=ask, parse=parse)
+        return PlanOutcome(
+            steps=steps,
+            strategy=self.name,
+            score=score_steps(steps),
+            candidates=[{
+                "branch": "react",
+                "steps": steps,
+                "score": score_steps(steps),
+                "finish_reason": getattr(result, "finish_reason", ""),
+                "llm_calls": getattr(result, "llm_calls", 0),
+            }],
+        )
+
+
 PLAN_STRATEGIES: dict[str, Callable[[], PlanStrategy]] = {
     "linear": LinearPlan,
     "tot": TreeOfThoughtPlan,
+    "react": ReActPlan,
 }
 
 REVIEW_STRATEGIES: dict[str, Callable[[], ReviewStrategy]] = {
@@ -642,11 +736,19 @@ REVIEW_STRATEGIES: dict[str, Callable[[], ReviewStrategy]] = {
 }
 
 
-def build_plan_strategy(name: str | None = None) -> PlanStrategy:
+def build_plan_strategy(
+    name: str | None = None,
+    *,
+    react_runner_factory: Optional[Callable[[], Any]] = None,
+) -> PlanStrategy:
     """Build a plan strategy by name; env ``GIGAFORGE_PLAN_STRATEGY`` wins.
 
     Unknown names fall back to ``linear`` with a warning — a typo in an env var
     must not make the harness unrunnable.
+
+    ``react_runner_factory`` is only used by :class:`ReActPlan`: the pipeline
+    passes a callable that builds a :class:`ReActRunner` from its own
+    collaborators, so the strategy never reaches for globals.
     """
     resolved = (name or os.environ.get("GIGAFORGE_PLAN_STRATEGY", "") or "linear").strip().lower()
     factory = PLAN_STRATEGIES.get(resolved)
@@ -657,6 +759,11 @@ def build_plan_strategy(name: str | None = None) -> PlanStrategy:
         return TreeOfThoughtPlan(
             branches=_env_int("GIGAFORGE_TOT_MAX_BRANCHES", 3),
             judge=_env_bool("GIGAFORGE_TOT_JUDGE", False),
+        )
+    if factory is ReActPlan:
+        return ReActPlan(
+            runner_factory=react_runner_factory,
+            max_steps=_env_int("GIGAFORGE_REACT_MAX_STEPS", 6),
         )
     return factory()
 
