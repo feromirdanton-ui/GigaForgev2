@@ -246,9 +246,66 @@ def _extract_css(fragment: str) -> tuple[str, str]:
     if not text:
         return "", ""
     blocks = re.findall(r"<style\b[^>]*>(.*?)</style\s*>", text, re.S | re.I)
-    css = "\n".join(block.strip() for block in blocks if block.strip())
+    css = "\n".join(_clean_css(block) for block in blocks if block.strip())
     markup = re.sub(r"<style\b[^>]*>.*?</style\s*>", "", text, flags=re.S | re.I)
-    return markup.strip(), css
+    return _clean_markup(markup).strip(), css
+
+
+#: A unified-diff line: ``+``/``-`` followed by content, or a hunk header.
+_DIFF_LINE_RE = re.compile(r"^(?:\+{1,3}|-{1,3})(?![-\d])|^@@ .* @@", re.M)
+
+
+def _clean_css(css: str) -> str:
+    """Remove unified-diff artefacts from a child's stylesheet.
+
+    A child is asked for a fragment and sometimes answers with a *diff* — the
+    same model, the same prompt family, and the fix loop's format leaks into the
+    section call.  Measured live, the assembled page's ``<style>`` contained::
+
+        .features +            .feature-card { +                background-color: ...
+
+    Every ``+`` is a diff marker, so the rule is invalid CSS and the browser
+    drops it — the section's styling silently disappeared while the page still
+    looked "assembled".  The markers are stripped rather than the block, because
+    the declarations underneath them are the child's real work.
+    """
+    if not css:
+        return ""
+    # A diff marker that got joined onto the previous line: ``{ +  color:`` or
+    # ``; +  color:``.  A ``+`` *between* selectors is the sibling combinator and
+    # is left alone — ``.features + .feature-card`` is valid CSS, and stripping
+    # it would silently change which elements the rule applies to.
+    css = re.sub(r"([{;])\s*\+\s+", r"\1 ", css)
+    lines: list[str] = []
+    for line in css.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("@@") or stripped.startswith("diff --git"):
+            continue
+        if stripped.startswith("+++") or stripped.startswith("---"):
+            continue
+        # A leading single ``+`` or ``-`` is a diff marker, not CSS: no selector
+        # or declaration starts with either.
+        if stripped[:1] in ("+", "-") and not stripped.startswith("--"):
+            line = stripped[1:].lstrip()
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _clean_markup(markup: str) -> str:
+    """Remove unified-diff artefacts from a child's markup."""
+    if not markup:
+        return ""
+    lines: list[str] = []
+    for line in markup.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("@@") or stripped.startswith("diff --git"):
+            continue
+        if stripped.startswith("+++") or stripped.startswith("---"):
+            continue
+        if stripped[:1] in ("+", "-") and not stripped.startswith("--"):
+            line = stripped[1:].lstrip()
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def _scope_css(css: str, section: str) -> str:
@@ -423,8 +480,19 @@ def _default_css(accent: str, secondary: str) -> str:
         h2 {{ font-size: clamp(1.5rem, 3vw, 2.25rem); color: var(--secondary); }}
         a {{ color: var(--accent); }}
         .hero {{ min-height: 70vh; display: grid; place-content: center; text-align: center; }}
-        .features {{ display: grid; gap: 1.5rem; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }}
-        .feature-card, .feature-item {{
+        /* The grid selector must match the markup the assembler writes.  It
+           styled ``.features`` while the section wrapper is
+           ``<div class="feature-grid">``, so the grid rules never applied:
+           measured in headless Chromium, four cards laid out as
+           ``684px 684px 0px 0px 0px`` — the third and fourth collapsed to zero
+           width and were invisible.  Both spellings are styled, because a child
+           may emit either. */
+        .features, .feature-grid, .features-grid {{
+            display: grid;
+            gap: 1.5rem;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        }}
+        .feature-card, .feature-item, .feature-grid > div, .features > div {{
             border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
             border-radius: 12px;
             padding: 1.5rem;
