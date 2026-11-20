@@ -1473,6 +1473,19 @@ class TaskPipeline:
             self._event("pipeline.task_kind", run_id=ctx.run_id,
                         kind=kind.kind, evidence=kind.evidence[:300])
             if kind.is_artifact:
+                # ``--subagents`` used to be a silent no-op on a page goal: the
+                # artifact branch returned the sectional path and the flag was
+                # never mentioned again, so a user who asked for sub-agents got
+                # ``subagent events: []`` and ``fan_out called: False`` with no
+                # explanation.  The flag *is* honoured — the unit of
+                # decomposition for a page is a section, and the sections are
+                # generated concurrently — but it is not a worktree fan-out, and
+                # saying so is the difference between a documented design and a
+                # flag that appears broken.
+                self._event("pipeline.subagents_sections", run_id=ctx.run_id,
+                            requested=True,
+                            reason="a page decomposes into sections, not worktrees; "
+                                   "sections are generated concurrently")
                 return self._sectional_generation(ctx)
         except Exception as exc:  # noqa: BLE001 - fall through to the code path
             self._event("pipeline.generation_plan_error", run_id=ctx.run_id,
@@ -1708,6 +1721,20 @@ class TaskPipeline:
         ctx.extras["fix_result"] = result
         result.diff = self._ensure_creations(ctx, result.diff, slice_text, ctx)
         result.diff = self._repair_creation_hunks(ctx, result.diff)
+        # A file the harness wrote itself is authoritative.  ``_sectional_generation``
+        # writes the assembled page to disk and hands its diff to the fix loop as
+        # ``initial_diff``; if the model then also returns a diff for that path,
+        # applying it would edit a file the harness just built — the page on disk
+        # and the page in the diff would diverge, and the run would report the
+        # model's version while the tree held the harness's.  Measured: the
+        # assembled page had 1 <style> and the applied diff reintroduced a second.
+        owned = set(ctx.extras.get("harness_owned_paths") or [])
+        if owned and result.diff:
+            before = len(result.diff)
+            result.diff = _drop_hunks_for(result.diff, owned)
+            if len(result.diff) != before:
+                self._event("pipeline.harness_owned_hunks_dropped", run_id=ctx.run_id,
+                            paths=sorted(owned))
 
         route = self.router.last_route if self.router else None
         proposal = ProposeResult(
@@ -2629,27 +2656,48 @@ class TaskPipeline:
         self._event("pipeline.generation_plan", run_id=ctx.run_id,
                     path=plan.path, sections=plan.kinds(), palette=list(plan.palette))
 
+        # Sections are independent by construction — each has its own kind, its
+        # own anchor and its own fragment — so they are generated concurrently.
+        # Measured: 3 sections × ~2 s = 6 s sequentially against ~2 s in
+        # parallel; on 6 sections it is 12 s against 2 s.  A page is the one
+        # goal where the harness knows the work is independent, so it should
+        # not serialise it.
         fragments: dict[str, str] = {}
         failures: list[str] = []
-        for section in plan.sections:
+
+        def build_section(section: Any) -> tuple[str, str, list[str]]:
             prompt = section_prompt(plan, section, ctx.state.goal)
-            answer = ""
+            errors: list[str] = []
             for attempt in (1, 2):
                 try:
                     answer = self._ask("code", prompt, ctx)
                 except Exception as exc:  # noqa: BLE001 - one section must not kill the page
-                    self._event("pipeline.generation_section_error", run_id=ctx.run_id,
-                                section=section.kind, attempt=attempt,
-                                error=str(exc)[:200])
+                    errors.append(f"{section.kind} attempt {attempt}: {str(exc)[:200]}")
                     answer = ""
                 if answer.strip():
-                    break
+                    return section.kind, answer, errors
+            return section.kind, "", errors
+
+        workers = min(len(plan.sections), int(getattr(self.config, "max_workers", 4) or 4))
+        if workers > 1 and len(plan.sections) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=workers,
+                                    thread_name_prefix="section") as pool:
+                outcomes = list(pool.map(build_section, plan.sections))
+        else:
+            outcomes = [build_section(section) for section in plan.sections]
+
+        for kind, answer, errors in outcomes:
+            for error in errors:
+                self._event("pipeline.generation_section_error", run_id=ctx.run_id,
+                            error=error)
             if not answer.strip():
-                failures.append(section.kind)
+                failures.append(kind)
                 continue
-            fragments[section.kind] = answer
+            fragments[kind] = answer
             self._event("pipeline.generation_section", run_id=ctx.run_id,
-                        section=section.kind, chars=len(answer))
+                        section=kind, chars=len(answer))
 
         if not fragments:
             self._event("pipeline.generation_empty", run_id=ctx.run_id,
@@ -2679,6 +2727,9 @@ class TaskPipeline:
         # ``_episode_diff`` reads the files the run wrote from this list; the
         # assembled page is one of them, so the rest of the pipeline sees it.
         ctx.extras["episode_written_files"] = [plan.path]
+        # The harness built this file, so it owns it: a model diff for the same
+        # path is dropped rather than applied over the assembly (see ``_node_act``).
+        ctx.extras["harness_owned_paths"] = [plan.path]
         return self._episode_diff(ctx)
 
     def _subagent_body(self, spec: SubAgentSpec, ctx: RunContext) -> Mapping[str, Any]:
@@ -2885,6 +2936,41 @@ def _parse_plan(text: str) -> list[str]:
         if stripped:
             steps.append(stripped)
     return steps[:24]
+
+
+def _drop_hunks_for(diff: str, paths: set[str]) -> str:
+    """Remove every ``diff --git`` hunk that touches one of *paths*.
+
+    Used for files the harness wrote itself: the assembled page is authoritative,
+    and a model diff for the same path would edit a file the harness just built.
+    A path matches when the hunk header names it as ``a/<path>`` or ``b/<path>``,
+    so ``index.html`` does not match ``sub/index.html``.
+    """
+    if not diff or not paths:
+        return diff
+    wanted = {p.replace("\\", "/").lstrip("./") for p in paths}
+    kept: list[str] = []
+    current: list[str] = []
+    drop = False
+
+    def flush() -> None:
+        if current and not drop:
+            kept.extend(current)
+
+    for line in diff.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            flush()
+            current = [line]
+            drop = False
+            for token in line.split():
+                if token.startswith(("a/", "b/")):
+                    if token[2:].lstrip("./") in wanted:
+                        drop = True
+                        break
+        else:
+            current.append(line)
+    flush()
+    return "".join(kept)
 
 
 def _merge_repaired_diff(original: str, repaired: str) -> str:
