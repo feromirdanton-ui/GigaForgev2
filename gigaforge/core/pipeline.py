@@ -610,6 +610,14 @@ class TaskPipeline:
         started_ms: float,
     ) -> PipelineResult:
         state = TaskState(run_id=run_id, goal=goal)
+        # ``router.reset()`` existed and was never called, so the per-phase
+        # call/token counters accumulated across every run in the process.  A
+        # goal run invokes ``pipeline.run()`` once per cycle, so from cycle 5
+        # onward the planner was refused with "phase 'plan' used its 4 calls"
+        # and spent zero tokens: measured live, 4 of 8 cycles were empty
+        # (`tokens 0`) and the goal gave up on work it had already done.
+        # A run is the unit a phase budget is specified for.
+        self.router.reset()
         ctx = RunContext(
             run_id=run_id,
             clock=self.clock,
