@@ -657,6 +657,9 @@ class TaskPipeline:
         # (`tokens 0`) and the goal gave up on work it had already done.
         # A run is the unit a phase budget is specified for.
         self.router.reset()
+        # The active state, so helpers without a RunContext in hand (the
+        # ``_degraded`` recorder) can still report what they could not do.
+        self._active_state = state
         ctx = RunContext(
             run_id=run_id,
             clock=self.clock,
@@ -739,9 +742,16 @@ class TaskPipeline:
                     ]
                     self._event("pipeline.memory_failures", run_id=ctx.run_id,
                                 hits=len(failures))
-            except Exception:  # noqa: BLE001
-                pass
-        self._event("pipeline.intake", run_id=ctx.run_id, goal_chars=len(goal))
+            except Exception as exc:  # noqa: BLE001 - memory is an optimisation
+                # Not fatal, but not silent either: a run that could not recall
+                # its own failures is a run that may repeat them, and the report
+                # must be able to say so.
+                ctx.state.note_degraded(
+                    what="memory_recall", why=f"{type(exc).__name__}: {exc}",
+                    where="intake",
+                )
+                self._event("pipeline.memory_recall_failed", run_id=ctx.run_id,
+                            error=str(exc)[:200])
         self._build_prefix(ctx)
         return {"task": goal, "task_normalized": " ".join(goal.split()).lower(),
                 "memory_hits": len(recalled)}
@@ -779,8 +789,11 @@ class TaskPipeline:
             tool_contract = build_contract_text(
                 ["grep", "read_structure", "run_tests", "edit_function"]
             )
-        except Exception:  # noqa: BLE001 - the contract is advisory
+        except Exception as exc:  # noqa: BLE001 - the contract is advisory
             tool_contract = ""
+            ctx.state.note_degraded(
+                what="tool_contract", why=f"{type(exc).__name__}: {exc}", where="prefix"
+            )
         ctx.state.prefix = build_system_prefix(
             repo_map=repo_map, tool_contract=tool_contract
         )
@@ -1335,8 +1348,9 @@ class TaskPipeline:
         root = self._repo_root()
         try:
             files = list(self.indexer.discover())[:limit] if self.indexer else []
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             files = []
+            self._degraded("indexer_discover", exc, "slice_fingerprint")
         if not files:
             # No index wired in: walk the tree, skipping the directories that never
             # carry task content.  A fingerprint of "0:0:0" would make every run in
@@ -1846,7 +1860,8 @@ class TaskPipeline:
 
             config = getattr(self.firewall, "config", None)
             paths = Extractor(config).extract(ctx.state.goal).paths
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            self._degraded("path_extractor", exc, "create_missing")
             return diff
         root = self._repo_root()
         paths = [
@@ -2012,8 +2027,13 @@ class TaskPipeline:
                 ).strip()[:1200]
             elif code == 0:
                 findings["tests_passed"] = True
-        except Exception:  # noqa: BLE001 - no test suite is not an error
-            pass
+        except Exception as exc:  # noqa: BLE001 - no test suite is not an error
+            # "No test suite" and "the test runner is broken" are different
+            # facts, and the second one used to look exactly like the first.
+            ctx.state.note_degraded(
+                what="self_debug_tests", why=f"{type(exc).__name__}: {exc}",
+                where="self_debug",
+            )
         if findings.get("lint_errors") or findings.get("tests_failed"):
             ctx.extras["self_debug"] = findings
             self._event("pipeline.self_debug", run_id=ctx.run_id,
@@ -2481,7 +2501,8 @@ class TaskPipeline:
         """
         try:
             from gigaforge.harness.html_structure import repair_html_structure
-        except Exception:  # pragma: no cover - import guard
+        except Exception as exc:  # pragma: no cover - import guard
+            self._degraded("html_repair_import", exc, "repair")
             return
         root = self._repo_root()
         for raw in files:
@@ -2703,6 +2724,25 @@ class TaskPipeline:
                 (ctx.extras.get("diff_repaired") or {}).get("repaired") or []
             ),
         )
+
+    def _degraded(self, what: str, exc: BaseException, where: str = "") -> None:
+        """Record a swallowed failure on the run's current state.
+
+        A silent ``except`` that swallows a broken check makes a run look clean
+        when it was merely unverified.  This is the helper for the places that
+        do not have a ``RunContext`` in hand; it finds the active state and
+        records ``what``/``why``/``where`` so the report can say "we did not
+        check" instead of implying "we checked and it passed".
+        """
+        state = getattr(self, "_active_state", None)
+        if state is None:
+            return
+        try:
+            state.note_degraded(
+                what=what, why=f"{type(exc).__name__}: {exc}", where=where
+            )
+        except Exception:  # noqa: BLE001 - reporting must never fail a run
+            pass
 
     def _event(self, kind: str, **payload: Any) -> None:
         if self.metrics is not None:
