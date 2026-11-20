@@ -463,6 +463,44 @@ def requirements_from_plan(plan: Any) -> list[Requirement]:
     return reqs
 
 
+def _count_grid_children(html: str) -> int:
+    """How many direct children the grid container has.
+
+    The cards are whatever the grid holds, not whatever they are called.  A
+    child that writes ``<div class="grid-item">`` has still built a grid of
+    four cards; failing it over the class name is the harness grading its own
+    vocabulary instead of the artifact.
+
+    The container is found by class token (``grid``, ``features``, ``cards``)
+    or by a ``display: grid`` rule naming it, and its direct children are
+    counted with a depth counter so nested wrappers are not double-counted.
+    """
+    container = re.search(
+        r'<(?P<tag>[a-z][a-z0-9]*)\b[^>]*class\s*=\s*["\'][^"\']*'
+        r'\b(?:feature-grid|features-grid|features|cards|grid)\b[^"\']*["\'][^>]*>',
+        html, re.I,
+    )
+    if not container:
+        return 0
+    tag = container.group("tag").lower()
+    depth = 1
+    cursor = container.end()
+    children = 0
+    token = re.compile(rf"<(/?){re.escape(tag)}\b[^>]*>", re.I)
+    while depth and cursor < len(html):
+        step = token.search(html, cursor)
+        if step is None:
+            break
+        if step.group(1):
+            depth -= 1
+        else:
+            if depth == 1:
+                children += 1
+            depth += 1
+        cursor = step.end()
+    return children
+
+
 def check_artifacts(
     requirements: list[Requirement],
     worktree: Path,
@@ -566,13 +604,20 @@ def check_artifacts(
             # while four cards were on screen, because the children wrote
             # ``.feature-item`` and the base sheet styled ``.feature-card``.
             # The count is a fact about the file; the class name is not.
+            #
+            # A child may also name its cards something the harness never
+            # guessed — measured live, a section child wrote
+            # ``<div class="grid-item">`` and the contract failed a page that
+            # had four cards in a grid.  So the structural reading is tried
+            # too: the direct children of the grid container are the cards,
+            # whatever they are called.
             best = 0
             for text in texts.values():
                 found = 0
                 for needle in req.needles:
                     found = max(found, len(re.findall(
                         rf'class="[^"]*\b{re.escape(needle)}\b', text, re.I)))
-                best = max(best, found)
+                best = max(best, found, _count_grid_children(text))
             if best >= 3:
                 verdict.met.append(req.label)
             else:
