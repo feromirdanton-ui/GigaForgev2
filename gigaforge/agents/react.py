@@ -561,11 +561,26 @@ class ReActRunner:
             except BudgetExceeded:
                 result.finish_reason = "budget_exceeded"
                 result.llm_calls = step_idx + 1
+                # The budget is a hard stop \u2014 the exception still propagates \u2014
+                # but the episode has already paid for its observations.  Salvage
+                # a plan from them first, so a run that ran out of tokens still
+                # hands the DAG something to execute instead of nothing.  This is
+                # the same recovery as the step cap, for the same reason.
+                salvaged = self._synthesize_plan(trajectory)
+                if salvaged:
+                    result.plan = salvaged
+                    result.localization = self._extract_localization(salvaged, "")
+                    result.finished = True
                 self._tracer.trace(
                     state.task_id,
                     step=f"react_step_{step_idx}_budget_exceeded",
                     kind="decision",
-                    detail={"step_idx": step_idx, "tokens_in": tokens_in, "tokens_out": tokens_out},
+                    detail={
+                        "step_idx": step_idx,
+                        "tokens_in": tokens_in,
+                        "tokens_out": tokens_out,
+                        "salvaged_plan_size": len(salvaged),
+                    },
                 )
                 raise
             except Exception:  # noqa: BLE001 — accounting best-effort

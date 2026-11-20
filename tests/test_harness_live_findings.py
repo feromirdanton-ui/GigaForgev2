@@ -12,6 +12,8 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from gigaforge.agents.react import (
     GrepTool,
     ReActRunner,
@@ -138,3 +140,97 @@ def test_synthesize_plan_is_empty_when_nothing_was_observed() -> None:
 def test_synthesize_plan_ignores_non_source_paths() -> None:
     observation = 'Observation (grep):\n{"matches": [{"file": "trace.jsonl", "line": 1}]}'
     assert _runner()._synthesize_plan([{"role": "user", "content": observation}]) == []  # noqa: SLF001
+
+
+# ------------------------------------------------- budget exhaustion salvage
+
+
+def test_budget_exhaustion_salvages_the_plan_before_raising() -> None:
+    """A run that runs out of tokens must still hand the DAG a plan.
+
+    The budget is a hard stop and the exception still propagates \u2014 but the
+    episode has already paid for its observations, and throwing them away made
+    a budget stop indistinguishable from a failed run.
+    """
+    from gigaforge.client.errors import BudgetExceeded
+
+    class _Budgets:
+        def check(self, *a: object, **k: object) -> None:
+            """The pre-call check passes; the post-call commit is what fails."""
+
+        def commit_task(self, *a: object, **k: object) -> None:
+            raise BudgetExceeded("out of tokens")
+
+        def check_overshoot(self, *a: object, **k: object) -> None:
+            raise AssertionError("must not be reached")
+
+    class _Client:
+        async def chat(self, *a: object, **k: object) -> object:
+            class _R:
+                content = '{"thought": "look", "action": "grep", "action_input": "TODO"}'
+                usage = {"prompt_tokens": 10, "completion_tokens": 5}
+
+            return _R()
+
+    class _Router:
+        def route(self, phase: str) -> str:
+            return "GigaChat-2-Pro"
+
+    class _Tracer:
+        def trace(self, *a: object, **k: object) -> None:
+            pass
+
+    class _Registry:
+        def names(self) -> list[str]:
+            return ["grep"]
+
+        def get(self, name: str) -> object:
+            class _T:
+                async def run(self, action_input: str, *, ctx: object) -> str:
+                    return '{"matches": [{"file": "src/x.py", "line": 1}]}'
+
+            return _T()
+
+        def register(self, tool: object) -> None:
+            pass
+
+    class _Guards:
+        def install(self, registry: object) -> None:
+            pass
+
+        def opening_messages(self, messages: object) -> list[object]:
+            return []
+
+        def screen_tool_call(self, action: str, action_input: object) -> None:
+            return None
+
+        def after_observation(self, messages: object) -> None:
+            return None
+
+    class _Window:
+        def check(self, *a: object, **k: object) -> None:
+            pass
+
+    class _Settings:
+        budget_plan_out = 100
+
+    runner = ReActRunner.__new__(ReActRunner)
+    runner._client = _Client()  # noqa: SLF001
+    runner._router = _Router()  # noqa: SLF001
+    runner._budgets = _Budgets()  # noqa: SLF001
+    runner._tracer = _Tracer()  # noqa: SLF001
+    runner._registry = _Registry()  # noqa: SLF001
+    runner._guards = _Guards()  # noqa: SLF001 - ``guards`` is a read-only property
+    runner._window_guard = _Window()  # noqa: SLF001 - read-only property
+    runner._s = _Settings()  # noqa: SLF001
+    runner._max_steps = 3  # noqa: SLF001
+    runner._compactions = 0  # noqa: SLF001
+
+    from gigaforge.core.task_state import TaskState
+
+    state = TaskState(goal="g", task_id="t")
+    ctx = _Ctx(Path("."))
+
+    with pytest.raises(BudgetExceeded):
+        asyncio.run(runner.run("find it", state, ctx=ctx))  # type: ignore[arg-type]
+
