@@ -1,5 +1,5 @@
 {
-  "started_at": 1795160116.95978,
+  "started_at": 1795160363.2732937,
   "credentials_present": true,
   "model": "GigaChat",
   "ok": true,
@@ -9,7 +9,7 @@
     {
       "name": "atokens_count",
       "ok": true,
-      "latency_ms": 1001,
+      "latency_ms": 1016,
       "detail": {
         "short": 8,
         "long": 208
@@ -19,14 +19,15 @@
     {
       "name": "response_format",
       "ok": true,
-      "latency_ms": 356,
+      "latency_ms": 364,
       "detail": {
         "parsed": true,
         "head": "{\"steps\": [{\"tool\": \"grep\"}]}",
         "usage": {
-          "prompt_tokens": 145,
+          "prompt_tokens": 141,
           "completion_tokens": 26,
-          "total_tokens": 171
+          "total_tokens": 167,
+          "cached_tokens": 4
         }
       },
       "error": ""
@@ -34,7 +35,7 @@
     {
       "name": "context_overflow",
       "ok": true,
-      "latency_ms": 453,
+      "latency_ms": 230,
       "detail": {
         "recognised_as_overflow": true
       },
@@ -43,27 +44,23 @@
     {
       "name": "rate_limit",
       "ok": true,
-      "latency_ms": 997,
+      "latency_ms": 1497,
       "detail": {
-        "errors": [
-          "RateLimitError",
-          "RateLimitError",
-          "RateLimitError"
-        ],
-        "saw_429": true,
+        "errors": [],
+        "saw_429": false,
         "retry_after": null,
-        "note": "429 observed: the Retry-After branch is confirmed live"
+        "note": "no 429 in this burst: the account had headroom, so the Retry-After branch is NOT confirmed live by this run"
       },
       "error": ""
     },
     {
       "name": "react_plan",
       "ok": true,
-      "latency_ms": 5473,
+      "latency_ms": 9733,
       "detail": {
         "strategy": "react",
         "steps": 4,
-        "first_step": "edit_function: live_probe.py",
+        "first_step": "grep: .gigaforge/live_probe_checkpoints.sqlite",
         "llm_calls": null
       },
       "error": ""
@@ -71,10 +68,10 @@
     {
       "name": "checkpointer",
       "ok": true,
-      "latency_ms": 1764,
+      "latency_ms": 8228,
       "detail": {
         "checkpoints": 6,
-        "db_bytes": 49152,
+        "db_bytes": 98304,
         "llm_calls": 2,
         "finish_reason": "max_steps"
       },

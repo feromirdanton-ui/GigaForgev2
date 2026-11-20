@@ -923,10 +923,15 @@ class ReActRunner:
 
         Deterministic, no model call.  The Firewall compresses a ``grep``
         observation into ``{"matches": [{"file": ..., "line": ..., ...}]}``, so
-        the distinct ``file`` values are the files the episode found relevant;
-        one ``edit_function`` step per file is a defensible plan even when the
-        model will not produce one.  Raw ``path:line:text`` rows are accepted
-        too, because a compressor may be disabled.
+        the distinct ``file`` values are the files the episode found relevant.
+
+        The salvaged steps are **read** steps, not edits.  An earlier version
+        emitted one ``edit_function`` per observed file, and a live run showed
+        why that is wrong: asked to *find* the TODO markers, the episode grepped,
+        found them, and the salvage turned that into "edit these four files".
+        The episode had no idea what to change — it was never asked to change
+        anything — so the plan invented work.  A read step is always true of an
+        observation; an edit step is a claim the episode never made.
 
         Returns an empty list when nothing was observed, so the caller still
         reports ``max_steps`` honestly rather than inventing work.
@@ -949,7 +954,7 @@ class ReActRunner:
         steps: list[PlanStep] = []
         for path in seen:
             try:
-                steps.append(PlanStep(tool="edit_function", args={"path": path}))
+                steps.append(PlanStep(tool="read_structure", args={"path": path}))
             except Exception:  # noqa: BLE001 - a malformed step is skipped
                 continue
         return steps
