@@ -79,9 +79,19 @@ class PhaseRoute:
 
 @dataclass(frozen=True)
 class RetryConfig:
+    """Node-level retry tuning.
+
+    ``backoff_max`` is 30 s, not 5 s, because the limit that actually stops a
+    run is a provider quota window, and GigaChat's is a minute.  Measured: two
+    concurrent runs hit 429 on the ``plan`` node, the node had ``retries=0`` so
+    it failed outright, and the whole run died with ``GF-CORE-DAG-026`` — a
+    transient quota blip reported as a failed run.  A ceiling below the window
+    it is waiting for cannot outlast that window.
+    """
+
     max_attempts: int = 3
-    backoff_base: float = 0.25
-    backoff_max: float = 5.0
+    backoff_base: float = 1.0
+    backoff_max: float = 30.0
     jitter: bool = True
 
     def to_dict(self) -> dict[str, Any]:
