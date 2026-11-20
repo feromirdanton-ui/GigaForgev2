@@ -244,3 +244,24 @@ class TestCssVariables:
         verdict = check_artifacts(extract_requirements(GOAL), tmp_path, files=["index.html"])
         assert not verdict.ok
         assert any("cyan" in item for item in verdict.unmet), verdict.unmet
+
+
+class TestRejectionReasonReachesTheCaller:
+    """A refused run must say why it was refused.
+
+    Measured live: ``run --json`` on a page the contract had just rejected for
+    placeholders reported ``status: rejected``, ``error: "ok"`` and the summary
+    "Produced a change that could not be validated".  The contract's verdict was
+    recorded in ``ctx.extras['contract_unmet']`` and then dropped by ``_collect``.
+    """
+
+    def test_contract_unmet_becomes_the_error(self) -> None:
+        import inspect
+
+        from gigaforge.core.pipeline import TaskPipeline
+
+        source = inspect.getsource(TaskPipeline._collect)
+        assert "contract_unmet" in source, (
+            "the contract's verdict must reach the result, not stop at the event log"
+        )
+        assert "did not meet the goal" in source

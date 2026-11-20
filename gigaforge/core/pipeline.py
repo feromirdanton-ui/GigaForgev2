@@ -2344,6 +2344,19 @@ class TaskPipeline:
         if loop_result is not None:
             nodes.append({"node": "fixloop", **loop_result.to_dict()})
         error = str(dag.error or "")
+        # The contract's verdict is the reason the run was refused, and it was
+        # being dropped: ``settle`` recorded ``contract_unmet`` and moved on, so
+        # ``_collect`` fell through to the fix-loop branch and reported
+        # "Produced a change that could not be validated" with ``error: "ok"``.
+        # A caller was told the run produced something un-validatable when the
+        # truth was "found placeholders: 'feature 1', 'feature 2'".
+        if not bool(artifacts.get("accepted")):
+            unmet = list(ctx.extras.get("contract_unmet") or [])
+            if unmet:
+                contract_reason = "the artifact did not meet the goal: " + "; ".join(
+                    str(item) for item in unmet[:6]
+                )
+                error = f"{contract_reason}; {error}" if error and error != "ok" else contract_reason
         if not error and not bool(artifacts.get("accepted")):
             review = artifacts.get("review_verdict") or {}
             if (str(review.get("verdict") or "") == "reject"
