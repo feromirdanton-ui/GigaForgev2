@@ -42,6 +42,7 @@ from gigaforge.agents.planner import json_repair
 from gigaforge.client.errors import BudgetExceeded
 from gigaforge.client.giga_client import ChatResult, GigaClient
 from gigaforge.config import Settings, get_settings
+from gigaforge.agents.observation_cache import ObservationCache
 from gigaforge.core.budgets import BudgetTracker
 from gigaforge.core.context_window_guard import ContextOverflowError
 from gigaforge.core.loop_breaker import LoopBreaker
@@ -601,6 +602,15 @@ class ReActRunner:
         # (one nudge per signature per run), so it is safe to consult on every
         # observation.
         breaker = LoopBreaker()
+        # Observation cache: a ReAct episode re-reads the same file constantly,
+        # and each repeat costs a tool call plus a full observation in the
+        # trajectory — which is what pushes a run into compaction.  Only
+        # read-only tools are cached, and any change to the tree drops the whole
+        # cache, so a write is always observed.
+        self._obs_cache = ObservationCache(
+            root=getattr(getattr(self, "ctx", None), "worktree", None)
+            or getattr(getattr(self, "ctx", None), "repo_root", None)
+        )
 
         for step_idx in range(self._max_steps):
             # ContextWindowGuard: compact before the request, not after a 422.
@@ -794,7 +804,18 @@ class ReActRunner:
                 continue
 
             try:
-                raw_obs = await tool.run(action_input, ctx=ctx)
+                cached = self._obs_cache.get(action, action_input)
+                if cached is not None:
+                    raw_obs = cached
+                    self._tracer.trace(
+                        state.task_id,
+                        step=f"react_step_{step_idx}_cache_hit",
+                        kind="decision",
+                        detail={"tool": action},
+                    )
+                else:
+                    raw_obs = await tool.run(action_input, ctx=ctx)
+                    self._obs_cache.put(action, action_input, raw_obs)
             except Exception as exc:  # noqa: BLE001 — best-effort
                 raw_obs = f"ERROR: tool {action!r} raised: {exc}"
 

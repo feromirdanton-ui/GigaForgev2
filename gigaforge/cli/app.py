@@ -773,7 +773,17 @@ def stack() -> None:
     typer.echo(f"  review strategy {build_review_strategy().name}")
     typer.echo(f"  react engine    {react_engine()}")
     typer.echo(f"  subagent engine {subagent_engine()}")
-    typer.echo(f"  harness profile {_env('GIGAFORGE_HARNESS_PROFILE', 'native_fs')}")
+    # Print the profile that will actually be used, resolved by the same
+    # function the runtime calls — not the raw env var, which may name a
+    # profile that does not exist.
+    from gigaforge.harness.profiles import resolve_profile
+
+    _profile = resolve_profile()
+    typer.echo(f"  harness profile {_profile.name} — {_profile.description}")
+    typer.echo(
+        f"  writes          {'allowed' if _profile.allow_writes else 'refused'}"
+        f" | steps {_profile.max_steps} | cache {_profile.observation_cache}"
+    )
     # Read the SAME objects the runtime reads.  The stack command used to print
     # ``os.environ`` defaults, so it advertised ``react budget 8000 out`` while
     # the runner sent ``max_tokens=1000`` — a diagnostic that disagrees with the
