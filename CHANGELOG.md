@@ -1,5 +1,72 @@
 # Changelog
 
+## [4.2.0] — 2026-11-20 — the merge is the default, and it runs
+
+The theme of this release is one defect, fixed at every level: a capability that
+exists, is unit-tested, and is bypassed by the path the product actually takes.
+
+### Changed — the merged stack is now what a default install gets
+- `GIGAFORGE_PROVIDER=auto` (was `giga`): the official `gigachat` SDK is used
+  when it is installed and a credential is present. The SDK transport used to be
+  dead code in every default deployment.
+- `GIGAFORGE_PLAN_STRATEGY=react` (was `linear`): the planner explores before it
+  commits.
+- `GIGAFORGE_REVIEW_STRATEGY=constitutional` (was `none`): a review phase exists
+  without a budget surprise.
+- `GIGAFORGE_REACT_ENGINE` / `GIGAFORGE_SUBAGENT_ENGINE=langgraph` when the
+  package is installed (was `classic`): checkpointing, `interrupt()`, streaming.
+- All six switches are documented in `env.example`; a deployment that copied it
+  used to get the pre-merge behaviour while the README described the opposite.
+
+### Fixed
+- **The plan guard ran on the path nobody used.** `validate_plan` was called only
+  from `ReActPlan.plan()`, while the pipeline prefers `plan_under_harness()`. A
+  live run executed `edit_function: react.py` — a file, not a symbol, with no
+  verification. Both entry points now share `_guarded_steps()`.
+- **A ReAct episode billed the `plan` phase.** `plan` is a single-call phase with
+  a 2 000-token input cap; the harness prompt alone is ~1 100. The second step of
+  a live episode died with `BudgetExceeded` and the run fell back to a linear plan
+  with zero steps. Episodes now bill their own `react` phase
+  (`GIGAFORGE_BUDGET_REACT_IN`, default 40 000) — in both engines.
+- **The guard's correct verdict threw away the episode's work.** The model
+  grepped, found the files, then emitted an untargeted `edit_function` for a
+  read-only task; the guard dropped it and the run reported zero steps. The
+  trajectory now travels with the result and a plan is salvaged from the
+  observations.
+- **`functions=` overwrote the structured-output schema**, leaving
+  `function_call` naming a function the server could not find (hard 422). Merged.
+- **Structured output was unreachable in the default configuration.**
+  `response_format` was translated to `functions` + `function_call` only in the
+  SDK adapter. The live API accepts `response_format` and ignores it, so the
+  default provider sent a field that did nothing and `json_repair` stayed the real
+  code path. The translation moved into `GigaClient.chat`, and the server's
+  `function_call.arguments` are surfaced as `content` for the synthetic
+  `structured_output` function only.
+- **The LangGraph engine reached into the runner's privates**
+  (`runner._router`, `_budgets`, `_tracer`, `_client`) behind `# noqa: SLF001`,
+  making every refactor of `ReActRunner` a silent breakage of the graph.
+  `ReActRunner` now exposes its collaborators.
+
+### Added — ported from `ai-forever/deepagents-gigachat`
+- `agents/harness_prompt.py` — the GigaChat-adapted behavioural prompt
+  (anti-looping, two-step operations, computed-not-guessed values, the plan
+  contract, read-only tasks) with tool descriptions rewritten against
+  GigaForge's real registry, in three profile variants.
+- `agents/output_guards.py` — `PathNormalizer` (workspace-relative paths in
+  observations) and `DeterministicOutput` (a plan may not assert a value it never
+  computed).
+- `harness/compaction.py::trim_stale_file_outputs` — the cheap first pass of
+  context management: cut the bodies of large stale file observations before
+  compacting whole messages.
+- `harness/plan_guard.py` — deterministic plan validation, wired into both
+  planning entry points.
+
+### Verified live (GigaChat API, 2026-11-20)
+`atokens_count` returns real counts (8 / 208); JSON Schema is enforced through
+`functions`; context overflow is recognised; a real 429 was observed; `ReActPlan`
+completes end-to-end; the checkpointer writes 6 checkpoints to SQLite. Six of six
+probes pass — `python -m gigaforge.harness.live_probe`.
+
 ## [4.1.0] — 2026-10-18 — one chat window, attachments, web-file editing
 
 ### Added

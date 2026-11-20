@@ -745,6 +745,49 @@ def doctor(
 
 
 @app.command()
+def stack() -> None:
+    """Show the stack this install will actually run.
+
+    The merge's recurring defect was a capability that exists, is tested, and is
+    bypassed by the path the product takes.  Documentation cannot catch that: the
+    README described the merged stack while a default install ran the pre-merge
+    one.  This command resolves the answer from the SAME functions the runtime
+    calls, so it cannot drift from behaviour.
+    """
+    import importlib.util
+    import os
+
+    from gigaforge.agents.engine import react_engine, subagent_engine
+    from gigaforge.core.strategies import build_plan_strategy, build_review_strategy
+
+    def _have(mod: str) -> str:
+        return "installed" if importlib.util.find_spec(mod) else "absent"
+
+    def _env(key: str, default: str) -> str:
+        return os.environ.get(key) or default
+
+    typer.echo("GigaForge stack")
+    typer.echo("-" * 46)
+    typer.echo(f"  provider        {_env('GIGAFORGE_PROVIDER', 'auto')}")
+    typer.echo(f"  plan strategy   {build_plan_strategy().name}")
+    typer.echo(f"  review strategy {build_review_strategy().name}")
+    typer.echo(f"  react engine    {react_engine()}")
+    typer.echo(f"  subagent engine {subagent_engine()}")
+    typer.echo(f"  harness profile {_env('GIGAFORGE_HARNESS_PROFILE', 'native_fs')}")
+    typer.echo(f"  compact at      {_env('GIGAFORGE_COMPACT_AT', '0.85')}")
+    typer.echo(
+        f"  react budget    {_env('GIGAFORGE_BUDGET_REACT_IN', '40000')} in / "
+        f"{_env('GIGAFORGE_BUDGET_REACT_OUT', '8000')} out"
+    )
+    typer.echo("-" * 46)
+    typer.echo(f"  gigachat SDK    {_have('gigachat')}")
+    typer.echo(f"  langgraph       {_have('langgraph')}")
+    typer.echo(f"  deepagents      {_have('deepagents')}")
+    typer.echo("-" * 46)
+    typer.echo("  live probe      python -m gigaforge.harness.live_probe")
+
+
+@app.command()
 def models(verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False) -> None:
     """List available GigaChat models (live API call)."""
     import asyncio

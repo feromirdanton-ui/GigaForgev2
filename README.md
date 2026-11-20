@@ -103,11 +103,30 @@ trace, `gigaforge/core/strategies.py` owns what they do.
 
 | stage | strategies | env |
 |---|---|---|
-| plan | `linear` (one call), `tot` (K branches, heuristic scoring, optional judge) | `GIGAFORGE_PLAN_STRATEGY` |
-| review | `none`, `constitutional` (deterministic blockers + one soft-principle call), `llm` | `GIGAFORGE_REVIEW_STRATEGY` |
+| plan | `react` (bounded exploration, then a validated plan — **default**), `linear` (one call), `tot` (K branches, heuristic scoring, optional judge) | `GIGAFORGE_PLAN_STRATEGY` |
+| review | `constitutional` (deterministic blockers — **default**), `llm`, `none` | `GIGAFORGE_REVIEW_STRATEGY` |
 
 A reviewer can only ever *narrow* an acceptance: `settle` combines the
 deterministic verdict with the review veto and never revives a rejected diff.
+
+Every plan — from either entry point — passes `harness/plan_guard.py` before the
+DAG sees it: unknown tools, untargeted edits, duplicate steps and an edit with no
+verification are dropped or repaired deterministically, with no model call. If
+the guard empties a plan, the episode's own observations are salvaged into one
+rather than reporting zero steps.
+
+### The harness
+
+LangGraph is the bridge, not the harness. `gigaforge/harness/` is the layer that
+decides how a run is allowed to continue:
+
+| module | what it decides |
+|---|---|
+| `compaction.py` | at 85% of the window: trim stale file bodies first, then compact whole messages. The guard **restores** a run instead of killing it. |
+| `ledger.py` | real token counts per phase, from the server counter when available |
+| `policy.py` | retry classification — 429 / 5xx / 400 are not the same failure |
+| `plan_guard.py` | deterministic plan validation (above) |
+| `live_probe.py` | the six live assertions, runnable against the real API |
 
 ### Agents — 14, all reachable
 
@@ -121,7 +140,10 @@ gigaforge agents          # catalog: name, family, stage, role
 
 ### Providers
 
-GigaChat is the default; an OpenAI-compatible endpoint is a drop-in selection:
+GigaChat is the default. `GIGAFORGE_PROVIDER=auto` (the default) uses the
+official `gigachat` SDK when it is installed and a credential is present, and
+falls back to the in-repo client otherwise. An OpenAI-compatible endpoint is a
+drop-in selection:
 
 ```bash
 GIGAFORGE_PROVIDER=openai
@@ -132,6 +154,12 @@ GIGAFORGE_OPENAI_API_KEY=...
 ```bash
 gigaforge providers       # what is registered, what is configured
 ```
+
+**Structured output.** The live API accepts `response_format` and ignores it.
+The mechanism it enforces is `functions` + `function_call`, and the answer comes
+back in `function_call.arguments` with an empty `content`. Both providers
+translate to that form, so a schema is honoured in the default configuration
+rather than only when the SDK transport happens to be selected.
 
 The async transports (HTTPX, SSE) sit under one blocking bridge,
 `core/sync_adapter.SyncChatClient`, so the synchronous DAG never touches an event
