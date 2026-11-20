@@ -850,12 +850,19 @@ class TaskPipeline:
         # ``SandboxExecutor`` already defaults to ``ALLOWED``; passing it
         # explicitly documents the contract at the call site.
         sandbox = SandboxExecutor(worktree=root)
+        # ``ToolRegistry()`` starts EMPTY \u2014 the built-ins are installed by
+        # ``install_defaults``.  Without this call the runner had no tools at
+        # all: the model asked for ``grep``, the registry returned ``None``, and
+        # every episode burned its whole step budget on "unknown tool" and
+        # finished with an empty plan.  The ReAct layer was reachable but inert.
+        registry = ToolRegistry()
+        registry.install_defaults(sandbox=sandbox)
         runner = ReActRunner(
             self.client,
             self.router,
             self.router.budget,
             self.tracer,
-            registry=ToolRegistry(),
+            registry=registry,
             max_steps=max_steps,
         )
         # The strategy adapter reads these two attributes off the runner.

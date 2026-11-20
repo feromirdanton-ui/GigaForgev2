@@ -1,0 +1,82 @@
+{
+  "started_at": 1795155163.8040447,
+  "credentials_present": true,
+  "model": "GigaChat",
+  "ok": true,
+  "passed": 6,
+  "total": 6,
+  "probes": [
+    {
+      "name": "atokens_count",
+      "ok": true,
+      "latency_ms": 1614,
+      "detail": {
+        "short": 8,
+        "long": 208
+      },
+      "error": ""
+    },
+    {
+      "name": "response_format",
+      "ok": true,
+      "latency_ms": 447,
+      "detail": {
+        "parsed": true,
+        "head": "{\"steps\": [{\"tool\": \"grep\"}]}",
+        "usage": {
+          "prompt_tokens": 145,
+          "completion_tokens": 26,
+          "total_tokens": 171
+        }
+      },
+      "error": ""
+    },
+    {
+      "name": "context_overflow",
+      "ok": true,
+      "latency_ms": 569,
+      "detail": {
+        "recognised_as_overflow": true
+      },
+      "error": ""
+    },
+    {
+      "name": "rate_limit",
+      "ok": true,
+      "latency_ms": 1765,
+      "detail": {
+        "errors": [
+          "RateLimitError"
+        ],
+        "saw_429": true,
+        "retry_after": null,
+        "note": "429 observed: the Retry-After branch is confirmed live"
+      },
+      "error": ""
+    },
+    {
+      "name": "react_plan",
+      "ok": true,
+      "latency_ms": 6270,
+      "detail": {
+        "strategy": "react",
+        "steps": 1,
+        "first_step": "edit_function: react.py",
+        "llm_calls": null
+      },
+      "error": ""
+    },
+    {
+      "name": "checkpointer",
+      "ok": true,
+      "latency_ms": 4691,
+      "detail": {
+        "checkpoints": 6,
+        "db_bytes": 57344,
+        "llm_calls": 2,
+        "finish_reason": "max_steps"
+      },
+      "error": ""
+    }
+  ]
+}

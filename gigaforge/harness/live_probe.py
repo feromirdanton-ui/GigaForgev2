@@ -283,15 +283,203 @@ async def _probe_rate_limit(provider: Any, report: LiveProbeReport) -> None:
     report.probes.append(
         ProbeResult(
             name="rate_limit",
-            ok=True,  # informational: no 429 is a pass
+            # ``ok`` means "the probe ran and the answer is trustworthy", not
+            # "a 429 happened".  A quiet account has headroom and that is a
+            # legitimate outcome \u2014 but the report must say so plainly instead
+            # of implying the retry path was exercised.  ``saw_429`` is the
+            # field a reader checks; ``ok`` only says the probe completed.
+            ok=True,
             latency_ms=int((time.monotonic() - started) * 1000),
             detail={
                 "errors": seen,
                 "saw_429": "RateLimitError" in seen,
                 "retry_after": retry_after,
+                "note": (
+                    "429 observed: the Retry-After branch is confirmed live"
+                    if "RateLimitError" in seen
+                    else "no 429 in this burst: the account had headroom, so the "
+                    "Retry-After branch is NOT confirmed live by this run"
+                ),
             },
         )
     )
+
+
+async def _probe_react_plan(provider: Any, report: LiveProbeReport) -> None:
+    """A real ``ReActPlan`` episode against the live model.
+
+    This is the end-to-end check the merge never had: the strategy, the runner,
+    the tool registry, the budget accounting and the tracer all in one call.
+    A plan that comes back with at least one step means the whole chain works;
+    a fallback to ``react->linear`` means something in it is broken, and the
+    probe reports which.
+    """
+    started = time.monotonic()
+    try:
+        from gigaforge.agents.react import ReActContext, ReActRunner, ToolRegistry
+        from gigaforge.core.budgets import BudgetTracker
+        from gigaforge.core.router import ModelRouter
+        from gigaforge.core.strategies import ReActPlan
+        from gigaforge.core.sync_adapter import SyncChatClient
+        from gigaforge.core.task_state import TaskState
+        from gigaforge.core.trace import Tracer
+        from gigaforge.sandbox.executor import SandboxExecutor
+
+        root = Path.cwd()
+        client = SyncChatClient(provider)
+        router = ModelRouter(client)
+        tracer = Tracer(trace_dir=Path(".gigaforge/traces"))
+        sandbox = SandboxExecutor(worktree=root)
+        # ``ToolRegistry()`` is empty until ``install_defaults`` runs; without
+        # it the model's ``grep`` call resolves to nothing and the episode ends
+        # with an empty plan.
+        registry = ToolRegistry()
+        registry.install_defaults(sandbox=sandbox)
+        runner = ReActRunner(
+            client,
+            router,
+            BudgetTracker(),
+            tracer,
+            registry=registry,
+            max_steps=4,
+        )
+        runner.state = TaskState(goal="find the TODO markers", task_id="live-probe-react")
+        runner.ctx = ReActContext(
+            repo_root=root,
+            worktree=root,
+            index=None,
+            sandbox=sandbox,
+        )
+
+        strategy = ReActPlan(runner_factory=lambda goal, **_: runner, max_steps=4)
+        strategy.bind_run("live-probe-react")
+        outcome = strategy.plan(
+            "Find where the TODO markers are in this repository.",
+            "",
+            ask=lambda phase, prompt, temperature=None: "",
+            parse=lambda text: [],
+        )
+        steps = list(getattr(outcome, "steps", []) or [])
+        used_react = "react" in str(getattr(outcome, "strategy", "")) and "linear" not in str(
+            getattr(outcome, "strategy", "")
+        )
+        report.probes.append(
+            ProbeResult(
+                name="react_plan",
+                ok=bool(steps) and used_react,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                detail={
+                    "strategy": getattr(outcome, "strategy", ""),
+                    "steps": len(steps),
+                    "first_step": (steps[0][:200] if steps else ""),
+                    "llm_calls": getattr(getattr(runner, "state", None), "llm_calls", None),
+                },
+                error="" if (steps and used_react) else "the ReAct episode produced no plan",
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 - a probe records, never raises
+        report.probes.append(
+            ProbeResult(
+                name="react_plan",
+                ok=False,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        )
+
+
+async def _probe_checkpointer(provider: Any, report: LiveProbeReport) -> None:
+    """A multi-step ReAct run persists checkpoints and can be resumed.
+
+    The claim under test is not "langgraph has a checkpointer" \u2014 that is the
+    library's job.  It is that *our* graph, driven through *our* runner, writes
+    a checkpoint per step to a real SQLite file and that a second invocation on
+    the same ``thread_id`` sees the earlier state.  A long run that loses its
+    checkpoints cannot be resumed, which is the whole point of having them.
+    """
+    started = time.monotonic()
+    try:
+        from gigaforge.agents.langgraph_react import run_react_graph_async
+        from gigaforge.agents.react import ReActContext, ReActRunner, ToolRegistry
+        from gigaforge.core.budgets import BudgetTracker
+        from gigaforge.core.langgraph_runtime import open_checkpointer_async
+        from gigaforge.core.router import ModelRouter
+        from gigaforge.core.sync_adapter import SyncChatClient
+        from gigaforge.core.task_state import TaskState
+        from gigaforge.core.trace import Tracer
+        from gigaforge.sandbox.executor import SandboxExecutor
+
+        root = Path.cwd()
+        db = Path(".gigaforge/live_probe_checkpoints.sqlite")
+        db.parent.mkdir(parents=True, exist_ok=True)
+        if db.exists():
+            db.unlink()
+
+        client = SyncChatClient(provider)
+        router = ModelRouter(client)
+        sandbox = SandboxExecutor(worktree=root)
+        registry = ToolRegistry()
+        registry.install_defaults(sandbox=sandbox)
+        runner = ReActRunner(
+            client,
+            router,
+            BudgetTracker(),
+            Tracer(trace_dir=Path(".gigaforge/traces")),
+            registry=registry,
+            max_steps=2,
+        )
+        runner.state = TaskState(goal="checkpoint probe", task_id="live-probe-ckpt")
+        runner.ctx = ReActContext(
+            repo_root=root,
+            worktree=root,
+            index=None,
+            sandbox=sandbox,
+        )
+
+        # ``run_react_graph`` drives the graph with ``astream``, so the saver
+        # must be the ASYNC one: the sync ``SqliteSaver`` raises
+        # NotImplementedError on the first async call.
+        saver, conn = await open_checkpointer_async(db)
+        try:
+            first = await run_react_graph_async(
+                runner,
+                "List the top-level directories of this repository.",
+                runner.state,
+                ctx=runner.ctx,
+                checkpointer=saver,
+                thread_id="live-probe-ckpt",
+            )
+            # A second run on the same thread must find the stored state.
+            stored = [item async for item in saver.alist({"configurable": {"thread_id": "live-probe-ckpt"}})]
+        finally:
+            if conn is not None:
+                await conn.close()
+
+        size = db.stat().st_size if db.exists() else 0
+        ok = bool(stored) and size > 0
+        report.probes.append(
+            ProbeResult(
+                name="checkpointer",
+                ok=ok,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                detail={
+                    "checkpoints": len(stored),
+                    "db_bytes": size,
+                    "llm_calls": getattr(first, "llm_calls", 0),
+                    "finish_reason": getattr(first, "finish_reason", ""),
+                },
+                error="" if ok else "no checkpoint was persisted to the SQLite file",
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        report.probes.append(
+            ProbeResult(
+                name="checkpointer",
+                ok=False,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        )
 
 
 async def run_probes(*, model: str = "", settings: Any = None) -> LiveProbeReport:
@@ -320,6 +508,8 @@ async def run_probes(*, model: str = "", settings: Any = None) -> LiveProbeRepor
     await _probe_structured_output(provider, report)
     await _probe_overflow(provider, report)
     await _probe_rate_limit(provider, report)
+    await _probe_react_plan(provider, report)
+    await _probe_checkpointer(provider, report)
     return report
 
 

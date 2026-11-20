@@ -433,26 +433,11 @@ def build_react_graph(
     return graph.compile(checkpointer=checkpointer or InMemorySaver())
 
 
-def run_react_graph(
-    runner: ReActRunner,
-    task: str,
-    state: Any,
-    *,
-    ctx: ReActContext,
-    bootstrap_hint: Optional[str] = None,
-    checkpointer: Any = None,
-    thread_id: str = "",
-    guard: Optional[ContextWindowGuard] = None,
-    breaker: Optional[LoopBreaker] = None,
-) -> ReActResult:
-    """Run the ReAct graph and return the same :class:`ReActResult` as the loop."""
-    from gigaforge.core.langgraph_runtime import thread_config
-
-    graph = build_react_graph(
-        runner, ctx=ctx, state=state, checkpointer=checkpointer, guard=guard, breaker=breaker
-    )
-    config = thread_config(thread_id or f"react-{state.task_id}")
-    initial: ReActState = {
+def _initial_state(
+    runner: ReActRunner, task: str, bootstrap_hint: Optional[str]
+) -> ReActState:
+    """The state a fresh ReAct episode starts from."""
+    return {
         "task": task,
         "bootstrap_hint": bootstrap_hint or "",
         "step_idx": 0,
@@ -469,13 +454,9 @@ def run_react_graph(
         "nudges": [],
     }
 
-    async def _drive() -> Mapping[str, Any]:
-        async for _chunk in graph.astream(initial, config, stream_mode="custom"):
-            pass
-        return graph.get_state(config).values or {}
 
-    values = await_blocking(_drive())
-
+def _to_result(values: Mapping[str, Any]) -> ReActResult:
+    """Map the graph's final state onto the shape the DAG expects."""
     result = ReActResult()
     result.llm_calls = int(values.get("llm_calls") or 0)
     result.steps = list(values.get("steps") or [])
@@ -484,3 +465,73 @@ def run_react_graph(
     result.localization = dict(values.get("localization") or {})
     result.plan = [PlanStep(**item) for item in (values.get("plan") or [])]
     return result
+
+
+async def run_react_graph_async(
+    runner: ReActRunner,
+    task: str,
+    state: Any,
+    *,
+    ctx: ReActContext,
+    bootstrap_hint: Optional[str] = None,
+    checkpointer: Any = None,
+    thread_id: str = "",
+    guard: Optional[ContextWindowGuard] = None,
+    breaker: Optional[LoopBreaker] = None,
+) -> ReActResult:
+    """Async entry point: drive the graph on the **caller's** loop.
+
+    This is the variant an async caller must use.  :func:`run_react_graph`
+    hops to the process-wide adapter loop, which is correct for the synchronous
+    DAG but wrong here: an ``AsyncSqliteSaver``'s ``aiosqlite`` connection
+    belongs to the loop that opened it, so driving the graph from another loop
+    deadlocks instead of checkpointing.  A real multi-step run with a durable
+    checkpointer hung on exactly that.
+    """
+    from gigaforge.core.langgraph_runtime import thread_config
+
+    graph = build_react_graph(
+        runner, ctx=ctx, state=state, checkpointer=checkpointer, guard=guard, breaker=breaker
+    )
+    config = thread_config(thread_id or f"react-{state.task_id}")
+    initial = _initial_state(runner, task, bootstrap_hint)
+    async for _chunk in graph.astream(initial, config, stream_mode="custom"):
+        pass
+    # ``aget_state``, not ``get_state``: an ``AsyncSqliteSaver`` refuses the
+    # synchronous accessor from the main thread ("Synchronous calls to
+    # AsyncSqliteSaver are only allowed from a different thread").
+    snapshot = await graph.aget_state(config)
+    return _to_result(snapshot.values or {})
+
+
+def run_react_graph(
+    runner: ReActRunner,
+    task: str,
+    state: Any,
+    *,
+    ctx: ReActContext,
+    bootstrap_hint: Optional[str] = None,
+    checkpointer: Any = None,
+    thread_id: str = "",
+    guard: Optional[ContextWindowGuard] = None,
+    breaker: Optional[LoopBreaker] = None,
+) -> ReActResult:
+    """Run the ReAct graph and return the same :class:`ReActResult` as the loop.
+
+    Synchronous entry point for the DAG.  An async caller should use
+    :func:`run_react_graph_async` instead \u2014 see its docstring for why.
+    """
+    from gigaforge.core.langgraph_runtime import thread_config
+
+    graph = build_react_graph(
+        runner, ctx=ctx, state=state, checkpointer=checkpointer, guard=guard, breaker=breaker
+    )
+    config = thread_config(thread_id or f"react-{state.task_id}")
+    initial = _initial_state(runner, task, bootstrap_hint)
+
+    async def _drive() -> Mapping[str, Any]:
+        async for _chunk in graph.astream(initial, config, stream_mode="custom"):
+            pass
+        return graph.get_state(config).values or {}
+
+    return _to_result(await_blocking(_drive()))

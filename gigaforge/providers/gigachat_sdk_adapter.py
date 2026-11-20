@@ -124,6 +124,20 @@ _ROLE_MAP = {
 }
 
 
+def _running_loop_key() -> Any:
+    """Identity of the event loop running right now, or ``None`` outside one.
+
+    Used to key owned SDK clients: ``httpx.AsyncClient`` binds to the loop of
+    its first request, so one cached client cannot serve two loops.
+    """
+    import asyncio
+
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+
+
 def to_sdk_messages(messages: Iterable[Any]) -> list[dict[str, Any]]:
     """Map GigaForge message dicts to the SDK's ``Messages`` payload shape.
 
@@ -242,6 +256,11 @@ class GigaChatSDKProvider:
         self._verify_ssl = verify_ssl
         self._timeout = timeout
         self._owns_client = client is None
+        #: Owned clients, one per event loop.  ``httpx.AsyncClient`` (which the
+        #: SDK wraps) binds to the loop of its first request, so a single cached
+        #: client fails with "cannot be used from a different event loop" as soon
+        #: as a caller drives the provider from a second loop.
+        self._clients: dict[Any, Any] = {}
 
     # -- construction --------------------------------------------------------
     def _sdk(self) -> Any:
@@ -254,6 +273,27 @@ class GigaChatSDKProvider:
         return _gigachat
 
     def _ensure_client(self) -> Any:
+        """Return a client bound to the loop that is running right now.
+
+        ``GigaChatAsyncClient`` wraps ``httpx.AsyncClient``, which binds itself
+        to the event loop of its first request and then raises
+
+            RuntimeError: ... cannot be used from a different event loop
+
+        on any other loop.  GigaForge has (at least) two loops in play: the
+        process-wide adapter loop in ``core/sync_adapter.py`` and the caller's
+        own loop when the pipeline is driven from ``asyncio.run``.  Caching a
+        single client therefore worked in a one-loop test and broke the moment
+        a real caller used both \u2014 the ReAct episode fell back to
+        ``react->linear`` every time.
+
+        Keying the owned client by the running loop fixes that without leaking:
+        each loop gets exactly one client, and ``aclose`` closes them all.
+        """
+        loop = _running_loop_key()
+        cached = self._clients.get(loop)
+        if cached is not None:
+            return cached
         if self._client is not None:
             return self._client
         sdk = self._sdk()
@@ -273,8 +313,9 @@ class GigaChatSDKProvider:
         }
         if self._base_url:
             kwargs["base_url"] = self._base_url
-        self._client = sdk.GigaChatAsyncClient(**kwargs)
-        return self._client
+        client = sdk.GigaChatAsyncClient(**kwargs)
+        self._clients[loop] = client
+        return client
 
     # -- provider protocol ---------------------------------------------------
     async def chat(
@@ -460,10 +501,23 @@ class GigaChatSDKProvider:
         return StreamAccumulator(_gen, started_at=time.monotonic())
 
     async def aclose(self) -> None:
+        """Close every client this provider built, whichever loop it belonged to.
+
+        Clients are keyed by the loop that created them (see
+        :meth:`_ensure_client`), so closing only ``self._client`` leaked one
+        connection pool per loop the provider had been used from.
+        """
+        owned = [c for c in self._clients.values() if c is not None]
+        self._clients.clear()
         if self._client is not None and self._owns_client:
-            closer = getattr(self._client, "aclose", None)
+            owned.append(self._client)
+        for client in owned:
+            closer = getattr(client, "aclose", None)
             if callable(closer):
-                await closer()
+                try:
+                    await closer()
+                except Exception:  # noqa: BLE001 - shutdown is best effort
+                    pass
         self._client = None
 
     # -- capabilities --------------------------------------------------------

@@ -30,6 +30,7 @@ __all__ = [
     "LANGGRAPH_IMPORT_ERROR",
     "langgraph_available",
     "open_checkpointer",
+    "open_checkpointer_async",
     "thread_config",
     "iter_graph_events",
     "graph_state_summary",
@@ -59,11 +60,20 @@ def langgraph_available() -> bool:
 def open_checkpointer(
     path: Optional[str | Path] = None,
 ) -> Tuple[Any, Optional[sqlite3.Connection]]:
-    """Open a checkpointer for a goal/chat thread.
+    """Open a **synchronous** checkpointer for a goal/chat thread.
 
     ``path`` given  -> a SQLite file (durable across processes, which is what
     makes ``interrupt()`` resumable after a restart).
     ``path`` None   -> an in-memory saver (tests, one-shot runs).
+
+    Use this only with ``graph.invoke`` / ``graph.stream``.  The sync
+    ``SqliteSaver`` raises
+
+        NotImplementedError: The SqliteSaver does not support async methods
+
+    the moment it is handed to ``graph.astream`` \u2014 which is how
+    :func:`gigaforge.agents.langgraph_react.run_react_graph` drives the graph.
+    For that path use :func:`open_checkpointer_async`.
 
     Returns ``(saver, connection)``; the caller must keep the connection alive
     for as long as the saver is used and close it afterwards.
@@ -81,6 +91,34 @@ def open_checkpointer(
     # thread while the UI may read state from another one.
     conn = sqlite3.connect(str(target), check_same_thread=False)
     return SqliteSaver(conn), conn
+
+
+async def open_checkpointer_async(
+    path: Optional[str | Path] = None,
+) -> Tuple[Any, Optional[Any]]:
+    """Async counterpart of :func:`open_checkpointer`.
+
+    Returns ``(saver, connection)`` where the connection is an ``aiosqlite``
+    connection; close it with ``await conn.close()``.
+    """
+    if not LANGGRAPH_AVAILABLE:  # pragma: no cover - guarded by callers
+        raise RuntimeError(
+            "langgraph is not installed: pip install 'gigaforge[langgraph]' "
+            f"({LANGGRAPH_IMPORT_ERROR})"
+        )
+    if path is None:
+        return InMemorySaver(), None
+    try:
+        import aiosqlite
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+    except Exception as exc:  # noqa: BLE001 - optional dependency
+        raise RuntimeError(
+            "async checkpointing needs aiosqlite: pip install aiosqlite"
+        ) from exc
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    conn = await aiosqlite.connect(str(target))
+    return AsyncSqliteSaver(conn), conn
 
 
 def thread_config(thread_id: str, **configurable: Any) -> dict[str, Any]:
