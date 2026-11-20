@@ -774,10 +774,18 @@ def stack() -> None:
     typer.echo(f"  react engine    {react_engine()}")
     typer.echo(f"  subagent engine {subagent_engine()}")
     typer.echo(f"  harness profile {_env('GIGAFORGE_HARNESS_PROFILE', 'native_fs')}")
-    typer.echo(f"  compact at      {_env('GIGAFORGE_COMPACT_AT', '0.85')}")
+    # Read the SAME objects the runtime reads.  The stack command used to print
+    # ``os.environ`` defaults, so it advertised ``react budget 8000 out`` while
+    # the runner sent ``max_tokens=1000`` — a diagnostic that disagrees with the
+    # code is worse than none, because it is believed.
+    from gigaforge.config import get_settings
+    from gigaforge.core.context_window_guard import ContextWindowGuard
+
+    settings = get_settings()
+    typer.echo(f"  compact at      {ContextWindowGuard().trigger_fraction}")
     typer.echo(
-        f"  react budget    {_env('GIGAFORGE_BUDGET_REACT_IN', '40000')} in / "
-        f"{_env('GIGAFORGE_BUDGET_REACT_OUT', '8000')} out"
+        f"  react budget    {settings.budget_react_in} in / "
+        f"{settings.budget_react_out} out"
     )
     typer.echo("-" * 46)
     typer.echo(f"  gigachat SDK    {_have('gigachat')}")

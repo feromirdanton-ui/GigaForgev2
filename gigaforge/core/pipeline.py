@@ -661,8 +661,54 @@ class TaskPipeline:
             except Exception:  # noqa: BLE001
                 pass
         self._event("pipeline.intake", run_id=ctx.run_id, goal_chars=len(goal))
+        self._build_prefix(ctx)
         return {"task": goal, "task_normalized": " ".join(goal.split()).lower(),
                 "memory_hits": len(recalled)}
+
+    def _build_prefix(self, ctx: RunContext) -> None:
+        """Assemble the stable system prefix once, at the start of the run.
+
+        ``build_system_prefix`` existed and was exported, and nothing called it:
+        ``state.prefix`` stayed ``None``, so every phase fell back to
+        ``DEFAULT_PERSONA``.  Three things were lost with it — the repo map never
+        reached the model, the tool contract was never in the system message, and
+        the prefix hash was empty, so GigaChat's prefix cache could not hit.
+
+        Built here rather than per phase because the whole point is that the
+        bytes are identical across every call in the run.
+        """
+        from .state import build_system_prefix
+
+        if ctx.state.prefix is not None:
+            return
+        repo_map = ""
+        try:
+            indexer = self.indexer
+            discover = getattr(indexer, "discover", None)
+            if callable(discover):
+                files = sorted(str(p) for p in list(discover())[:60])
+                if files:
+                    repo_map = "\n".join(files)
+        except Exception as exc:  # noqa: BLE001 - a repo map is an optimisation
+            self._event("pipeline.prefix_error", run_id=ctx.run_id, error=str(exc)[:200])
+        tool_contract = ""
+        try:
+            from .tool_contract import build_contract_text
+
+            tool_contract = build_contract_text(
+                ["grep", "read_structure", "run_tests", "edit_function"]
+            )
+        except Exception:  # noqa: BLE001 - the contract is advisory
+            tool_contract = ""
+        ctx.state.prefix = build_system_prefix(
+            repo_map=repo_map, tool_contract=tool_contract
+        )
+        self._event(
+            "pipeline.prefix",
+            run_id=ctx.run_id,
+            prefix_hash=ctx.state.prefix.hash[:12],
+            chars=len(ctx.state.prefix.text),
+        )
 
     def _node_index(self, ctx: RunContext, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
         git_sha = ""

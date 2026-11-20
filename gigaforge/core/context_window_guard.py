@@ -25,6 +25,7 @@ silently rewrote the prompt would make a run unreproducible.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
@@ -147,6 +148,21 @@ class ContextWindowGuard:
     token_counter: Optional[Callable[[Sequence[Any], Any], Optional[int]]] = None
 
     def __post_init__(self) -> None:
+        # ``GIGAFORGE_COMPACT_AT`` was documented in env.example and printed by
+        # ``gigaforge stack`` while nothing read it: the fraction was hard-coded
+        # at 0.85.  A documented knob that does nothing is worse than no knob —
+        # it makes an operator believe they changed the behaviour.  Read it here,
+        # where the guard is constructed, and keep the dataclass default when the
+        # variable is absent or unparseable.
+        if self.trigger_fraction == DEFAULT_TRIGGER_FRACTION:
+            raw = (os.environ.get("GIGAFORGE_COMPACT_AT") or "").strip()
+            if raw:
+                try:
+                    value = float(raw)
+                except ValueError:
+                    value = 0.0
+                if 0 < value < 1:
+                    self.trigger_fraction = value
         if self.context_window is not None and self.context_window <= 0:
             raise ValueError("context_window must be a positive integer")
         if not 0 < self.trigger_fraction < 1:
