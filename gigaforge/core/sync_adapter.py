@@ -86,6 +86,15 @@ class _LoopThread:
 
     def submit(self, coro: Awaitable[T], *, timeout: float = _SENTINEL_TIMEOUT) -> T:
         loop = self.loop()
+        # Re-entrancy: a coroutine already running on THIS loop must not block
+        # on a future owned by the same loop — that is a guaranteed deadlock
+        # (the loop thread waits for itself).  This happens for real: the agent
+        # layer is async (``ReActRunner.run``) but its client is this blocking
+        # adapter, so ``run_react`` submits the runner to the adapter loop and
+        # the runner's first ``client.chat()`` submits again from inside it.
+        # Run the nested coroutine on a private loop in a throwaway thread.
+        if threading.current_thread() is self._thread:
+            return _run_on_private_loop(coro, timeout=timeout)
         future = asyncio.run_coroutine_threadsafe(coro, loop)  # type: ignore[arg-type]
         return future.result(timeout=timeout)
 
@@ -104,6 +113,32 @@ class _LoopThread:
 
 _shared = _LoopThread()
 _shared_lock = threading.Lock()
+
+
+def _run_on_private_loop(coro: Awaitable[T], *, timeout: float = _SENTINEL_TIMEOUT) -> T:
+    """Run *coro* on a fresh loop in a throwaway thread and return its result.
+
+    Used only for the re-entrant case (see :meth:`_LoopThread.submit`): the
+    caller is already inside the adapter loop, so it cannot block on that loop.
+    A private loop costs one thread per nested call, which is acceptable because
+    nesting is one level deep (runner → client) and the call is I/O bound.
+    """
+    box: dict[str, Any] = {}
+
+    def _target() -> None:
+        try:
+            box["value"] = asyncio.run(coro)  # type: ignore[arg-type]
+        except BaseException as exc:  # noqa: BLE001 - re-raised in the caller
+            box["error"] = exc
+
+    thread = threading.Thread(target=_target, name="gigaforge-nested-async", daemon=True)
+    thread.start()
+    thread.join(timeout=timeout)
+    if thread.is_alive():
+        raise TimeoutError(f"nested async call did not finish within {timeout:.0f}s")
+    if "error" in box:
+        raise box["error"]
+    return box["value"]  # type: ignore[return-value]
 
 
 def _shared_runner() -> _LoopThread:
@@ -191,6 +226,59 @@ class SyncChatClient:
                 **kwargs,
             ),
             timeout=self._timeout,
+        )
+
+    async def chat(
+        self,
+        model: str,
+        messages: Sequence[Any],
+        *,
+        temperature: float = 0.2,
+        max_tokens: Optional[int] = None,
+        functions: Optional[List[Dict[str, Any]]] = None,
+        function_name_hint: Optional[str] = None,
+        task_id: str = "",
+        phase: str = "unknown",
+        response_format: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """``GigaClient.chat``-shaped entry point over the provider.
+
+        The agent layer (``ReActRunner``, ``PlannerAgent``, ``ReviewerAgent``)
+        was written against ``GigaClient``, whose signature is
+        ``chat(model, messages, ...)`` and which is *async*.  The pipeline's
+        client is this adapter, whose router-facing call is the blocking
+        ``complete(messages, model=...)``.  Without this method the whole agent
+        layer raised ``AttributeError`` the first time it touched the pipeline's
+        client — the defect that made the ReAct layer unreachable even after the
+        import was fixed.
+
+        It is deliberately ``async`` and awaits the provider directly: every
+        caller in ``gigaforge.agents`` does ``await client.chat(...)``, and a
+        blocking implementation would deadlock the adapter loop it is called
+        from.  The result is the provider's own ``ChatResult`` (``.content``,
+        ``.usage``, ``.estimated``), which is exactly what the agents read.
+        """
+        if self._closed:
+            raise RuntimeError("this SyncChatClient has been closed")
+        payload: List[Dict[str, Any]] = [_as_message(m) for m in messages]
+        self._calls += 1
+        if response_format is not None:
+            kwargs["response_format"] = response_format
+        if functions is not None:
+            kwargs["functions"] = functions
+        if function_name_hint is not None:
+            kwargs["function_name_hint"] = function_name_hint
+        if task_id:
+            kwargs["task_id"] = task_id
+        if phase:
+            kwargs["phase"] = phase
+        return await self._provider.chat(
+            payload,
+            model=model or "",
+            temperature=temperature,
+            max_tokens=max_tokens,
+            **kwargs,
         )
 
     def list_models(self) -> List[Dict[str, Any]]:

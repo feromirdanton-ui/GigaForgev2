@@ -31,6 +31,7 @@ unable to answer "did this run spend tokens?" without reading model metrics.
 """
 from __future__ import annotations
 
+import logging
 import re
 import threading
 import time
@@ -67,6 +68,9 @@ from .strategies import (
     build_plan_strategy,
     build_review_strategy,
 )
+from .trace import Tracer
+
+log = logging.getLogger(__name__)
 
 PIPELINE_NAME = "task"
 PIPELINE_VERSION = "4.1.0"
@@ -264,6 +268,14 @@ class TaskPipeline:
             clock=self.clock,
             breaker=self.breakers.get("model"),
             sleep=self._sleep,
+        )
+        #: The run-level JSONL tracer.  The DAG writes through
+        #: ``metrics.trace`` (an event stream); the agent layer
+        #: (``PlannerAgent``, ``ReActRunner``) writes through a ``Tracer``
+        #: (one file per task).  Both must be the *same* object graph, or a
+        #: ReAct plan's tokens land in a file nobody reads.
+        self.tracer = Tracer(
+            trace_dir=Path(str(getattr(self.config, "trace_path", ".gigaforge/traces/core.jsonl"))).parent
         )
         self._lock = threading.RLock()
         self._active_runs: dict[str, CancellationToken] = {}
@@ -800,49 +812,64 @@ class TaskPipeline:
                 return {"cache_hit": True, "cached_diff": diff}
         return {"cache_hit": False, "cached_diff": ""}
 
-    def _build_react_runner(self, goal: str = "") -> Any:
+    def _build_react_runner(
+        self,
+        goal: str = "",
+        *,
+        run_id: str = "",
+        max_steps: int | None = None,
+    ) -> Any:
         """Build a :class:`ReActRunner` from this pipeline's own collaborators.
 
         This is the seam that makes the ReAct layer reachable from the product.
         The runner is constructed lazily, only when ``GIGAFORGE_PLAN_STRATEGY``
         selects ``react``, so a default run pays nothing for it.
 
+        **The runner shares the run's accounting.**  It is handed the router's
+        own :class:`BudgetTracker` and the pipeline's :class:`Tracer`, and its
+        ``TaskState`` carries the *caller's* ``run_id``.  A runner built with a
+        fresh ``BudgetTracker()`` would spend tokens the budget never sees —
+        exactly the bypass the contract DAG exists to prevent.
+
         Returns ``None`` when the pipeline cannot supply what the runner needs
-        (no client, no router, no sandbox).  :class:`ReActPlan` then degrades to
-        the one-shot plan instead of failing the run.
+        (no client, no router).  :class:`ReActPlan` then degrades to the
+        one-shot plan instead of failing the run.
+
+        An *import* failure is deliberately **not** caught: a missing module is
+        a build defect, and swallowing it turns a loud error into a silent
+        feature that never runs.
         """
         if self.client is None or self.router is None:
             return None
-        try:
-            from gigaforge.agents.react import ReActContext, ReActRunner, ToolRegistry
-            from gigaforge.core.budgets import BudgetTracker
-            from gigaforge.core.state import TaskState
-            from gigaforge.core.trace import Tracer
-            from gigaforge.sandbox.allowlist import DEFAULT_ALLOWLIST
-            from gigaforge.sandbox.executor import SandboxExecutor
 
-            root = Path(str(getattr(self.config, "repo_root", ".") or ".")).resolve()
-            sandbox = SandboxExecutor(worktree=root, allowlist=DEFAULT_ALLOWLIST)
-            runner = ReActRunner(
-                self.client,
-                self.router,
-                BudgetTracker(),
-                Tracer(),
-                registry=ToolRegistry(),
-                settings=getattr(self, "_settings", None),
-            )
-            # The strategy adapter reads these two attributes off the runner.
-            runner.state = TaskState(run_id="react-plan", goal=goal)
-            runner.ctx = ReActContext(
-                repo_root=root,
-                worktree=root,
-                index=self.index,
-                sandbox=sandbox,
-            )
-            return runner
-        except Exception as exc:  # noqa: BLE001 - exploration is optional
-            log.warning("could not build the ReAct runner (%s)", exc)
-            return None
+        from gigaforge.agents.react import ReActContext, ReActRunner, ToolRegistry
+        from gigaforge.core.task_state import TaskState
+        from gigaforge.sandbox.executor import SandboxExecutor
+
+        root = Path(str(getattr(self.config, "repo_root", ".") or ".")).resolve()
+        # ``SandboxExecutor`` already defaults to ``ALLOWED``; passing it
+        # explicitly documents the contract at the call site.
+        sandbox = SandboxExecutor(worktree=root)
+        runner = ReActRunner(
+            self.client,
+            self.router,
+            self.router.budget,
+            self.tracer,
+            registry=ToolRegistry(),
+            max_steps=max_steps,
+        )
+        # The strategy adapter reads these two attributes off the runner.
+        # ``TaskState`` keys its trace and budget accounting on ``task_id``, so
+        # the DAG's run id goes there — a synthetic id would split one run's
+        # trace across two files.
+        runner.state = TaskState(goal=goal, task_id=run_id or "react-plan")
+        runner.ctx = ReActContext(
+            repo_root=root,
+            worktree=root,
+            index=self.index,
+            sandbox=sandbox,
+        )
+        return runner
 
     def _node_plan(self, ctx: RunContext, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
         if inputs.get("cache_hit"):
@@ -861,6 +888,12 @@ class TaskPipeline:
 
         budget = int(ctx.extras.get("budget_tokens") or 0)
         budget_remaining = max(0, budget - ctx.state.total_tokens()) if budget else 0
+
+        # Tell a stateful strategy which run it is planning for, so the ReAct
+        # runner's TaskState and trace carry the DAG's own run id.
+        binder = getattr(self.plan_strategy, "bind_run", None)
+        if callable(binder):
+            binder(ctx.run_id)
 
         outcome: PlanOutcome = self.plan_strategy.plan(
             ctx.state.goal,

@@ -630,9 +630,33 @@ def _slice_proxy(slice_obj: Any) -> Any:
 # ══════════════════════════════════════════════════════════════════════════
 # selection
 # ══════════════════════════════════════════════════════════════════════════
+def _describe_plan_step(step: Any) -> str:
+    """Render one ReAct ``PlanStep`` as the DAG's plan line.
+
+    ``PlanStep`` carries ``tool`` + ``args`` (a pydantic model), not a
+    ``description`` string — the previous implementation read
+    ``step.description`` and raised ``AttributeError`` on the first real plan.
+    The DAG's plan is a list of human-readable lines, so the tool name plus its
+    salient argument is the right rendering.
+    """
+    tool = str(getattr(step, "tool", "") or "").strip()
+    if not tool:
+        # A duck-typed step (a test stub, or a future engine) may carry a
+        # ready-made description instead of tool/args.
+        return str(getattr(step, "description", "") or "").strip()
+    args = getattr(step, "args", None) or {}
+    if isinstance(args, dict) and args:
+        # Prefer the argument that names the target; fall back to the first.
+        for key in ("name", "path", "file", "query", "value"):
+            if key in args and str(args[key]).strip():
+                return f"{tool}: {args[key]}"
+        first_key = next(iter(args))
+        return f"{tool}: {args[first_key]}"
+    return tool
+
+
 class ReActPlan:
     """Plan by *exploring* the repository, not by guessing from a slice.
-
     This is the strategy that makes the LangGraph ReAct layer reachable from the
     product.  Before it existed, ``run_react_graph`` and ``ReActRunner`` were
     only ever constructed by tests: the DAG's ``plan`` node always called a
@@ -660,11 +684,34 @@ class ReActPlan:
     def __init__(
         self,
         *,
-        runner_factory: Optional[Callable[[], Any]] = None,
+        runner_factory: Optional[Callable[..., Any]] = None,
         max_steps: int = 6,
     ) -> None:
         self._runner_factory = runner_factory
         self._max_steps = max_steps
+        #: Set by the pipeline for the duration of one run, so the runner's
+        #: ``TaskState`` carries the DAG's own ``run_id`` instead of a
+        #: synthetic one.  A separate id would split one run's trace in two.
+        self._run_id = ""
+
+    def bind_run(self, run_id: str) -> None:
+        """Attach the current run id (called by the pipeline before ``plan``)."""
+        self._run_id = str(run_id or "")
+
+    def _build_runner(self, goal: str) -> Any:
+        """Call the factory, passing the run id and step cap when it takes them.
+
+        The factory is a plain callable so a test can inject a stub; a stub that
+        only accepts ``goal`` must keep working, hence the ``TypeError`` retry.
+        """
+        if self._runner_factory is None:
+            return None
+        try:
+            return self._runner_factory(
+                goal, run_id=self._run_id, max_steps=self._max_steps
+            )
+        except TypeError:
+            return self._runner_factory(goal)
 
     def _linear(
         self,
@@ -690,7 +737,7 @@ class ReActPlan:
         parse: Callable[[str], list[str]],
         budget_remaining: int = 0,
     ) -> PlanOutcome:
-        runner = self._runner_factory(goal) if self._runner_factory is not None else None
+        runner = self._build_runner(goal)
         if runner is None:
             # No exploration capability wired in: fall back to the one-shot plan.
             return self._linear(goal, slice_text, ask=ask, parse=parse)
@@ -698,12 +745,19 @@ class ReActPlan:
         from gigaforge.agents.engine import run_react
 
         try:
-            result = run_react(runner, goal, runner.state, ctx=runner.ctx)
+            result = run_react(
+                runner,
+                goal,
+                runner.state,
+                ctx=runner.ctx,
+                thread_id=self._run_id or "react-plan",
+            )
         except Exception as exc:  # noqa: BLE001 - exploration is best-effort
             log.warning("ReAct planning failed (%s); falling back to linear", exc)
             return self._linear(goal, slice_text, ask=ask, parse=parse)
 
-        steps = [step.description for step in (getattr(result, "plan", None) or [])]
+        steps = [_describe_plan_step(step) for step in (getattr(result, "plan", None) or [])]
+        steps = [step for step in steps if step]
         if not steps:
             # The loop explored but never produced a plan: the slice-based plan
             # is still better than an empty one.
