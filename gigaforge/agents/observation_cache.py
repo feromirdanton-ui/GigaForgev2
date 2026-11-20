@@ -30,11 +30,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-__all__ = ["ObservationCache", "CACHEABLE_TOOLS"]
+__all__ = ["ObservationCache", "CACHEABLE_TOOLS", "READ_ONLY_TOOLS"]
 
 #: Tools whose output is a pure function of the tree.  Anything that can write
 #: is excluded by construction, not by a flag someone can forget to set.
 CACHEABLE_TOOLS = frozenset({"grep", "read_structure"})
+
+#: Tools that cannot change the tree, and so may run in a parallel batch.
+#:
+#: This is deliberately a *different* set from :data:`CACHEABLE_TOOLS`.
+#: ``web_search`` is read-only — it cannot touch the workspace — but it is not
+#: cached here, because it has its own cache with a TTL (a search result is a
+#: fact about the world, not about the tree, and the tree-stamp invalidation
+#: that makes the observation cache correct would be meaningless for it).
+#: Conflating the two sets would either let a writer into a parallel batch or
+#: make a search result expire whenever a file changed.
+READ_ONLY_TOOLS = CACHEABLE_TOOLS | {"web_search"}
 
 
 @dataclass

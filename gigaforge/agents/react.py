@@ -138,6 +138,9 @@ _REACT_PROMPT = (
     '  \'{"path":"index.html","content":"<!DOCTYPE html>..."}\'.\n'
     '  ЭТО ЕДИНСТВЕННЫЙ правильный способ создать файл: тело экранируется ОДИН раз.\n'
     '  Не вкладывай содержимое файла в план finish — там оно экранируется трижды и ломается.\n'
+    '- "web_search" — поиск в интернете; action_input — поисковый запрос.\n'
+    '  Бюджет ограничен (по умолчанию 3 вызова на прогон), результаты кэшируются.\n'
+    '  Если сеть недоступна, вернётся явная ошибка — работай по репозиторию.\n'
     '- "finish"    — завершить, подготовить план редактирования.\n'
     '  Для finish: action_input = JSON-строка вида\n'
     '  \'[{"tool":"edit_function","args":{"name":"<symbol>"}}]\'.\n'
@@ -468,6 +471,13 @@ class ToolRegistry:
         from gigaforge.agents.repl_tool import ReplTool
 
         self.register(ReplTool())
+        # Web search is a harness tool, not a model feature: the harness owns
+        # the budget, the cache and the honest "unavailable" answer.  Registered
+        # here so it is available in every mode that builds a registry, not only
+        # in the one path that happened to need it.
+        from gigaforge.agents.web_search_tool import WebSearchTool
+
+        self.register(WebSearchTool())
         self.register(FinishTool())
 
 
@@ -1578,7 +1588,7 @@ class ReActRunner:
         believe it had asked for parallel work and get sequential work, and the
         next batch would make the same mistake.
         """
-        from gigaforge.agents.observation_cache import CACHEABLE_TOOLS
+        from gigaforge.agents.observation_cache import READ_ONLY_TOOLS
 
         if not calls:
             return [], "the parallel payload contained no usable calls"
@@ -1592,7 +1602,7 @@ class ReActRunner:
             return [], (
                 f"unknown tool(s) {unknown}; available: {self._registry.names()} + 'finish'"
             )
-        unsafe = [name for name, _ in calls if name not in CACHEABLE_TOOLS]
+        unsafe = [name for name, _ in calls if name not in READ_ONLY_TOOLS]
         if unsafe:
             return [], (
                 f"tool(s) {unsafe} can change the tree and cannot run in parallel; "
@@ -1912,6 +1922,10 @@ def _kind_for_tool(action: str) -> str:
         return "pytest"
     if action == "grep":
         return "grep"
+    if action == "web_search":
+        # A results page is prose with URLs; the builderr compressor is the
+        # general text bound and keeps the titles and links intact.
+        return "builderr"
     # read_structure + repl + finish + unknown → builderr (general fallback).
     # A REPL step's output is a traceback or a print, which is exactly what the
     # builderr compressor is built to bound.
