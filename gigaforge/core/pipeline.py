@@ -1507,7 +1507,22 @@ class TaskPipeline:
 
         report = merge_diffs(entries, root=root, config=config)
         ctx.extras["subagent_merge"] = report.to_dict()
+        # A partial fan-out is not a finished run.
+        #
+        # Measured: two children, one accepted and merged, one rejected with a
+        # reason — and the run settled ``accepted: True`` with one of the two
+        # files fixed.  The goal asked for both.  Reporting success on half the
+        # work is the same defect as reporting success on a rejected artifact:
+        # the verdict does not follow the evidence.
+        #
+        # The accepted child's work is kept (it is already in the tree and its
+        # diff is returned), and the run is marked partial so the goal loop
+        # spends another cycle on what is left instead of stopping.
         if rejected or report.rejected:
+            ctx.extras["subagent_partial"] = {
+                "accepted": list(report.accepted),
+                "rejected": (rejected + report.rejected)[:6],
+            }
             self._event("pipeline.subagents_rejected", run_id=ctx.run_id,
                         rejected=(rejected + report.rejected)[:4])
         if report.conflicts:
@@ -2049,6 +2064,21 @@ class TaskPipeline:
                 "pipeline.contract_rejected", run_id=ctx.run_id,
                 unmet=contract.unmet[:6], files=contract.files[:6],
             )
+        # A partial fan-out cannot settle as accepted.  The accepted children's
+        # work is kept — it is already in the tree — but the run is not done,
+        # and the goal loop must spend another cycle on what is left.  Measured:
+        # two children, one merged, one rejected, and the run reported success
+        # with one of the two files fixed.
+        partial = ctx.extras.get("subagent_partial")
+        if partial:
+            accepted = False
+            ctx.extras["contract_unmet"] = list(ctx.extras.get("contract_unmet") or []) + [
+                "sub-agent work was rejected: "
+                + ", ".join(str(r.get("name")) for r in partial.get("rejected") or [])
+            ]
+            self._event("pipeline.subagents_partial", run_id=ctx.run_id,
+                        accepted=partial.get("accepted"),
+                        rejected=len(partial.get("rejected") or []))
         ctx.state.artifacts["final_diff"] = final
         ctx.state.artifacts["accepted"] = accepted
         ctx.state.artifacts["review"] = dict(verdict or {})
