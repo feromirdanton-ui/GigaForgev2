@@ -230,3 +230,28 @@ class TestPipelineWiring:
         page = (tmp_path / "index.html").read_text(encoding="utf-8")
         assert "GigaForge" in page
         assert Ctx.extras["generation"]["failed"] == ["features"]
+
+
+class TestPlanStability:
+    """The plan must come from the user's goal, not the harness's repair notes."""
+
+    def test_feedback_block_does_not_change_the_plan(self) -> None:
+        from gigaforge.core.pipeline import _original_goal
+
+        feedback = (
+            "\n\nLONG-LIVED GOAL MODE — CONTINUE THE EXISTING TASK. "
+            "The previous cycle did not complete. Inspect the current workflow "
+            "and fix the reported pipeline failure."
+        )
+        plain = plan_generation(SITE_GOAL).kinds()
+        with_feedback = plan_generation(_original_goal(SITE_GOAL + feedback)).kinds()
+        assert plain == with_feedback, (
+            "the feedback prose mentions 'workflow', which the catalogue reads as "
+            "a 'how it works' section — the plan drifted between cycles"
+        )
+
+    def test_original_goal_strips_only_the_feedback_block(self) -> None:
+        from gigaforge.core.pipeline import _original_goal
+
+        assert _original_goal(SITE_GOAL) == SITE_GOAL
+        assert _original_goal(SITE_GOAL + "\n\nLONG-LIVED GOAL MODE — x") == SITE_GOAL

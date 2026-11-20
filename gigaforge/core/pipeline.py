@@ -2108,7 +2108,9 @@ class TaskPipeline:
         # The review stage can only ever *narrow* an acceptance: a diff the
         # deterministic gate rejected is never revived by an approving reviewer.
         accepted = validated and not review_rejected
-        changed = list(validation.changed_files) if validation else []
+        changed = list(dict.fromkeys(
+            str(p) for p in (getattr(validation, "changed_files", []) or []) if str(p).strip()
+        ))
         # The goal contract is a GATE, not advice.
         #
         # It used to be advisory: the episode was told what was missing, and if
@@ -2478,7 +2480,7 @@ class TaskPipeline:
             section_prompt,
         )
 
-        plan = plan_generation(ctx.state.goal)
+        plan = plan_generation(_original_goal(ctx.state.goal))
         if not plan.ok:
             return ""
         self._event("pipeline.generation_plan", run_id=ctx.run_id,
@@ -2740,6 +2742,22 @@ def _parse_plan(text: str) -> list[str]:
         if stripped:
             steps.append(stripped)
     return steps[:24]
+
+
+def _original_goal(goal: str) -> str:
+    """The user's goal, with the goal-loop's own feedback block removed.
+
+    ``GoalRunner`` appends a "LONG-LIVED GOAL MODE — CONTINUE THE EXISTING TASK"
+    block to every cycle after the first.  Planning the artifact from that text
+    made the section plan drift between cycles: measured live, cycle 1 planned
+    ``hero, features, footer`` and cycles 2-3 planned ``hero, features, how,
+    footer`` — the feedback prose mentioned "workflow", which the catalogue reads
+    as a "how it works" section.  The plan must come from what the user asked
+    for, not from the harness's own repair notes.
+    """
+    marker = "\n\nLONG-LIVED GOAL MODE"
+    head, sep, _tail = (goal or "").partition(marker)
+    return head.strip() if sep else (goal or "").strip()
 
 
 def _fallback_summary(accepted: bool, diff: str) -> str:
