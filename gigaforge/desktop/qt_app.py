@@ -168,12 +168,24 @@ def _compose_attachment_prompt(
     prompt: str,
     paths: list[str],
     workspace_root: Path,
+    tracker: Any = None,
 ) -> tuple[str, tuple[str, ...]]:
-    """Include selected text files as bounded, untrusted prompt references."""
+    """Include selected text files as bounded, untrusted prompt references.
+
+    ``tracker`` is an optional :class:`gigaforge.harness.attachments.AttachmentTracker`.
+    When one is supplied, a file the run has already seen is not re-sent
+    verbatim: an unchanged re-attachment costs one line instead of its whole
+    body, and a changed one arrives with a diff against the previous revision
+    plus an explicit instruction to correct any plan step that assumed the old
+    text.  Deciding "same file, what changed" is a hash and a diff — the harness
+    does it, so the model spends its budget on what to do about the change
+    rather than on rediscovering the file.
+    """
     root = workspace_root.expanduser().resolve()
     references: list[str] = []
     project_files: list[str] = []
     remaining = _MAX_ATTACHMENT_CHARS
+    back_calls: list[Any] = []
 
     for raw in paths[:_MAX_ATTACHMENTS]:
         path = Path(raw).expanduser().resolve(strict=True)
@@ -199,6 +211,20 @@ def _compose_attachment_prompt(
         if relative and size <= 2_000_000:
             project_files.append(relative)
 
+        # Ask the tracker what this attachment is before deciding how much of it
+        # to send.  A repeat that is byte-identical needs no body at all.
+        call = None
+        if tracker is not None and text:
+            try:
+                call = tracker.observe(path, text=text)
+                back_calls.append(call)
+            except Exception:  # noqa: BLE001 - tracking must never break a send
+                call = None
+
+        if call is not None and call.verdict == "unchanged":
+            references.append(f"- `{label}`\n{call.note}")
+            continue
+
         if text and remaining > 0:
             excerpt = text[:min(_MAX_ATTACHMENT_CHARS_PER_FILE, remaining)]
             truncated = len(excerpt) < len(text)
@@ -209,6 +235,10 @@ def _compose_attachment_prompt(
             block = f"- `{label}`\n{fence}{language}\n{excerpt}\n{fence}"
             if truncated:
                 block += "\n[Текст файла сокращён до безопасного лимита]"
+            if call is not None and call.verdict == "changed":
+                block = f"{call.note}\n\n{block}"
+                if call.diff:
+                    block += f"\n\n```diff\n{call.diff}\n```"
             references.append(block)
             remaining -= len(excerpt)
         else:
@@ -2572,6 +2602,10 @@ def _make_bridge_types(qt: tuple[Any, Any, Any, Any, Any, Any]) -> type:
             self._engines.clear()
             self._events = []
             self._agent_activity.clear()
+            # A new conversation is a new attachment history: carrying digests
+            # across chats would let a stale "unchanged" verdict suppress a file
+            # the model has never actually seen.
+            self._attachment_tracker = None
             self._status = "Новый разговор"
             self._refresh_chat_sessions()
             self.eventsChanged.emit()
@@ -2594,10 +2628,19 @@ def _make_bridge_types(qt: tuple[Any, Any, Any, Any, Any, Any]) -> type:
             try:
                 project_files: tuple[str, ...] = ()
                 if attachments:
+                    # One tracker per conversation: a re-attached file is
+                    # recognised, and an unchanged one is not re-sent.
+                    tracker = getattr(self, "_attachment_tracker", None)
+                    if tracker is None:
+                        from gigaforge.harness.attachments import AttachmentTracker
+
+                        tracker = AttachmentTracker()
+                        self._attachment_tracker = tracker
                     prompt, project_files = _compose_attachment_prompt(
                         prompt,
                         attachments,
                         Path(self.projectPath),
+                        tracker,
                     )
                 if self._mode in {"agent", "goal"} and not use_saved_goal_prompt:
                     profile = self._selected_agent_profile()
