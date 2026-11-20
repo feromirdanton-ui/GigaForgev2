@@ -171,6 +171,44 @@ _LINE_COMMENT = re.compile(r"(?m)^\s*//.*$")
 _HTML_COMMENT = re.compile(r"<!--.*?-->", re.S)
 
 
+_CUSTOM_PROPERTY_RE = re.compile(r"(--[A-Za-z0-9_-]+)\s*:\s*([^;{}]+);")
+
+
+def resolve_css_variables(text: str) -> str:
+    """Inline ``var(--x)`` uses with the value declared for ``--x``.
+
+    Measured live: a sectional run produced a page that declared
+
+        :root { --accent: cyan; --secondary: magenta; }
+        h1 { color: var(--accent); }
+
+    and the colour check rejected it.  The colours are declared correctly — the
+    reference is indirect, and resolving an indirection is a string operation,
+    not a judgement.  One level is resolved (a variable defined in terms of
+    another is left alone), which covers the palette idiom without pretending to
+    be a CSS engine.
+    """
+    declared = {name: value.strip() for name, value in _CUSTOM_PROPERTY_RE.findall(text)}
+
+    def _sub(match: re.Match[str]) -> str:
+        name = match.group(1)
+        fallback = match.group(2)
+        if name in declared:
+            return declared[name]
+        return fallback if fallback is not None else match.group(0)
+
+    out = re.sub(
+        r"var\(\s*(--[A-Za-z0-9_-]+)\s*(?:,\s*([^)]*))?\)",
+        _sub,
+        text,
+    )
+    # A custom property whose value is a colour is itself a colour declaration:
+    # ``--accent: cyan;`` says the accent *is* cyan.
+    if declared:
+        out += "\n" + "\n".join(f"color: {value};" for value in declared.values())
+    return out
+
+
 def strip_comments(text: str) -> str:
     """Remove CSS/JS/HTML comments, keeping the code that actually runs.
 
@@ -216,7 +254,7 @@ class Requirement:
     needles: tuple[str, ...] = ()
 
     def satisfied_by(self, text: str) -> bool:
-        low = strip_comments(text).lower()
+        low = strip_comments(resolve_css_variables(text)).lower()
         if self.kind == "self_contained":
             # Any absolute URL in a src/href is an external asset.
             return not re.search(r'(?:src|href)\s*=\s*["\']https?://', low)

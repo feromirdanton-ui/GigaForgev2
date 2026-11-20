@@ -204,3 +204,43 @@ class TestHeadlineAndMetaCopy:
         verdict = check_artifacts(extract_requirements(GOAL), tmp_path)
         assert not verdict.ok
         assert any("this is where we" in item.lower() for item in verdict.unmet), verdict.unmet
+
+
+class TestCssVariables:
+    """A palette declared through CSS custom properties is a real palette.
+
+    Measured live: a sectional run produced
+
+        :root { --accent: cyan; --secondary: magenta; }
+        h1 { color: var(--accent); }
+
+    and the contract rejected it for missing cyan and magenta.  The colours were
+    declared correctly; the reference was indirect, and resolving an indirection
+    is a string operation, not a judgement.
+    """
+
+    def test_a_colour_reached_through_var_is_found(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "<!DOCTYPE html><html><head><style>"
+            ":root{--accent:cyan;--secondary:magenta}"
+            "h1{color:var(--accent)}h2{color:var(--secondary)}"
+            "</style></head><body><h1>GigaForge</h1>"
+            "<section class='hero'>h</section><div class='grid'>g</div>"
+            "<footer>f</footer>" + "x" * 1400 + "</body></html>",
+        )
+        verdict = check_artifacts(extract_requirements(GOAL), tmp_path, files=["index.html"])
+        assert verdict.ok, verdict.unmet
+
+    def test_a_var_without_a_definition_does_not_satisfy(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            "<!DOCTYPE html><html><head><style>"
+            "h1{color:var(--accent)}"
+            "</style></head><body><h1>GigaForge</h1>"
+            "<section class='hero'>h</section><div class='grid'>g</div>"
+            "<footer>f</footer>" + "x" * 1400 + "</body></html>",
+        )
+        verdict = check_artifacts(extract_requirements(GOAL), tmp_path, files=["index.html"])
+        assert not verdict.ok
+        assert any("cyan" in item for item in verdict.unmet), verdict.unmet
