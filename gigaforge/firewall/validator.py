@@ -287,12 +287,20 @@ class DiffValidator:
         task: str = "",
         dry_run: bool = False,
         max_retries: Optional[int] = None,
+        path_hint: str = "",
     ) -> ValidationOutcome:
         """Validate ``diff_text``, retrying up to ``max_retries`` times.
 
         ``retry_fn(attempt, repair, previous_diff)`` must return a corrected diff
         or ``None``.  Returning ``None`` stops the loop — there is no point
         spending the remaining budget on a repair the caller cannot produce.
+
+        ``path_hint`` names the file a bare hunk belongs to.  A model that has
+        been told "here is the page, change it" often answers with a hunk and no
+        ``--- a/path`` header; the parser can accept that when it is told which
+        file is meant, and the caller always knows.  Measured live: the ``run``
+        mode failed with "hunk without a file header and no path hint" while the
+        harness held the path in ``harness_owned_paths``.
         """
         budget = self.config.max_retries if max_retries is None else int(max_retries)
         outcome = ValidationOutcome(
@@ -303,7 +311,8 @@ class DiffValidator:
         current = diff_text
 
         for index in range(budget + 1):
-            attempt = self._run_once(current, index + 1, dry_run=dry_run)
+            attempt = self._run_once(current, index + 1, dry_run=dry_run,
+                                     path_hint=path_hint)
             outcome.attempts.append(attempt)
             if attempt.accepted:
                 outcome.accepted = True
@@ -349,13 +358,14 @@ class DiffValidator:
         return max(0, tries - 1)
 
     # ── one pass ─────────────────────────────────────────────────────────
-    def _run_once(self, diff_text: str, attempt_no: int, *, dry_run: bool) -> Attempt:
+    def _run_once(self, diff_text: str, attempt_no: int, *, dry_run: bool,
+                  path_hint: str = "") -> Attempt:
         cfg = self.config
         attempt = Attempt(attempt=attempt_no, accepted=False, dry_run=dry_run)
 
         # 1. parse
         try:
-            parsed = parse(diff_text, cfg)
+            parsed = parse(diff_text, cfg, path_hint=path_hint)
         except DiffParseError as exc:
             attempt.repair = RepairRequest(
                 attempt=attempt_no,

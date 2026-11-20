@@ -135,7 +135,8 @@ class FixLoop:
         self._sleep = sleep or time.sleep
 
     # ── helpers ──────────────────────────────────────────────────────────────
-    def _validate_once(self, diff: str, *, task: str, dry_run: bool) -> ValidateResult:
+    def _validate_once(self, diff: str, *, task: str, dry_run: bool,
+                       path_hint: str = "") -> ValidateResult:
         """Single validate pass, normalised.
 
         ``max_retries=0`` is the whole point: the loop below owns the budget.
@@ -144,7 +145,8 @@ class FixLoop:
             raise FixLoopExhausted("FixLoop needs a validator")
         try:
             outcome = self.validator.validate(diff, retry_fn=None, task=task,
-                                              dry_run=dry_run, max_retries=0)
+                                              dry_run=dry_run, max_retries=0,
+                                              path_hint=path_hint)
         except Exception as exc:  # noqa: BLE001 - a crashing gate must reject
             # A validator that raises has *not* approved anything.  Letting the
             # exception escape used to end the run as "accepted" with no file
@@ -157,14 +159,16 @@ class FixLoop:
             )
         return _normalise_validation(outcome)
 
-    def validate_once(self, diff: str, *, task: str = "", dry_run: bool = False) -> ValidateResult:
+    def validate_once(self, diff: str, *, task: str = "", dry_run: bool = False,
+                      path_hint: str = "") -> ValidateResult:
         """Public single-pass validation.
 
         The pipeline's ``validate`` node calls this when no repair loop ran, so the
         executor and the loop agree on what "validated" means instead of each
         having its own notion.
         """
-        return self._validate_once(diff, task=task, dry_run=dry_run)
+        return self._validate_once(diff, task=task, dry_run=dry_run,
+                                   path_hint=path_hint)
 
     def _compress_failure(self, raw: str, *, hint: str = "") -> str:
         """Compress raw failure output into a short structured summary.
@@ -210,6 +214,7 @@ class FixLoop:
         dry_run: bool = False,
         run_id: str = "",
         approve: Optional[Callable[[str], bool]] = None,
+        path_hint: str = "",
     ) -> FixLoopResult:
         """Run the loop.
 
@@ -318,7 +323,8 @@ class FixLoop:
 
             # ── validate it ──────────────────────────────────────────────────
             try:
-                validation = self._validate_once(current_diff, task=task, dry_run=dry_run)
+                validation = self._validate_once(current_diff, task=task, dry_run=dry_run,
+                                                 path_hint=path_hint)
             except BaseException as exc:  # noqa: BLE001 - reported, not raised
                 iteration.error = str(exc)[:1000]
                 iteration.reason = "validation raised"

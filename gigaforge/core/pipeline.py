@@ -1717,6 +1717,12 @@ class TaskPipeline:
             dry_run=bool(ctx.extras.get("dry_run")),
             run_id=ctx.run_id,
             approve=ctx.extras.get("approve"),
+            # A model told "here is the page, change it" often answers with a
+            # bare hunk and no ``--- a/path`` header.  The harness knows which
+            # file is meant, so it says so instead of failing the run with
+            # "hunk without a file header and no path hint" — measured live on
+            # the ``run`` mode, which rejected a correct page for this reason.
+            path_hint=(sorted(ctx.extras.get("harness_owned_paths") or []) or [""])[0],
         )
         ctx.extras["fix_result"] = result
         result.diff = self._ensure_creations(ctx, result.diff, slice_text, ctx)
