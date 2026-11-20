@@ -433,6 +433,15 @@ def default_routes(cfg: CoreConfig) -> dict[str, PhaseRoute]:
             temperature=0.1,
             rationale="planning benefits from the strongest reasoning model",
         ),
+        # A ReAct episode explores before it commits, so it wants the strong
+        # model at a low temperature — same reasoning as ``plan``, but with the
+        # loop's own (larger) budget above.
+        "react": PhaseRoute(
+            model=cfg.strong_model,
+            fallbacks=(cfg.default_model,),
+            temperature=0.1,
+            rationale="exploration needs the strong model; the loop budget bounds it",
+        ),
         "retrieve": PhaseRoute(
             model=cfg.cheap_model,
             fallbacks=(),
@@ -495,6 +504,12 @@ def default_budgets() -> dict[str, PhaseBudget]:
         "fix": PhaseBudget(max_tokens=160_000, max_calls=12, max_output_tokens=8_000),
         "review": PhaseBudget(max_tokens=30_000, max_calls=4, max_output_tokens=1_500),
         "summarize": PhaseBudget(max_tokens=20_000, max_calls=3, max_output_tokens=2_000),
+        # A ReAct episode is a LOOP, not one planning call.  It used to bill
+        # ``plan`` (4 calls / 40 000 tokens), which a live episode exhausted on
+        # its second step because the harness prompt alone is ~1 100 tokens.
+        # The call budget is what actually binds here, so it is the one that
+        # grows.
+        "react": PhaseBudget(max_tokens=200_000, max_calls=24, max_output_tokens=4_000),
     }
 
 
