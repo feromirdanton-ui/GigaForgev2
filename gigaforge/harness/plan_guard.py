@@ -72,6 +72,20 @@ _TARGET_KEYS = (
     "symbol_name", "function_name",
 )
 
+#: Keys that name a *symbol* rather than a file.
+#:
+#: ``edit_function`` edits a function, so a file name is not a target for it:
+#: "edit react.py" says where to look, not what to change.  Measured: the guard
+#: accepted ``edit_function: {"path": "react.py"}`` — the exact step it was
+#: written to reject — because ``path`` was in the generic key list.  A tool
+#: that edits a symbol must name one.
+_SYMBOL_KEYS = (
+    "name", "symbol", "function", "symbol_name", "function_name", "target",
+)
+
+#: Tools whose target must be a symbol, not a file.
+_SYMBOL_TOOLS = frozenset({"edit_function", "refactor"})
+
 
 @dataclass
 class PlanVerdict:
@@ -124,6 +138,11 @@ def _signature(step: Any) -> tuple[str, str]:
 
 def _has_target(step: Any) -> bool:
     args = _args_of(step)
+    tool = _tool_of(step)
+    if tool in _SYMBOL_TOOLS:
+        # A symbol-editing tool must name a symbol.  ``path`` alone is not a
+        # target: it says where to look, not what to change.
+        return any(str(args.get(key) or "").strip() for key in _SYMBOL_KEYS)
     return any(str(args.get(key) or "").strip() for key in _TARGET_KEYS)
 
 

@@ -318,10 +318,21 @@ class LintResult:
         return len(self.errors)
 
 
-def _run_ruff_check(path: Path) -> tuple[int, str, str]:
+def _run_ruff_check(path: Path, *, ruff_bin: str = "") -> tuple[int, str, str]:
+    """Run ``ruff check``, resolving the binary instead of assuming it.
+
+    The hard-coded ``"ruff"`` ignored the ``Linter``'s own configured
+    ``ruff_bin``, so a deployment that pinned a specific ruff still ran
+    whatever happened to be first on ``PATH`` — or nothing at all.
+    """
+    from gigaforge.l0.toolchain import resolve_tool
+
+    tool = resolve_tool("ruff", override=ruff_bin)
+    if not tool.found:
+        return -1, "", tool.reason
     try:
         proc = subprocess.run(
-            ["ruff", "check", "--output-format=json", "--no-fix", str(path)],
+            [tool.path, "check", "--output-format=json", "--no-fix", str(path)],
             capture_output=True,
             text=True,
             timeout=30.0,
@@ -367,10 +378,15 @@ def lint(path: Path | str) -> LintResult:
 
 def format(path: Path | str) -> str:
     """Run `ruff format` in-place on file; return the (now-formatted) source."""
+    from gigaforge.l0.toolchain import resolve_tool
+
     path = Path(path)
+    tool = resolve_tool("ruff")
+    if not tool.found:
+        raise RuntimeError(f"{tool.reason}; cannot format {path}")
     try:
         proc = subprocess.run(
-            ["ruff", "format", str(path)],
+            [tool.path, "format", str(path)],
             capture_output=True,
             text=True,
             timeout=30.0,
@@ -385,13 +401,32 @@ def format(path: Path | str) -> str:
 
 
 def format_code(path: Path | str) -> tuple[bool, str]:
-    """Run `ruff format` on path."""
+    """Run ``ruff format`` on path.
+
+    A missing ruff is **not** a failure of the code: it returns ``(True, source)``
+    with the file unchanged, which is the same degradation ``lint()`` documents.
+    This function used to return ``(False, "[Errno 2] No such file or
+    directory: 'ruff'")`` — the identical defect that was fixed in ``lint()``
+    one function above, left in place here.
+    """
+    from gigaforge.l0.toolchain import resolve_tool
+
+    target = Path(path)
+    tool = resolve_tool("ruff")
+    if not tool.found:
+        try:
+            return True, target.read_text(encoding="utf-8")
+        except OSError as exc:
+            return False, str(exc)
     try:
-        proc = subprocess.run(["ruff", "format", str(path)], capture_output=True, text=True, timeout=30.0)
+        proc = subprocess.run(
+            [tool.path, "format", str(target)],
+            capture_output=True, text=True, timeout=30.0,
+        )
         if proc.returncode == 0:
-            return True, Path(path).read_text(encoding="utf-8")
+            return True, target.read_text(encoding="utf-8")
         return False, proc.stderr
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - reported, not raised
         return False, str(e)
 
 

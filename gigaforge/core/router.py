@@ -578,6 +578,39 @@ class ModelRouter:
             self._usage.clear()
             self._stats = RouterStats()
 
+    def child(self) -> "ModelRouter":
+        """A router for one isolated run: own counters, own budget, shared client.
+
+        ``reset()`` was added so a phase budget would be per-run, but the
+        sub-agent fan-out hands every child the *same* router object
+        (``pipeline.py``: ``router=self.router``).  A child's ``run()`` then
+        called ``reset()`` on the parent's router, and the parent forgot what it
+        had already spent: measured, a parent that used 3 calls in ``plan`` saw
+        ``usage("plan") is None`` after the fan-out.
+
+        The phase caps had the mirror-image defect: ``BudgetTracker`` keeps
+        ``_phase_used`` on the instance, and the instance was process-wide, so
+        three children each got the parent's full phase allowance and the
+        parent's budget was consumed three times over.
+
+        A child router shares everything that must be shared — the client, the
+        route table, the metrics sink, the tracer — and owns everything that
+        must not be: the per-phase usage counters and the budget tracker.  The
+        circuit breaker lives on the client, so it stays shared, which is what
+        you want: a provider outage is a property of the provider, not of one
+        sub-agent.
+        """
+        child = ModelRouter(
+            self.client,
+            self.config,
+            budget_tracker=BudgetTracker(settings=self._s),
+            settings=self._s,
+            metrics=self.metrics,
+            trace=self.trace,
+            exclude_models=self.exclude_models,
+        )
+        return child
+
     def __repr__(self) -> str:  # pragma: no cover - trivial
         return f"ModelRouter(client={type(self.client).__name__}, phases={len(self.config.routes)})"
 

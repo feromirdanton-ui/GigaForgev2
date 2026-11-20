@@ -31,6 +31,7 @@ unable to answer "did this run spend tokens?" without reading model metrics.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import threading
@@ -787,7 +788,8 @@ class TaskPipeline:
             # No slice means no context hash; fold in a worktree fingerprint so a
             # changed repository cannot be served the previous run's diff.
             key = task_hash(ctx.state.goal, empty,
-                            f"{ctx.state.git_sha}|{self._repo_fingerprint()}")
+                            f"{ctx.state.git_sha}|{self._repo_fingerprint()}"
+                            f"|{self._cache_scope()}")
             ctx.state.slice_hash = _NO_SLICE
             return {"slice": empty, "slice_hash": _NO_SLICE, "cache_key": key}
         files = tuple(ctx.extras.get("files") or ())
@@ -830,11 +832,13 @@ class TaskPipeline:
                     "pipeline.slice_empty", run_id=ctx.run_id, error=str(slice_error)[:300]
                 )
                 empty = _NullSlice()
-                key = task_hash(ctx.state.goal, empty, ctx.state.git_sha)
+                key = task_hash(ctx.state.goal, empty,
+                                f"{ctx.state.git_sha}|{self._cache_scope()}")
                 ctx.state.slice_hash = _NO_SLICE
                 return {"slice": empty, "slice_hash": _NO_SLICE, "cache_key": key}
 
-        key = task_hash(ctx.state.goal, slice_obj, ctx.state.git_sha)
+        key = task_hash(ctx.state.goal, slice_obj,
+                        f"{ctx.state.git_sha}|{self._cache_scope()}")
         ctx.state.slice_hash = key[:16]
         ctx.state.artifacts["slice_hash"] = ctx.state.slice_hash
         # The key is computed exactly once, here, and then carried.  Recomputing
@@ -843,6 +847,28 @@ class TaskPipeline:
         # looks exactly like a cache that is simply cold.
         ctx.extras["slice_obj"] = slice_obj
         return {"slice": slice_obj, "slice_hash": ctx.state.slice_hash, "cache_key": key}
+
+    def _cache_scope(self) -> str:
+        """A stable id for the tree this pipeline writes to.
+
+        The cache key was ``task_hash(goal, slice, git_sha)``, and a sub-agent's
+        worktree is a *copy* of the repository at the same commit — so two
+        children with the same goal text produced the same key and one could be
+        served the other's diff.  Measured: two children with identical goals
+        hashed identically.
+
+        The scope is the resolved repo root, hashed.  It is stable across runs
+        of the same tree (so the cache still hits where it should) and distinct
+        between worktrees (so it cannot cross-contaminate).
+        """
+        root = str(getattr(self.config, "repo_root", "") or "")
+        if not root:
+            return ""
+        try:
+            resolved = str(Path(root).resolve())
+        except OSError:  # pragma: no cover - an unresolvable root is used as given
+            resolved = root
+        return hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:16]
 
     def _fallback_slice_files(self, limit: int = 3) -> list[str]:
         """Seeds for a vague goal: ranked files, else the filesystem itself.
@@ -1320,12 +1346,27 @@ class TaskPipeline:
         return "\n".join(parts)
 
     def _subagent_diff(self, ctx: RunContext) -> str:
-        """Split a multi-file goal into per-file sub-agents in isolated workspaces.
+        """Delegate a multi-file goal to sub-agents with exclusive ownership.
 
-        Opt-in (``use_subagents``): each sub-agent runs the whole pipeline inside its
-        own Git worktree or copy fallback, so concurrent edits stay isolated. The
-        diffs are merged in spawn order — the same determinism the wave scheduler
-        gives nodes.
+        Opt-in (``use_subagents``).  Each sub-agent runs the whole pipeline in
+        its own worktree, and its diff is **accepted or rejected before it is
+        merged** — see :mod:`gigaforge.core.acceptance`.
+
+        Three things changed here, and each one was a measured defect:
+
+        * **The child is handed only its own work.**  It used to receive
+          ``f"Only touch {rel}. Goal: {full_goal}"``, and ``_ensure_creations``
+          reads the file names out of the goal — so a child told to touch only
+          ``a.html`` created ``index.html`` and ``b.html`` too, and three
+          children rewrote each other's files.  The scoped goal names one path.
+        * **Ownership is enforced, not requested.**  ``focus_paths`` was a hint
+          for the slicer; nothing stopped a write.  The child's firewall now
+          carries ``apply_allow_paths``, so a write outside its assignment is
+          refused by the same guard that refuses a path outside the repo.
+        * **The merge is sequential and conflict-aware.**  It was
+          ``"\\n".join(diffs)`` followed by an apply in which the last writer
+          won: two children creating the same file merged to ``ok: True`` with
+          one child's work silently gone.
         """
         if not ctx.extras.get("use_subagents"):
             return ""
@@ -1344,7 +1385,6 @@ class TaskPipeline:
             if (rel := _workspace_relative_path(raw, root))
             and (root / rel).is_file()
         ]
-        targets = named[:3]
 
         def is_test(rel: str) -> bool:
             lowered = rel.replace("\\", "/").lower()
@@ -1356,23 +1396,34 @@ class TaskPipeline:
         # tests is a coordinated change: `mul` in calc.py exists for a test in
         # test_calc.py, and splitting them makes both halves fail — observed live,
         # where four per-file children produced one diff and two hard failures.
-        if any(is_test(rel) for rel in named) or len(named) > 3 or len(targets) < 2:
+        coordinated = any(is_test(rel) for rel in named)
+        if len(named) > 3 or len(named) < 2:
             self._event("pipeline.subagents_skipped", run_id=ctx.run_id,
                         files=len(named), reason="coordinated change or too many files")
             return ""
+
+        from .acceptance import allocate_work, check_acceptance, merge_diffs
         from .agents import SubAgentSpec
+
+        items = allocate_work(ctx.state.goal, named, coordinated=coordinated)
+        if len(items) < 2:
+            self._event("pipeline.subagents_skipped", run_id=ctx.run_id,
+                        files=len(named), reason="not enough independent work")
+            return ""
 
         specs = [
             SubAgentSpec(
-                name=f"file-{index}",
-                goal=(f"Only touch `{rel}`. Goal: {ctx.state.goal}"),
-                focus_paths=(rel,),
+                name=f"work-{index}",
+                # Only this item's work.  ``_scoped_goal`` removes the other
+                # paths from the text, so the child cannot re-derive them.
+                goal=_scoped_goal(ctx.state.goal, item.owns_paths, named),
+                focus_paths=item.owns_paths,
                 budget_tokens=int(ctx.extras.get("budget_tokens") or 0),
                 use_cache=bool(ctx.extras.get("use_cache", True)),
                 dry_run=bool(ctx.extras.get("dry_run", False)),
                 max_fix_iterations=ctx.extras.get("max_fix_iterations"),
             )
-            for index, rel in enumerate(targets)
+            for index, item in enumerate(items)
         ]
         try:
             results = self.fan_out(specs, parent_ctx=ctx, parallel=True)
@@ -1380,30 +1431,59 @@ class TaskPipeline:
             self._event("pipeline.subagents_error", run_id=ctx.run_id,
                         error=str(exc)[:300])
             return ""
-        merged = [str(getattr(item, "diff", "") or "").strip() for item in results]
-        merged = [part for part in merged if part]
-        if not merged:
-            # Name the reason instead of an empty return: a sub-agent with no diff
-            # means its child run was rejected (or could not write), and that is
-            # exactly what has to be visible in the trace.
+
+        # Acceptance gate.  A rejected child is reported with its reason and
+        # excluded from the merge; it is never silently dropped and never
+        # silently merged.
+        entries: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
+        accepted_paths: list[str] = []
+        for item, result in zip(items, results):
+            verdict = check_acceptance(
+                result, item, accepted_paths=accepted_paths, config=config
+            )
+            if verdict.accepted:
+                accepted_paths.extend(verdict.paths)
+                entries.append({
+                    "name": item.id,
+                    "diff": str(getattr(result, "diff", "") or ""),
+                    "owns_paths": item.owns_paths,
+                })
+            else:
+                rejected.append({
+                    "name": item.id,
+                    "reasons": verdict.reasons,
+                    "ok": bool(getattr(result, "ok", False)),
+                    "error": str(getattr(result, "error", "") or "")[:200],
+                })
+
+        if not entries:
             self._event(
                 "pipeline.subagents_empty", run_id=ctx.run_id, specs=len(specs),
-                detail=[{"ok": bool(getattr(item, "ok", False)),
-                         "error": str(getattr(item, "error", "") or "")[:160]}
-                        for item in results][:4],
+                detail=rejected[:4],
             )
             return ""
-        # A partially merged diff is worse than none: the run reports the goal as done
-        # for one file and silently skips the rest — observed live, where a two-file
-        # goal touched only a.py.  Accept the fan-out only when every sub-agent
-        # produced a change; otherwise fall back to the single-agent pass.
-        if len(merged) != len(specs):
-            self._event("pipeline.subagents_partial", run_id=ctx.run_id,
-                        specs=len(specs), diffs=len(merged))
+
+        report = merge_diffs(entries, root=root, config=config)
+        ctx.extras["subagent_merge"] = report.to_dict()
+        if rejected or report.rejected:
+            self._event("pipeline.subagents_rejected", run_id=ctx.run_id,
+                        rejected=(rejected + report.rejected)[:4])
+        if report.conflicts:
+            # A conflict means two children claimed one path.  The allocator
+            # makes that impossible for the paths it was given, so reaching here
+            # means a child wrote outside its assignment and the guard let it
+            # through — worth a loud event rather than a quiet merge.
+            self._event("pipeline.subagents_conflict", run_id=ctx.run_id,
+                        conflicts=report.conflicts[:4])
+        if not report.diff:
+            self._event("pipeline.subagents_empty", run_id=ctx.run_id,
+                        specs=len(specs), detail=report.rejected[:4])
             return ""
         self._event("pipeline.subagents", run_id=ctx.run_id,
-                    files=len(targets), diffs=len(merged))
-        return "\n".join(merged)
+                    files=len(named), diffs=len(report.accepted),
+                    rejected=len(rejected) + len(report.rejected))
+        return report.diff
 
     def _node_act(self, ctx: RunContext, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
         if inputs.get("cache_hit"):
@@ -2137,6 +2217,17 @@ class TaskPipeline:
                 from gigaforge.firewall import ContextFirewall
 
                 firewall_config = replace(self.firewall.config, repo_root=str(worktree))
+                # Ownership is enforced, not requested.  ``focus_paths`` was a
+                # hint for the slicer and nothing stopped a write: measured, a
+                # child told to touch only ``a.html`` created ``index.html`` and
+                # ``b.html`` as well.  ``apply_allow_paths`` is the same guard
+                # that refuses a path outside the repo, so a write outside the
+                # assignment is refused before it reaches the tree.
+                if spec.focus_paths:
+                    firewall_config = replace(
+                        firewall_config,
+                        apply_allow_paths=tuple(spec.focus_paths),
+                    )
                 child_firewall = ContextFirewall(self.firewall.store, config=firewall_config)
             except Exception as exc:  # noqa: BLE001 - fail this child, preserve parent isolation
                 return {"ok": False, "error": f"sub-agent firewall unavailable: {exc}"}
@@ -2151,7 +2242,14 @@ class TaskPipeline:
             client=self.client,
             store=self.store,
             firewall=child_firewall,
-            router=self.router,
+            # A child gets its OWN router.  Handing it ``self.router`` made the
+            # child's ``run()`` call ``reset()`` on the parent's counters, so the
+            # parent forgot what it had spent in ``plan`` the moment a fan-out
+            # finished; and because ``BudgetTracker`` keeps its usage on the
+            # instance, every child also got the parent's full phase allowance.
+            # ``child()`` shares the client (and therefore the circuit breaker)
+            # and owns the counters.
+            router=self.router.child() if self.router is not None else None,
             cache=self.cache,
             metrics=self.metrics,
             checkpoints=self.checkpoints,
@@ -2229,6 +2327,40 @@ class _NullSlice:
 
     def to_dict(self) -> dict[str, Any]:
         return {"symbols": [], "empty": True}
+
+
+def _scoped_goal(goal: str, owns_paths: Sequence[str], all_paths: Sequence[str]) -> str:
+    """The parent goal with every *other* path removed from the text.
+
+    A child handed the full goal re-derives every file name in it.  Measured:
+    a child told "only touch ``a.html``" still created ``index.html`` and
+    ``b.html``, because ``_ensure_creations`` reads the paths out of the goal
+    text and the goal text named all three.  Three children then rewrote each
+    other's files and the run oscillated.
+
+    Removing the other names is the deterministic half of the fix; the other
+    half is ``apply_allow_paths`` on the child's firewall, which refuses the
+    write even if the model invents the name anyway.
+    """
+    text = str(goal or "")
+    mine = {str(p).replace("\\", "/") for p in owns_paths}
+    for other in all_paths:
+        rel = str(other).replace("\\", "/")
+        if not rel or rel in mine:
+            continue
+        # Replace the path with a neutral token rather than deleting it: the
+        # sentence around it still has to read as a goal.
+        text = text.replace(rel, "(another file, not yours)")
+        name = rel.rsplit("/", 1)[-1]
+        if name and name != rel:
+            text = text.replace(name, "(another file, not yours)")
+    owned = ", ".join(f"`{p}`" for p in owns_paths)
+    return (
+        f"{text}\n\n"
+        f"Your assignment covers ONLY {owned}. "
+        "Do not create, edit or delete any other file: writes outside this set "
+        "are refused by the guard and the work will be rejected."
+    )
 
 
 def _workspace_relative_path(raw: str, root: Path) -> str:

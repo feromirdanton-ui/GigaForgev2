@@ -19,11 +19,13 @@ Selection is by environment variable, with the same shape as the goal engine:
     ``classic`` (default when LangGraph is absent) or ``langgraph``.
 
 ``GIGAFORGE_SUBAGENT_ENGINE``
-    ``classic`` (default) or ``langgraph``.
+    ``classic`` or ``langgraph``.
 
-Both default to ``classic`` so an existing deployment keeps its exact behaviour;
-``langgraph`` is opt-in and degrades to ``classic`` with a logged warning when
-the package is missing.
+Both default to ``langgraph`` when the package is installed, and degrade to
+``classic`` with a logged warning when it is missing.  (This docstring used to
+claim both defaulted to ``classic``, which was the opposite of what
+:func:`_choice` does — a comment that contradicts the code is how a reader
+concludes a feature is off when it is on.)
 """
 from __future__ import annotations
 
@@ -144,12 +146,17 @@ def run_subagents(
     if chosen in {"langgraph", "graph"} and _langgraph_ok():
         from gigaforge.agents.langgraph_subagents import run_subagents_graph
 
+        # ``parent_ctx`` travels through: the production runner needs it to
+        # build each child's isolated context, and the graph holds it in a
+        # closure because a RunContext is not serialisable and would break the
+        # checkpointer if it were put in graph state.
         return run_subagents_graph(
             runner,
             spawns,
             agent_factory,
             checkpointer=checkpointer,
             thread_id=thread_id,
+            parent_ctx=classic_kwargs.get("parent_ctx"),
         )
     from gigaforge.core.sync_adapter import await_blocking
 

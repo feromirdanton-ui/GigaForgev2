@@ -15,6 +15,20 @@ checks what the user literally asked for.
 
 The verdict is fed back to the model as an observation, so a miss becomes a
 correction step inside the same episode instead of a silent pass.
+
+**Three ways the check used to pass without the artifact deserving it.**  All
+three were measured, and all three are the same mistake — checking something
+other than the file the run produced:
+
+* a colour named in a **CSS comment** counted.  A page that was white on black
+  but contained ``/* background: cyan; abandoned */`` satisfied "cyan";
+* with no file list, the check fell back to **every text file in the worktree**,
+  so a run that wrote nothing passed on a file that was already in the repo;
+* ``min_size`` **summed** the files, so five 300-byte files satisfied "at least
+  1200 bytes" for an artifact that was supposed to be one page.
+
+The rule that fixes all three: check only the files the run created or changed,
+check each of them on its own, and read the text the way a browser would.
 """
 from __future__ import annotations
 
@@ -87,6 +101,25 @@ _SELF_CONTAINED = (
 #: A page smaller than this cannot plausibly satisfy a multi-part design brief.
 _MIN_ARTIFACT_BYTES = 1200
 
+#: Comment syntaxes to strip before checking.  A comment is not a declaration:
+#: the browser does not apply it, so the contract must not count it.
+_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.S)
+_LINE_COMMENT = re.compile(r"(?m)^\s*//.*$")
+_HTML_COMMENT = re.compile(r"<!--.*?-->", re.S)
+
+
+def strip_comments(text: str) -> str:
+    """Remove CSS/JS/HTML comments, keeping the code that actually runs.
+
+    Deliberately conservative: only comment forms that cannot appear inside a
+    string literal in the languages this contract checks are removed, so a
+    ``//`` inside a URL is not mistaken for a comment.
+    """
+    out = _BLOCK_COMMENT.sub(" ", text)
+    out = _HTML_COMMENT.sub(" ", out)
+    out = _LINE_COMMENT.sub(" ", out)
+    return out
+
 
 @dataclass(frozen=True)
 class Requirement:
@@ -97,21 +130,27 @@ class Requirement:
     needles: tuple[str, ...] = ()
 
     def satisfied_by(self, text: str) -> bool:
-        low = text.lower()
+        low = strip_comments(text).lower()
         if self.kind == "self_contained":
             # Any absolute URL in a src/href is an external asset.
             return not re.search(r'(?:src|href)\s*=\s*["\']https?://', low)
         if self.kind == "min_size":
             return len(text) >= _MIN_ARTIFACT_BYTES
         if self.kind == "colour":
-            # The colour must sit in a CSS declaration.  A page whose only
-            # colours are #fff and #000 satisfied "cyan" because the word
-            # appeared in a comment — the check has to look where colour is
-            # actually used, not anywhere in the document.
+            # The colour must sit in a CSS *declaration*: the needle has to
+            # appear after a ``:`` on a line that also names a colour property.
+            # Checking the whole line let a comment satisfy it, and checking
+            # only for the property let ``color: red; /* cyan */`` satisfy
+            # "cyan" — the value has to be on the right-hand side.
             for line in low.splitlines():
                 if not any(n in line for n in self.needles):
                     continue
-                if any(ctx in line for ctx in _CSS_COLOUR_CONTEXT):
+                if not any(ctx in line for ctx in _CSS_COLOUR_CONTEXT):
+                    continue
+                head, _, tail = line.partition(":")
+                if not tail:
+                    continue
+                if any(n in tail for n in self.needles):
                     return True
             return False
         return any(n in low for n in self.needles)
@@ -199,18 +238,25 @@ def check_artifacts(
 ) -> ContractVerdict:
     """Check the produced files against the requirements.
 
-    ``files`` is the set the episode actually wrote.  When it is empty the
-    check falls back to the worktree's own text files, because a run that
-    produced nothing must not pass by having nothing to inspect.
+    ``files`` is the set the run actually created or changed, and it is the
+    **only** thing checked when it is given.  The distinction matters:
+
+    * ``files=[]`` — the run produced nothing, so the verdict is "no artifact
+      was produced".  This is what the product path passes, and it is the fix
+      for the measured defect where a run that wrote nothing passed the
+      contract on a file that was already in the repository;
+    * ``files=None`` — the caller did not say what it produced (an ad-hoc check
+      of a tree, a test).  Only then does the check fall back to the worktree's
+      own text files, and that fallback is never used by a run.
+
+    ``min_size`` is checked **per file**, not against the concatenation.  Five
+    300-byte files are not a 1200-byte page.
     """
     root = Path(worktree)
     targets: list[Path] = []
-    if files:
-        for rel in files:
-            p = root / rel
-            if p.is_file():
-                targets.append(p)
-    if not targets:
+    if files is None:
+        # No claim about what was produced: inspect the tree.  A run never
+        # takes this branch — it always knows its own written files.
         for p in sorted(root.rglob("*")):
             if not p.is_file():
                 continue
@@ -218,6 +264,11 @@ def check_artifacts(
                    for part in p.parts):
                 continue
             if p.suffix.lower() in {".html", ".htm", ".css", ".js", ".md", ".txt", ".py"}:
+                targets.append(p)
+    else:
+        for rel in files:
+            p = root / str(rel)
+            if p.is_file():
                 targets.append(p)
 
     verdict = ContractVerdict(files=[str(p.relative_to(root)) for p in targets])
@@ -227,10 +278,21 @@ def check_artifacts(
         verdict.unmet.append("no artifact was produced")
         return verdict
 
-    text = "\n".join(p.read_text(encoding="utf-8", errors="replace") for p in targets)
+    texts = {p: p.read_text(encoding="utf-8", errors="replace") for p in targets}
     for req in requirements:
         verdict.checked.append(req.label)
-        if req.satisfied_by(text):
+        if req.kind == "min_size":
+            # Per file: the requirement is about *an* artifact, and summing
+            # unrelated files is how five small files passed a 1200-byte check.
+            biggest = max((len(t) for t in texts.values()), default=0)
+            if biggest >= _MIN_ARTIFACT_BYTES:
+                verdict.met.append(req.label)
+            else:
+                verdict.unmet.append(
+                    f"{req.label} (largest file is {biggest} bytes)"
+                )
+            continue
+        if any(req.satisfied_by(text) for text in texts.values()):
             verdict.met.append(req.label)
         else:
             verdict.unmet.append(req.label)

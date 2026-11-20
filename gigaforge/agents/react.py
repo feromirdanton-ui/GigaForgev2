@@ -1397,7 +1397,11 @@ class ReActRunner:
 
             return ContractVerdict()
         written = list(getattr(result, "written_files", None) or [])
-        return check_artifacts(requirements, ctx.worktree, files=written or None)
+        # ``files=written`` — NOT ``written or None``.  ``None`` used to mean
+        # "scan the whole worktree", so a run that wrote nothing passed the
+        # contract on a file that was already in the repository.  An empty list
+        # now means what it says: no artifact was produced.
+        return check_artifacts(requirements, ctx.worktree, files=written)
 
     def _synthesize_plan(self, trajectory: list[dict[str, str]]) -> list[PlanStep]:
         """Derive a plan from the files the episode actually observed.

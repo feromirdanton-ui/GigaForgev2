@@ -831,6 +831,12 @@ class ReActPlan:
         because it is a DAG step, even on a path where the registry could not
         have produced it.  Keeping the sets separate and naming them is what
         makes the check mean something again.
+
+        The union is still returned, but only because the plan is *rendered
+        into* DAG steps before it runs — the guard's job is to reject a step
+        that cannot be executed at all, and a DAG step can.  What the guard
+        must not do is accept an untargeted ``edit_function``, and that is
+        enforced by ``_has_target``, not by this set.
         """
         dag_tools = {"tests", "lint", "reviewer", "coder", "edit_function"}
         runner = getattr(self, "_last_runner", None)
@@ -957,13 +963,20 @@ class ReActPlan:
             runner.state,
             ctx=runner.ctx,
             run_id=self._run_id or "react-plan",
-            engine="react",
+            # ``engine=""`` — NOT ``"react"``.  The engine argument selects the
+            # *implementation*; ``"react"`` is not one of them, so the dispatcher
+            # in ``agents/engine.py`` fell through to the classic loop while the
+            # ledger recorded ``engine: react``.  Measured: with
+            # ``GIGAFORGE_REACT_ENGINE=langgraph`` (the default, and what
+            # ``gigaforge stack`` printed) ``run_react_graph`` was called zero
+            # times.  An empty string means "resolve it", which is the only
+            # value that honours the environment variable.
+            engine="",
             # ``react=True`` is what makes the harness dispatch through
             # ``run_react`` — the only function that honours
             # ``GIGAFORGE_REACT_ENGINE``.  Without it the harness called
             # ``runner.run`` directly, so the LangGraph ReAct graph was
-            # unreachable on the product path while the ledger still said
-            # ``engine: react``.
+            # unreachable on the product path.
             react=True,
         )
         if not outcome.ok:

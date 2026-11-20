@@ -367,6 +367,48 @@ class SubAgentRunner:
                    duration_ms=round((self.clock.now() - started) * 1000.0, 3))
         return results
 
+    def spawn_one(
+        self,
+        spec: SubAgentSpec,
+        *,
+        parent_ctx: Optional[RunContext] = None,
+        index: int = 0,
+        cleanup: bool = True,
+    ) -> SubAgentResult:
+        """Run exactly one spec in its own worktree.
+
+        This is the single-spec form of :meth:`spawn`, and it exists so the
+        LangGraph fan-out can dispatch one graph branch per spec while still
+        using *this* runner's isolation rules.  The graph previously drove the
+        A2A runner (``agents/subagents.py``), which takes ``SubAgentSpawn`` — a
+        type the product never builds.  Measured: with the default
+        ``GIGAFORGE_SUBAGENT_ENGINE=langgraph`` every fan-out raised
+        ``'SubAgentSpec' object has no attribute 'payload'``, the exception was
+        swallowed by ``_subagent_diff``'s ``except Exception``, and
+        ``--subagents`` silently ran with no sub-agents at all.
+
+        Worktree creation and cleanup live here rather than in the graph: the
+        runner owns them, and a graph node that created its own worktree would
+        be a second, divergent implementation of the isolation rules.
+        """
+        worktree: Optional[Worktree] = None
+        if self.worktrees is not None:
+            try:
+                worktree = self.worktrees.create(spec.name)
+            except WorktreeError as exc:
+                worktree = Worktree(name=spec.name, path="", branch="", created=False,
+                                    error=str(exc))
+        handle = SubAgentHandle(index=index, spec=spec, worktree=worktree)
+        try:
+            handle.result = self._run_one(handle, parent_ctx)
+        finally:
+            if cleanup and self.worktrees is not None:
+                self.worktrees.remove(spec.name)
+        return handle.result or SubAgentResult(
+            name=spec.name, spawn_index=index, ok=False,
+            error="sub-agent produced no result",
+        )
+
     def _run_parallel(
         self, handles: list[SubAgentHandle], parent_ctx: Optional[RunContext]
     ) -> None:
@@ -510,22 +552,48 @@ class SubAgentRunner:
 
     # ── aggregation ──────────────────────────────────────────────────────────
     @staticmethod
-    def aggregate(results: Sequence[SubAgentResult]) -> dict[str, Any]:
-        """Merge sub-agent results **in spawn order**.
+    def aggregate(
+        results: Sequence[SubAgentResult],
+        *,
+        owns_paths: Mapping[str, Sequence[str]] | None = None,
+        root: Path | str = ".",
+        config: Any = None,
+    ) -> dict[str, Any]:
+        """Merge sub-agent results **in spawn order**, through the acceptance gate.
 
-        The merged ``diff`` concatenates per-agent diffs in spawn order, which is
-        only meaningful because each agent worked in its own worktree: the
-        concatenation is a set of independent changes, not an interleaving.
+        This method had no caller in the product: the pipeline concatenated the
+        diffs itself with ``"\\n".join(...)``, which is how two children creating
+        the same file merged to ``ok: True`` with one child's work silently gone.
+        It now delegates to :func:`gigaforge.core.acceptance.merge_diffs`, so the
+        merge has exactly one implementation and this method is the reporting
+        view of it rather than a second, divergent one.
+
+        ``owns_paths`` maps a child's name to the paths it was assigned; a child
+        that wrote outside them is rejected with a reason instead of merged.
         """
+        from .acceptance import merge_diffs
+
         ordered = sorted(results, key=lambda r: r.spawn_index)
-        diffs = [r.diff for r in ordered if r.diff]
+        entries = [
+            {
+                "name": r.name,
+                "diff": r.diff,
+                "owns_paths": tuple((owns_paths or {}).get(r.name, ())),
+            }
+            for r in ordered
+            if r.ok and r.diff
+        ]
+        report = merge_diffs(entries, root=root, config=config)
         return {
             "count": len(ordered),
             "ok": sum(1 for r in ordered if r.ok),
             "failed": [r.name for r in ordered if not r.ok],
             "order": [r.name for r in ordered],
             "summaries": {r.name: r.summary for r in ordered if r.summary},
-            "diff": "\n".join(diffs),
+            "diff": report.diff,
+            "accepted": list(report.accepted),
+            "rejected": list(report.rejected),
+            "conflicts": list(report.conflicts),
             "errors": {r.name: r.error for r in ordered if r.error},
             "usage": _merge_usage([r.usage for r in ordered if r.usage]),
             "results": [r.to_dict() for r in ordered],

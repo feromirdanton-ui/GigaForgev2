@@ -45,6 +45,29 @@ __all__ = ["ReActState", "build_react_graph", "run_react_graph"]
 
 _OBS_TOKEN_BUDGET = 1500
 
+#: How many times the goal contract may send the episode back to fix the file.
+#: Two is enough for "you dropped a requirement while adding another" and small
+#: enough that a model which cannot satisfy the contract does not burn the whole
+#: step budget on it.
+_MAX_CONTRACT_RETRIES = 2
+
+
+def _check_contract(state: Any, ctx: ReActContext, written: list[str]) -> Any:
+    """Check the produced artifact against the goal's explicit requirements.
+
+    Returns ``None`` when the goal names nothing checkable, so the caller can
+    skip the whole correction path.  The check is the same one the classic loop
+    runs — this module must not have a second, divergent idea of what the goal
+    asked for.
+    """
+    from gigaforge.harness.goal_contract import check_artifacts, extract_requirements
+
+    goal = str(getattr(state, "goal", "") or "")
+    requirements = extract_requirements(goal)
+    if not requirements:
+        return None
+    return check_artifacts(requirements, ctx.worktree, files=written)
+
 
 def _add(left: list, right: list) -> list:
     return list(left or []) + list(right or [])
@@ -92,6 +115,12 @@ class ReActState(TypedDict, total=False):
     tokens_in: int
     tokens_out: int
     nudges: Annotated[list[str], _add]
+    #: Files the episode wrote itself, so the goal contract can check the
+    #: artifact the run actually produced rather than the whole worktree.
+    written_files: Annotated[list[str], _add]
+    #: How many times the contract has sent the episode back to fix the file.
+    contract_retries: int
+    contract_unmet: list[str]
 
 
 def _writer() -> Callable[[dict[str, Any]], None]:
@@ -362,18 +391,34 @@ def build_react_graph(
         delta: list[dict[str, str]] = [
             {"role": "user", "content": f"Observation ({kind}):\n{observation}"}
         ]
+        # Track the files the episode wrote.  The goal contract checks the
+        # artifact the run produced; without this list it would have to fall
+        # back to every text file in the worktree, and a run that wrote nothing
+        # would pass on a file that was already in the repository.
+        written: list[str] = []
+        if action in {"write_file", "create_file"}:
+            try:
+                payload = json.loads(action_input) if action_input.strip() else {}
+            except (json.JSONDecodeError, AttributeError):
+                payload = {}
+            rel = str(payload.get("path") or payload.get("file") or "").strip()
+            if rel:
+                written.append(rel)
         # SpecificationAudit: nudge once after the model inspects a new file.
         audit = guards.after_observation(
             list(gstate.get("trajectory") or []) + delta
         )
         if audit is not None:
             delta.append(audit)
-        return {
+        out: dict[str, Any] = {
             "observation": observation,
             "steps": [{"step_idx": int(gstate.get("step_idx") or 1) - 1,
                        "observation": observation}],
             "trajectory": delta,
         }
+        if written:
+            out["written_files"] = written
+        return out
 
     def observe(gstate: ReActState) -> dict[str, Any]:
         """LoopBreaker: at most one nudge per turn, always a HumanMessage.
@@ -395,13 +440,20 @@ def build_react_graph(
         return {"trajectory": [signal.message()], "nudges": [signal.marker]}
 
     def finish(gstate: ReActState) -> dict[str, Any]:
-        """Terminal node: parse the plan out of the finish payload."""
+        """Terminal node: parse the plan, then check the artifact.
+
+        The contract check lives here because this is the only place a run
+        declares itself done.  It used to exist **only** in the classic loop
+        (``react.py``), so the moment the LangGraph engine became the default
+        the check silently disappeared from the product path — two defects
+        masking each other, since the engine was unreachable at the time.
+        """
         plan = runner.parse_finish_plan(str(gstate.get("action_input") or ""))
         localization = runner.extract_localization(
             plan, str(gstate.get("thought") or "")
         )
         _emit("react.finish", plan_size=len(plan), localization=localization)
-        return {
+        out: dict[str, Any] = {
             "finished": True,
             "finish_reason": "finish_action",
             "plan": [
@@ -412,6 +464,25 @@ def build_react_graph(
             ],
             "localization": localization,
         }
+        verdict = _check_contract(
+            task_state, ctx, list(gstate.get("written_files") or [])
+        )
+        if verdict is None or verdict.ok:
+            return out
+        retries = int(gstate.get("contract_retries") or 0)
+        if retries >= _MAX_CONTRACT_RETRIES:
+            _emit("react.contract_giveup", unmet=verdict.unmet, retries=retries)
+            return out
+        _emit("react.contract_unmet", unmet=verdict.unmet, retry=retries + 1)
+        out["finished"] = False
+        out["finish_reason"] = ""
+        out["contract_retries"] = retries + 1
+        out["contract_unmet"] = list(verdict.unmet)
+        out["trajectory"] = [
+            {"role": "assistant", "content": str(gstate.get("action_input") or "")},
+            {"role": "user", "content": verdict.as_observation()},
+        ]
+        return out
 
     def route(gstate: ReActState) -> str:
         if gstate.get("finished"):
@@ -421,6 +492,14 @@ def build_react_graph(
         if str(gstate.get("action") or "") == FINISH_ACTION:
             return "finish"
         return "act"
+
+    def route_finish(gstate: ReActState) -> str:
+        """After the contract check: done, or back to the model to fix it."""
+        if gstate.get("finished"):
+            return "end"
+        if int(gstate.get("step_idx") or 0) >= int(gstate.get("max_steps") or 5):
+            return "end"
+        return "reason"
 
     graph = StateGraph(ReActState)
     graph.add_node("reason", reason)
@@ -433,7 +512,9 @@ def build_react_graph(
     )
     graph.add_edge("act", "observe")
     graph.add_edge("observe", "reason")
-    graph.add_edge("finish", END)
+    graph.add_conditional_edges(
+        "finish", route_finish, {"reason": "reason", "end": END}
+    )
     return graph.compile(checkpointer=checkpointer or InMemorySaver())
 
 
@@ -456,6 +537,9 @@ def _initial_state(
         "tokens_in": 0,
         "tokens_out": 0,
         "nudges": [],
+        "written_files": [],
+        "contract_retries": 0,
+        "contract_unmet": [],
     }
 
 
@@ -473,6 +557,9 @@ def _to_result(values: Mapping[str, Any]) -> ReActResult:
     # unusable.  Without it the guard's (correct) rejection of an untargeted
     # edit left the run reporting zero steps.
     result.trajectory = list(values.get("trajectory") or [])
+    # The files the episode wrote travel with the result: the pipeline turns
+    # them into a diff, and the contract checks them instead of the worktree.
+    result.written_files = list(values.get("written_files") or [])
     return result
 
 

@@ -99,10 +99,24 @@ class ReplTool:
             return f"ERROR: repl could not write its program: {exc}"
 
         try:
-            # ``python`` is in the default allowlist; the argv carries only a
-            # relative path, so no metacharacter check can reject the program.
+            # Resolve the interpreter instead of assuming ``python`` exists.
+            # ``python`` is in the sandbox allowlist, but on a host that ships
+            # only ``python3`` (most Linux distributions, and this project's own
+            # CI) the hard-coded name failed exactly the way ``bench`` did
+            # before it was fixed.  ``sys.executable`` is preferred, so the
+            # scratch program sees the same packages the harness does.
+            from gigaforge.l0.toolchain import python_bin
+
+            interpreter = python_bin()
+            if not interpreter.found:
+                return f"ERROR: repl needs a python interpreter: {interpreter.reason}"
             result = await sandbox.run(
-                ["python", str(program.relative_to(worktree))], kind="builderr"
+                # ``argv_name``, not ``path``: the sandbox resolves commands via
+                # PATH and rejects an absolute path in argv.  Using ``path``
+                # here made every REPL step fail with "command must be a bare
+                # name" — the fix for a missing interpreter introduced a
+                # rejection of the interpreter that was present.
+                [interpreter.argv_name, str(program.relative_to(worktree))], kind="builderr"
             )
         except Exception as exc:  # noqa: BLE001 - a rejected command is an observation
             return f"ERROR: repl could not run: {exc}"

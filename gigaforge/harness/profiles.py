@@ -19,6 +19,15 @@ from typing import Any
 
 __all__ = ["HarnessProfile", "PROFILES", "resolve_profile"]
 
+#: Documented names that are not profiles.  ``native_fs`` is a prompt variant;
+#: ``env.example`` documented it as a profile value, so it resolves to the
+#: profile whose behaviour it describes rather than to ``unknown``.
+_ALIASES: dict[str, str] = {
+    "native_fs": "default",
+    "native-fs": "default",
+    "balanced": "default",
+}
+
 
 @dataclass(frozen=True)
 class HarnessProfile:
@@ -88,8 +97,17 @@ def resolve_profile(name: str | None = None) -> HarnessProfile:
     An unknown name returns ``default`` — a typo in an environment variable must
     not stop a run, and silently using a *different* profile than the one asked
     for would be worse than using the documented default.
+
+    ``native_fs`` is accepted as an alias for ``default``.  ``env.example``
+    documented ``GIGAFORGE_HARNESS_PROFILE=native_fs``, but ``native_fs`` is a
+    *prompt variant* (``harness_prompt.py``), not a profile — so the documented
+    value silently resolved to ``default (unknown: native_fs)``.  A documented
+    value that does not work is worse than an undocumented one, so the alias
+    makes the documentation true; the prompt variant keeps its own variable.
     """
     requested = (name or os.environ.get("GIGAFORGE_HARNESS_PROFILE") or "default").strip()
+    if requested in _ALIASES:
+        requested = _ALIASES[requested]
     profile = PROFILES.get(requested)
     if profile is None:
         return replace(PROFILES["default"], name=f"default (unknown: {requested})")
