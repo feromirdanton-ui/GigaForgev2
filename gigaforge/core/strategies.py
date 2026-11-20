@@ -820,6 +820,22 @@ class ReActPlan:
         verdict = validate_plan(raw, known_tools=self._known_tools())
         if verdict.changed:
             log.info("plan guard adjusted the ReAct plan: %s", verdict.to_dict())
+        # DeterministicOutput (ported from deepagents-gigachat): a plan may not
+        # assert a derived value it never computed.  This is a separate rule
+        # from the structural guard above — that one asks "is this step
+        # actionable", this one asks "is this value earned".
+        runner = getattr(self, "_last_runner", None)
+        guards = getattr(runner, "guards", None) if runner is not None else None
+        if guards is not None and hasattr(guards, "check_plan"):
+            det = guards.check_plan(verdict.steps or [])
+            if not det.ok:
+                log.warning("deterministic-output guard: %s", det.to_dict())
+                verdict.dropped_untargeted.extend(det.blocked)
+                verdict.steps = [
+                    step
+                    for step in (verdict.steps or [])
+                    if f"{getattr(step, 'tool', '')}:" not in " ".join(det.blocked)
+                ]
         steps = [_describe_plan_step(step) for step in (verdict.steps or [])]
         return [step for step in steps if step], verdict
 
@@ -852,6 +868,9 @@ class ReActPlan:
         runner = self._build_runner(goal)
         if runner is None:
             return self._linear(goal, slice_text, ask=ask, parse=parse), None
+        # Kept so the plan guard can read the runner's real tool registry and
+        # its guards (the deterministic-output rule lives on the runner).
+        self._last_runner = runner
 
         harness = Harness(
             policy=policy or HarnessPolicy(),

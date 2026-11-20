@@ -44,6 +44,7 @@ __all__ = [
     "COMPACTION_MARKER",
     "compact_trajectory",
     "compaction_fits",
+    "trim_stale_file_outputs",
 ]
 
 #: Prefix of the synthetic message that replaces the dropped middle.  A marker
@@ -51,11 +52,67 @@ __all__ = [
 #: stay idempotent.
 COMPACTION_MARKER = "[compacted]"
 
+#: Marker left where a large file body was cut down to its head.
+TRIM_MARKER = "[trimmed]"
+
 #: How many trailing messages are always kept verbatim.
 DEFAULT_KEEP_TAIL = 6
 
 #: Characters of a dropped message that survive into the digest.
 DIGEST_CHARS = 160
+
+#: An observation longer than this is a file body, not a search result.
+LARGE_OBSERVATION_CHARS = 4000
+
+#: How much of a large observation survives when it is trimmed.
+TRIM_HEAD_CHARS = 600
+
+
+def trim_stale_file_outputs(
+    messages: Sequence[Any],
+    *,
+    keep_tail: int = DEFAULT_KEEP_TAIL,
+) -> list[dict[str, Any]]:
+    """Cut the bodies of large, *stale* file observations down to their head.
+
+    Ported from ``deepagents-gigachat``'s context management.  Its observation
+    was that the biggest single consumer of a long agent trajectory is not the
+    reasoning — it is the full text of files the agent read twenty turns ago
+    and will never look at again.  Compaction (below) drops whole messages;
+    this pass is gentler and runs first: it keeps the message, keeps its first
+    lines (which carry the path and the shape), and replaces the body with a
+    marker.
+
+    "Stale" means outside the last ``keep_tail`` messages.  The tail is what the
+    model is actively reasoning about, so it is never touched.
+
+    Idempotent: a message already carrying :data:`TRIM_MARKER` is skipped, so a
+    retry loop cannot keep shrinking the same message.
+    """
+    normalized = normalize_messages(messages)
+    if len(normalized) <= keep_tail:
+        return normalized
+
+    cutoff = len(normalized) - max(0, int(keep_tail))
+    out: list[dict[str, Any]] = []
+    for index, message in enumerate(normalized):
+        content = str(message.get("content", "") or "")
+        if (
+            index < cutoff
+            and len(content) > LARGE_OBSERVATION_CHARS
+            and TRIM_MARKER not in content
+        ):
+            head = content[:TRIM_HEAD_CHARS].rstrip()
+            dropped = len(content) - len(head)
+            trimmed = dict(message)
+            trimmed["content"] = (
+                f"{head}\n{TRIM_MARKER} {dropped} characters of this file body "
+                "were dropped to save context. Re-read the file if you need it."
+            )
+            out.append(trimmed)
+            continue
+        out.append(dict(message))
+    return out
 
 
 def _first_line(text: str, limit: int = DIGEST_CHARS) -> str:

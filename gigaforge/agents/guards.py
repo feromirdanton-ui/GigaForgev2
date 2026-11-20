@@ -24,9 +24,11 @@ Everything here is pure and side-effect free apart from the registry mutation in
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any
 
+from gigaforge.agents.output_guards import DeterministicOutput, PathNormalizer
 from gigaforge.agents.think_tool import THINK_TOOL_NAME, ThinkTool
 from gigaforge.core.specification_audit import SpecificationAudit
 from gigaforge.core.tool_contract import ToolContract
@@ -43,7 +45,7 @@ class ThinkToolAdapter:
     the two-line bridge, and it keeps the tool's own schema and log intact.
     """
 
-    def __init__(self, tool: Optional[ThinkTool] = None) -> None:
+    def __init__(self, tool: ThinkTool | None = None) -> None:
         self._tool = tool or ThinkTool()
 
     @property
@@ -78,12 +80,17 @@ class ReActGuards:
         tool_names: Sequence[str] = (),
         workspace: Path | str | None = None,
         shell_tool_names: tuple[str, ...] = ("execute", "shell", "bash", "run_command"),
-        think: Optional[ThinkTool] = None,
+        think: ThinkTool | None = None,
     ) -> None:
         self.shell_safety = ShellSafety(tool_names=shell_tool_names)
         self.contract = ToolContract.for_tools(list(tool_names))
         self.audit = SpecificationAudit.for_workspace(workspace)
         self.think = ThinkToolAdapter(think)
+        # Ported from deepagents-gigachat: paths in observations are made
+        # workspace-relative, and a plan may not assert a computed value it
+        # never computed.
+        self.paths = PathNormalizer()
+        self.deterministic = DeterministicOutput()
 
     # -- installation --------------------------------------------------------
     def install(self, registry: Any) -> None:
@@ -104,7 +111,7 @@ class ReActGuards:
         contract = self.contract.maybe_inject(messages)
         return [contract] if contract is not None else []
 
-    def screen_tool_call(self, action: str, action_input: Any) -> Optional[str]:
+    def screen_tool_call(self, action: str, action_input: Any) -> str | None:
         """Return an error observation when *action* must not run, else ``None``.
 
         The verdict is rendered as the same ``ERROR:`` shape a failing tool
@@ -116,9 +123,17 @@ class ReActGuards:
             return None
         return f"ERROR: [SHELL-SAFETY] {verdict.message()}"
 
-    def after_observation(self, messages: Sequence[Any]) -> Optional[dict[str, Any]]:
+    def after_observation(self, messages: Sequence[Any]) -> dict[str, Any] | None:
         """The specification-audit nudge, when the last action read a new file."""
         return self.audit.maybe_inject(messages)
+
+    def normalize_observation(self, tool: str, observation: str) -> str:
+        """Make workspace paths in a tool result relative before the model sees it."""
+        return self.paths.normalize(tool, observation)
+
+    def check_plan(self, steps: Sequence[Any]) -> Any:
+        """Deterministic-output verdict for a finished plan."""
+        return self.deterministic.check(steps)
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -126,4 +141,6 @@ class ReActGuards:
             "tool_contract": self.contract.describe(),
             "specification_audit": self.audit.describe(),
             "think_tool": self.think.tool.describe(),
+            "path_normalizer": self.paths.describe(),
+            "deterministic_output": self.deterministic.describe(),
         }

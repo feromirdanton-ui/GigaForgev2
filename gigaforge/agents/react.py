@@ -508,14 +508,25 @@ class ReActRunner:
         forever.  Each compaction is traced, because a run that silently
         rewrote its own history is a run whose token accounting needs a note.
         """
-        from gigaforge.harness.compaction import compact_trajectory
+        from gigaforge.harness.compaction import compact_trajectory, trim_stale_file_outputs
 
         if self._compactions >= _MAX_COMPACTIONS:
             return None
         before = sum(len(str(m.get("content", ""))) for m in trajectory) // 4
         window = self.window_guard.window_for(self._router.route("plan"))
         target = int(window * self.window_guard.trigger_fraction * 0.75)
-        compacted = compact_trajectory(trajectory, target_tokens=target)
+        # Two passes, cheapest first (ported from deepagents-gigachat):
+        #   1. trim the bodies of large STALE file observations — keeps the
+        #      message and its head, drops the bulk;
+        #   2. only if that was not enough, drop whole middle messages.
+        # Doing (1) first means a long episode usually keeps its full reasoning
+        # history and loses only the file text it has already finished with.
+        trimmed = trim_stale_file_outputs(trajectory)
+        trimmed_tokens = sum(len(str(m.get("content", ""))) for m in trimmed) // 4
+        if trimmed_tokens < before:
+            compacted = compact_trajectory(trimmed, target_tokens=target)
+        else:
+            compacted = compact_trajectory(trajectory, target_tokens=target)
         after = sum(len(str(m.get("content", ""))) for m in compacted) // 4
         if after >= before:
             # Nothing was dropped: the goal alone is over the limit.
@@ -760,6 +771,13 @@ class ReActRunner:
 
             # Observe — compress the raw output via the Firewall.
             kind = _kind_for_tool(action)
+            # PathNormalizer (ported from deepagents-gigachat): a tool that
+            # walks the tree returns paths rooted at the workspace
+            # (``/src/foo.py``); the model copies them verbatim into a plan and
+            # the executor then looks for ``/src/foo.py`` on the host.  Make
+            # them relative BEFORE compression, so the compressed payload the
+            # model reads is already correct.
+            raw_obs = self.guards.normalize_observation(action, raw_obs)
             compressed = compress(kind, raw_obs, limit_tokens=_OBS_TOKEN_BUDGET)
             observation = json.dumps(compressed, ensure_ascii=False)
             # Cap the observation text (belt-and-braces).
@@ -956,7 +974,23 @@ class ReActRunner:
         self, task: str, state: TaskState, hint: str | None
     ) -> str:
         prefix = state.serialize_prefix()
+        # The harness prompt (ported from ai-forever/deepagents-gigachat) is
+        # prepended, not substituted: _REACT_PROMPT carries the JSON step
+        # contract this loop parses, and the harness prompt carries the
+        # behavioural rules GigaChat needs (anti-looping, two-step operations,
+        # computed-not-guessed values).  Dropping either one breaks the run.
+        from gigaforge.agents.harness_prompt import build_harness_prompt
+
+        variant = os.environ.get("GIGAFORGE_HARNESS_PROFILE", "native_fs")
+        try:
+            harness = build_harness_prompt(
+                variant, tool_names=sorted(self._registry.names())
+            )
+        except ValueError:
+            log.warning("unknown GIGAFORGE_HARNESS_PROFILE=%r; using native_fs", variant)
+            harness = build_harness_prompt("native_fs", tool_names=sorted(self._registry.names()))
         parts = [
+            harness,
             _REACT_PROMPT,
             f"State: {json.dumps(prefix, ensure_ascii=False)}",
             f"Task: {task}",
