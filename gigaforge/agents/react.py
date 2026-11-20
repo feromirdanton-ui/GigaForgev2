@@ -30,6 +30,7 @@ Doctrine:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -78,6 +79,25 @@ DEFAULT_REACT_MAX_STEPS = 5
 # The special action that terminates the loop with a synthesized plan.
 FINISH_ACTION = "finish"
 
+#: The action that runs several independent read-only tools at once.
+#:
+#: The model asks for it; the harness decides whether it is allowed.  A ReAct
+#: episode spends most of its steps on exploration, and exploration is usually
+#: a set of *independent* reads — grep for one symbol, read the skeleton of
+#: another file, run the suite.  Doing them one per step costs one model round
+#: trip each, which is the dominant cost of a run.
+#:
+#: The harness owns the safety question, not the model: only tools whose output
+#: is a pure function of the tree may run in parallel, because two writes to the
+#: same tree are not independent and their order is not defined.  A request that
+#: includes a write is refused with an explanation rather than serialised
+#: silently — the model should learn the rule, not be quietly overruled.
+PARALLEL_ACTION = "parallel"
+
+#: Upper bound on calls in one parallel batch.  Beyond this the observation
+#: itself becomes the context problem the batch was meant to avoid.
+MAX_PARALLEL_CALLS = 4
+
 #: Budget/routing phase for a ReAct episode.
 #:
 #: It used to be ``"plan"``, which is a *single-call* phase with a 2 000-token
@@ -111,6 +131,11 @@ _REACT_PROMPT = (
     '- "finish"    — завершить, подготовить план редактирования.\n'
     '  Для finish: action_input = JSON-строка вида\n'
     '  \'[{"tool":"edit_function","args":{"name":"<symbol>"}}]\'.\n'
+    '- "parallel"  — выполнить НЕСКОЛЬКО независимых read-only вызовов за один шаг.\n'
+    '  action_input = JSON-строка вида\n'
+    '  \'[{"tool":"grep","args":"<regex>"},{"tool":"read_structure","args":"<path>"}]\'.\n'
+    '  Разрешены только read-only инструменты (grep, read_structure); вызов с\n'
+    '  инструментом, меняющим файлы, будет отклонён. Максимум 4 вызова.\n'
     "Поле \"thought\" — короткое рассуждение (≤1 предложения).\n"
     "Не пиши ничего вне JSON. Никакого markdown. Только JSON."
 )
@@ -887,6 +912,63 @@ class ReActRunner:
                 return self._carry_trajectory(result, trajectory)
 
             # Act — invoke the tool.
+            #
+            # ``parallel`` is handled before the single-tool path: it is the
+            # harness's own action, not a registered tool, and the model asks
+            # for it by name.  A refused batch becomes an observation, so the
+            # model learns the rule instead of the harness silently serialising
+            # work it was told to run concurrently.
+            if action == PARALLEL_ACTION:
+                batch = self._parse_parallel_batch(action_input)
+                records, refusal = await self._run_parallel(
+                    batch, ctx=ctx, state=state, step_idx=step_idx
+                )
+                trajectory.append({"role": "assistant", "content": text})
+                if refusal:
+                    trajectory.append(
+                        {
+                            "role": "user",
+                            "content": f"ERROR: [PARALLEL] {refusal}",
+                        }
+                    )
+                    result.steps.append(
+                        {
+                            "step_idx": step_idx,
+                            "thought": thought,
+                            "action": action,
+                            "action_input": action_input,
+                            "ok": False,
+                            "error": refusal,
+                        }
+                    )
+                    continue
+                lines = [
+                    f"Observation ({r['kind']}) [{r['tool']}]:\n{r['observation']}"
+                    for r in records
+                ]
+                trajectory.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Observation (parallel, {len(records)} calls):\n\n"
+                            + "\n\n".join(lines)
+                        ),
+                    }
+                )
+                result.steps.append(
+                    {
+                        "step_idx": step_idx,
+                        "thought": thought,
+                        "action": action,
+                        "action_input": action_input,
+                        "ok": True,
+                        "observation": "\n\n".join(lines),
+                        "parallel_calls": [r["tool"] for r in records],
+                    }
+                )
+                self._compaction_streak = 0
+                continue
+
             tool = self._registry.get(action)
             if tool is None:
                 trajectory.append({"role": "assistant", "content": text})
@@ -951,11 +1033,17 @@ class ReActRunner:
             # them relative BEFORE compression, so the compressed payload the
             # model reads is already correct.
             raw_obs = self.guards.normalize_observation(action, raw_obs)
-            compressed = compress(kind, raw_obs, limit_tokens=_OBS_TOKEN_BUDGET)
-            observation = compressed.text
-            # Cap the observation text (belt-and-braces).
-            if estimate_tokens(observation) > _OBS_TOKEN_BUDGET:
-                observation = observation[: _OBS_TOKEN_BUDGET * 4] + "\n[truncated]"
+            if _is_error_observation(raw_obs):
+                # An error is a message, not a result: the compressors would
+                # turn it into an empty result set and the model would read the
+                # opposite of the truth.
+                observation = raw_obs
+            else:
+                compressed = compress(kind, raw_obs, limit_tokens=_OBS_TOKEN_BUDGET)
+                observation = compressed.text
+                # Cap the observation text (belt-and-braces).
+                if estimate_tokens(observation) > _OBS_TOKEN_BUDGET:
+                    observation = observation[: _OBS_TOKEN_BUDGET * 4] + "\n[truncated]"
 
             trajectory.append({"role": "assistant", "content": text})
             if cached is not None:
@@ -1282,6 +1370,126 @@ class ReActRunner:
             parts.append(f"Hint: {hint}")
         return "\n\n".join(parts)
 
+    def _parse_parallel_batch(self, action_input: str) -> list[tuple[str, str]]:
+        """Parse a ``parallel`` payload into ``[(tool, action_input), ...]``.
+
+        Accepts the same shapes the finish payload accepts, because the model
+        has already learned them: a JSON list of ``{"tool","args"}`` objects, or
+        an object with a ``calls``/``steps`` key.  Returns an empty list when
+        nothing usable is present, which the caller reports as a parse failure
+        rather than silently running nothing.
+        """
+        if not action_input:
+            return []
+        try:
+            data = json.loads(action_input)
+        except json.JSONDecodeError:
+            try:
+                data = json.loads(json_repair(action_input))
+            except json.JSONDecodeError:
+                return []
+        if isinstance(data, dict):
+            for key in ("calls", "steps", "actions"):
+                if key in data:
+                    data = data[key]
+                    break
+        if not isinstance(data, list):
+            return []
+        calls: list[tuple[str, str]] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            tool = str(item.get("tool") or item.get("action") or "").strip()
+            if not tool:
+                continue
+            raw = item.get("args", item.get("action_input", ""))
+            if isinstance(raw, (dict, list)):
+                raw = json.dumps(raw, ensure_ascii=False)
+            else:
+                raw = str(raw or "").strip()
+            calls.append((tool, raw))
+        return calls
+
+    async def _run_parallel(
+        self,
+        calls: list[tuple[str, str]],
+        *,
+        ctx: ReActContext,
+        state: TaskState,
+        step_idx: int,
+    ) -> tuple[list[dict[str, Any]], str]:
+        """Run a batch of independent read-only calls concurrently.
+
+        Returns ``(records, refusal)``.  ``refusal`` is non-empty when the batch
+        was rejected as a whole, in which case nothing ran.
+
+        The safety rule is the harness's, and it is checked *before* anything
+        executes: a batch containing a tool that can write is refused outright.
+        Serialising it instead would be worse than refusing — the model would
+        believe it had asked for parallel work and get sequential work, and the
+        next batch would make the same mistake.
+        """
+        from gigaforge.agents.observation_cache import CACHEABLE_TOOLS
+
+        if not calls:
+            return [], "the parallel payload contained no usable calls"
+        if len(calls) > MAX_PARALLEL_CALLS:
+            return [], (
+                f"too many calls in one batch ({len(calls)} > {MAX_PARALLEL_CALLS}); "
+                "split the work across steps"
+            )
+        unknown = [name for name, _ in calls if self._registry.get(name) is None]
+        if unknown:
+            return [], (
+                f"unknown tool(s) {unknown}; available: {self._registry.names()} + 'finish'"
+            )
+        unsafe = [name for name, _ in calls if name not in CACHEABLE_TOOLS]
+        if unsafe:
+            return [], (
+                f"tool(s) {unsafe} can change the tree and cannot run in parallel; "
+                "call them one per step"
+            )
+
+        async def _one(name: str, payload: str) -> dict[str, Any]:
+            tool = self._registry.get(name)
+            assert tool is not None  # checked above
+            try:
+                cached = self._obs_cache.get(name, payload)
+                if cached is not None:
+                    return {"tool": name, "action_input": payload, "raw": cached, "cached": True}
+                raw = await tool.run(payload, ctx=ctx)
+                self._obs_cache.put(name, payload, raw)
+                return {"tool": name, "action_input": payload, "raw": raw, "cached": False}
+            except Exception as exc:  # noqa: BLE001 - one failure must not sink the batch
+                return {
+                    "tool": name,
+                    "action_input": payload,
+                    "raw": f"ERROR: tool {name!r} raised: {exc}",
+                    "cached": False,
+                }
+
+        gathered = await asyncio.gather(*(_one(name, payload) for name, payload in calls))
+        records: list[dict[str, Any]] = []
+        for item in gathered:
+            kind = _kind_for_tool(item["tool"])
+            raw = self.guards.normalize_observation(item["tool"], item["raw"])
+            if _is_error_observation(raw):
+                observation = raw
+            else:
+                observation = compress(kind, raw, limit_tokens=_OBS_TOKEN_BUDGET).text
+            records.append({**item, "kind": kind, "observation": observation})
+        self._tracer.trace(
+            state.task_id,
+            step=f"react_step_{step_idx}_parallel",
+            kind="decision",
+            detail={
+                "step_idx": step_idx,
+                "calls": [name for name, _ in calls],
+                "cached": [r["cached"] for r in records],
+            },
+        )
+        return records, ""
+
     def _parse_step(self, text: str) -> tuple[str, str, str] | None:
         """Parse one ReAct step: (thought, action, action_input). None on failure."""
         repaired = json_repair(text)
@@ -1382,6 +1590,22 @@ _STOPWORDS = frozenset(
         "now", "next", "first", "last", "done", "ok", "okay", "yes", "no",
     }
 )
+
+
+def _is_error_observation(raw: str) -> bool:
+    """True when a tool's output is a failure report rather than a result.
+
+    The Firewall's compressors are written for *results*: the grep compressor
+    turns any text into a ``{"matches": [...]}`` envelope, so a tool that raised
+    ``RuntimeError("tool exploded")`` reached the model as ``{"matches":[]}`` —
+    an empty result set, which reads as "the symbol is not in the tree".  The
+    model then concluded the opposite of the truth, and the harness had no way
+    to tell the two apart because the error text was already gone.
+
+    An error is not a result to be summarised; it is a message to be delivered
+    verbatim.  It is also short, so there is nothing to compress.
+    """
+    return raw.lstrip().startswith("ERROR:")
 
 
 def _kind_for_tool(action: str) -> str:
