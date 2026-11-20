@@ -140,6 +140,11 @@ class PipelineResult:
     #: Files whose creation hunk was rewritten into a modification because the
     #: file already existed (see ``harness.diff_repair``).
     diff_repaired: list[str] = field(default_factory=list)
+    #: Requirements from the goal that the produced artifact does not satisfy.
+    #: Non-empty means the run was rejected by the contract gate, not by the
+    #: model's own judgement — the distinction a caller needs to tell "the model
+    #: gave up" from "the harness refused to call this done".
+    contract_unmet: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.success and not self.accepted:
@@ -177,6 +182,7 @@ class PipelineResult:
             "calls": self.calls,
             "phase_usages": self.phase_usages,
             "diff_chars": len(self.final_diff or self.diff or ""),
+            "contract_unmet": list(self.contract_unmet),
             "summary": self.summary,
             "plan": list(self.plan),
             "duration_ms": round(self.duration_ms, 3),
@@ -2021,17 +2027,77 @@ class TaskPipeline:
         # deterministic gate rejected is never revived by an approving reviewer.
         accepted = validated and not review_rejected
         changed = list(validation.changed_files) if validation else []
+        # The goal contract is a GATE, not advice.
+        #
+        # It used to be advisory: the episode was told what was missing, and if
+        # the model finished anyway the run still settled ``accepted: true``.
+        # Measured live: a cyberpunk landing page whose body was four
+        # "Feature Card 1" divs and a "Footer Content" div settled
+        # ``status: succeeded, accepted: true`` — the contract had fired twice
+        # (the trace shows the two correction steps) and the run reported
+        # success regardless.  A check that cannot change the verdict is
+        # decoration.
+        #
+        # The check runs here, on the files on disk, because this is the only
+        # place that knows both the goal and the tree the run wrote to.  It is
+        # deterministic and model-free, so it cannot be talked out of a verdict.
+        contract = self._check_goal_contract(ctx, changed)
+        if contract is not None and not contract.ok:
+            accepted = False
+            ctx.extras["contract_unmet"] = list(contract.unmet)
+            self._event(
+                "pipeline.contract_rejected", run_id=ctx.run_id,
+                unmet=contract.unmet[:6], files=contract.files[:6],
+            )
         ctx.state.artifacts["final_diff"] = final
         ctx.state.artifacts["accepted"] = accepted
         ctx.state.artifacts["review"] = dict(verdict or {})
+        if contract is not None:
+            ctx.state.artifacts["contract"] = {
+                "ok": contract.ok,
+                "checked": contract.checked,
+                "met": contract.met,
+                "unmet": contract.unmet,
+            }
         ctx.state.add_note(
             f"settle: accepted={accepted} diff_chars={len(final)} files={len(changed)} "
             f"review={verdict.get('verdict', 'ok') if isinstance(verdict, Mapping) else 'ok'}"
+            + (f" contract_unmet={len(contract.unmet)}" if contract is not None else "")
         )
         self._event("pipeline.settle", run_id=ctx.run_id, accepted=accepted,
                     diff_chars=len(final), files=len(changed),
                     reviewed=bool(verdict), review_rejected=review_rejected)
         return {"final_diff": final, "accepted": accepted, "changed_files": changed}
+
+    def _check_goal_contract(self, ctx: RunContext, changed: Sequence[str]) -> Any:
+        """Check the artifact on disk against the goal's explicit requirements.
+
+        Returns ``None`` when the goal names nothing checkable, so a goal like
+        "fix the failing test" is not held to a design checklist it never set.
+
+        The files checked are the ones the run changed, resolved against the
+        repository root.  When the run changed nothing there is nothing to
+        check and the verdict is ``None`` — a run that produced no diff is
+        already rejected by the validation gate, and reporting a second,
+        unrelated reason for it would be noise.
+        """
+        try:
+            from gigaforge.harness.goal_contract import (
+                check_artifacts,
+                extract_requirements,
+            )
+
+            requirements = extract_requirements(ctx.state.goal)
+            if not requirements:
+                return None
+            files = [str(p) for p in changed if str(p).strip()]
+            if not files:
+                return None
+            return check_artifacts(requirements, self._repo_root(), files=files)
+        except Exception as exc:  # noqa: BLE001 - a broken check must not fail a run
+            self._event("pipeline.contract_error", run_id=ctx.run_id,
+                        error=str(exc)[:300])
+            return None
 
     def _node_summarize(self, ctx: RunContext, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
         diff = str(inputs.get("final_diff", "") or "")
@@ -2162,7 +2228,17 @@ class TaskPipeline:
         return PipelineResult(
             run_id=run_id,
             goal=goal,
-            status=dag.status,
+            # The DAG's own status says the *nodes* ran; it does not know that
+            # the settle gate refused the artifact.  Reporting ``succeeded``
+            # next to ``accepted: false`` is the contradiction the live run
+            # showed: ``status=succeeded accepted=False`` on a page the contract
+            # had just rejected.  A caller reading only ``status`` was told the
+            # run worked.  The status now follows the verdict.
+            status=(
+                "rejected"
+                if (dag.status == "succeeded" and not artifacts.get("accepted"))
+                else dag.status
+            ),
             accepted=bool(artifacts.get("accepted")),
             final_diff=final_diff,
             changed_files=list(artifacts.get("changed_files") or []),

@@ -42,16 +42,22 @@ from pathlib import Path
 #: style guide, it is a checklist of what the user said.  "neon" is deliberately
 #: absent: it is a style modifier ("neon cyan"), not a colour, and treating it as
 #: one let a page satisfy the contract by writing the word in prose.
+#:
+#: The numeric forms matter.  Measured live: a page whose only magenta was
+#: ``text-shadow: 2px 2px 4px rgba(255, 0, 255, 0.5)`` was rejected for
+#: "colour 'magenta'" — the colour was there, in the form a designer actually
+#: writes it, and the checker only knew the keyword.  A false negative is as
+#: damaging as a false positive: it rejects work that is correct.
 _COLOUR_WORDS: dict[str, tuple[str, ...]] = {
-    "cyan": ("cyan", "#0ff", "#00ffff", "aqua"),
-    "magenta": ("magenta", "#f0f", "#ff00ff", "fuchsia"),
-    "purple": ("purple", "#800080", "#a020f0", "#9d00ff"),
+    "cyan": ("cyan", "#0ff", "#00ffff", "aqua", "rgb(0, 255, 255", "rgb(0,255,255"),
+    "magenta": ("magenta", "#f0f", "#ff00ff", "fuchsia", "rgb(255, 0, 255", "rgb(255,0,255"),
+    "purple": ("purple", "#800080", "#a020f0", "#9d00ff", "rgb(128, 0, 128"),
     "violet": ("violet", "#8a2be2", "#7f00ff"),
-    "orange": ("orange", "#ffa500", "#ff7f00"),
-    "green": ("green", "#0f0", "#00ff00", "lime"),
-    "red": ("red", "#f00", "#ff0000"),
-    "blue": ("blue", "#00f", "#0000ff"),
-    "yellow": ("yellow", "#ff0", "#ffff00"),
+    "orange": ("orange", "#ffa500", "#ff7f00", "rgb(255, 165, 0"),
+    "green": ("green", "#0f0", "#00ff00", "lime", "rgb(0, 255, 0"),
+    "red": ("red", "#f00", "#ff0000", "rgb(255, 0, 0"),
+    "blue": ("blue", "#00f", "#0000ff", "rgb(0, 0, 255"),
+    "yellow": ("yellow", "#ff0", "#ffff00", "rgb(255, 255, 0"),
     "pink": ("pink", "#ffc0cb", "#ff69b4"),
     "gold": ("gold", "#ffd700"),
 }
@@ -101,6 +107,52 @@ _SELF_CONTAINED = (
 #: A page smaller than this cannot plausibly satisfy a multi-part design brief.
 _MIN_ARTIFACT_BYTES = 1200
 
+#: Placeholder text that means the artifact is a skeleton, not a deliverable.
+#:
+#: Measured live: a goal asking for a cyberpunk landing page produced a page
+#: that satisfied every structural requirement — cyan and magenta in real CSS
+#: declarations, a hero, a glitch keyframe, a grid, a footer, self-contained,
+#: 1539 bytes — and whose entire body was
+#:
+#:     <div class="card">Feature Card 1</div>   (×4)
+#:     <div class="footer">Footer Content</div>
+#:
+#: The contract passed it, because every check it had was structural.  A
+#: skeleton is not a deliverable, and "is this text a placeholder?" is a string
+#: match, not a judgement call — so it belongs here rather than in a prompt.
+_PLACEHOLDER_PATTERNS = (
+    r"\bfeature\s+card\s+\d+\b",
+    r"\bfeature\s+\d+\b",
+    r"\bfooter\s+content\b",
+    r"\bheader\s+content\b",
+    r"\bcard\s+content\b",
+    r"\blorem\s+ipsum\b",
+    r"\bdolor\s+sit\s+amet\b",
+    r"\bplaceholder\b",
+    r"\byour\s+text\s+here\b",
+    r"\btext\s+here\b",
+    r"\btodo\b",
+    r"\bcoming\s+soon\b",
+    r"\bsample\s+text\b",
+    r"\bexample\s+content\b",
+    r"\binsert\s+.{0,20}\s+here\b",
+)
+
+#: Deliberately NOT included: a bare run of ``x`` characters.  It looks like a
+#: placeholder and it fires on legitimate content — a redacted value, a hex
+#: mask, a form field's filler — and a check that rejects real content is worse
+#: than one that misses an edge case.  The patterns above catch the skeleton the
+#: live run actually produced.
+
+#: A page whose visible text is shorter than this is a skeleton regardless of
+#: how many elements it has.  Four cards reading "Feature Card 1" are four
+#: elements and zero content.
+_MIN_VISIBLE_TEXT_CHARS = 400
+
+_PLACEHOLDER_RE = re.compile("|".join(_PLACEHOLDER_PATTERNS), re.I)
+_TAG_RE = re.compile(r"<[^>]+>")
+_SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b.*?</\1>", re.S | re.I)
+
 #: Comment syntaxes to strip before checking.  A comment is not a declaration:
 #: the browser does not apply it, so the contract must not count it.
 _BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.S)
@@ -121,6 +173,29 @@ def strip_comments(text: str) -> str:
     return out
 
 
+def visible_text(text: str) -> str:
+    """The text a reader actually sees: no tags, no script, no style.
+
+    A placeholder check has to look at what is rendered.  Searching the raw
+    source would count a class name (``class="placeholder"``) and miss nothing
+    useful, while searching the rendered text catches exactly the skeleton the
+    live run produced.
+    """
+    body = _SCRIPT_STYLE_RE.sub(" ", text)
+    body = _TAG_RE.sub(" ", body)
+    return re.sub(r"\s+", " ", body).strip()
+
+
+def find_placeholders(text: str) -> list[str]:
+    """Placeholder phrases in the visible text, deduplicated, in order."""
+    seen: list[str] = []
+    for match in _PLACEHOLDER_RE.finditer(visible_text(text)):
+        phrase = match.group(0).strip().lower()
+        if phrase and phrase not in seen:
+            seen.append(phrase)
+    return seen
+
+
 @dataclass(frozen=True)
 class Requirement:
     """One explicit, machine-checkable thing the goal asked for."""
@@ -136,6 +211,13 @@ class Requirement:
             return not re.search(r'(?:src|href)\s*=\s*["\']https?://', low)
         if self.kind == "min_size":
             return len(text) >= _MIN_ARTIFACT_BYTES
+        if self.kind == "substance":
+            # Two independent signals, either of which fails the artifact:
+            # a placeholder phrase in the visible text, or too little visible
+            # text to be a page rather than a skeleton.
+            if find_placeholders(text):
+                return False
+            return len(visible_text(text)) >= _MIN_VISIBLE_TEXT_CHARS
         if self.kind == "colour":
             # The colour must sit in a CSS *declaration*: the needle has to
             # appear after a ``:`` on a line that also names a colour property.
@@ -228,6 +310,18 @@ def extract_requirements(goal: str) -> list[Requirement]:
                 f"artifact of at least {_MIN_ARTIFACT_BYTES} bytes",
             )
         )
+        # ...and it is not a skeleton either.  Every structural check above can
+        # pass on a page whose body is four "Feature Card 1" divs — measured
+        # live.  Substance is the check that separates a deliverable from a
+        # wireframe.
+        reqs.append(
+            Requirement(
+                "substance",
+                "real content, not placeholders (no 'Feature Card 1', 'Footer "
+                "Content', 'lorem ipsum', 'TODO'; at least "
+                f"{_MIN_VISIBLE_TEXT_CHARS} characters of visible text)",
+            )
+        )
     return reqs
 
 
@@ -291,6 +385,27 @@ def check_artifacts(
                 verdict.unmet.append(
                     f"{req.label} (largest file is {biggest} bytes)"
                 )
+            continue
+        if req.kind == "substance":
+            # Name the offending phrases: "add real content" is not actionable,
+            # "replace 'Feature Card 1' with a real feature description" is.
+            offenders: list[str] = []
+            for text in texts.values():
+                offenders.extend(find_placeholders(text))
+            if offenders:
+                unique = list(dict.fromkeys(offenders))[:5]
+                verdict.unmet.append(
+                    f"{req.label} — found placeholders: "
+                    + ", ".join(f"'{p}'" for p in unique)
+                )
+            else:
+                longest = max((len(visible_text(t)) for t in texts.values()), default=0)
+                if longest >= _MIN_VISIBLE_TEXT_CHARS:
+                    verdict.met.append(req.label)
+                else:
+                    verdict.unmet.append(
+                        f"{req.label} — only {longest} characters of visible text"
+                    )
             continue
         if any(req.satisfied_by(text) for text in texts.values()):
             verdict.met.append(req.label)

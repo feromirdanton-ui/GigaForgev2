@@ -23,6 +23,7 @@ parsing.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
@@ -86,8 +87,22 @@ def main_callback(
     state["model"] = model
 
 
-def _store() -> UiStore:
-    """Build the read-only store from the resolved configuration."""
+def _store(repo: Optional[Path] = None) -> UiStore:
+    """Build the read-only store from the resolved configuration.
+
+    ``repo`` matters: the pipeline writes its trace under the *repository* it
+    operates on (``runtime.build_runtime`` sets ``trace_path`` to
+    ``<repo>/.gigaforge/traces/core.jsonl``), while this store resolved the
+    default relative to the *process's* working directory.  Measured: a run
+    against ``--repo /workspace/live/run3`` finished with 6 model calls and
+    4751 tokens, and the dashboard printed
+
+        ! trace file not found at .gigaforge/traces/core.jsonl
+        0 tokens · 0 model calls · 0/11 nodes
+
+    — a run that had just done real work reported as if nothing had happened.
+    The store now looks where the run wrote.
+    """
     kwargs: dict[str, Any] = {}
     if state.get("db"):
         kwargs["db_path"] = state["db"]
@@ -100,7 +115,15 @@ def _store() -> UiStore:
     try:  # prefer the pipeline's own defaults so the CLI and the app agree
         from gigaforge.core import CoreConfig
 
-        return UiStore.from_config(CoreConfig.from_env())
+        config = CoreConfig.from_env()
+        if repo is not None:
+            # Same resolution the runtime uses, so the two cannot disagree.
+            config = replace(
+                config,
+                repo_root=str(repo),
+                trace_path=str(Path(repo) / ".gigaforge" / "traces" / "core.jsonl"),
+            )
+        return UiStore.from_config(config)
     except Exception:
         return UiStore()
 
@@ -223,7 +246,7 @@ def run(
         if not as_json:
             _emit(f"wrote run report to {target}")
 
-    store = _store()
+    store = _store(repo)
     snapshot = _snapshot(store, run_id or None)
     if as_json:
         _emit(R.render_json(snapshot), machine=True)
