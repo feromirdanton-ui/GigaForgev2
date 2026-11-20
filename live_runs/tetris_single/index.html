@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <title>Cyber Neon Tetris</title>
+    <style>
+        body {
+            font-family: 'Courier New', monospace;
+            background-color: black;
+            color: cyan;
+            text-align: center;
+            margin-top: 5vh;
+        }
+
+        #game-container {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            max-width: 80vw;
+            margin: auto;
+        }
+
+        #game-board,
+#next-piece,
+#hold-piece {
+            border: 1px solid white;
+            width: 200px;
+            height: 400px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        #score,
+#level,
+#lines {
+            padding: 10px;
+            background-color: rgba(0, 0, 0, 0.5);
+            border-radius: 5px;
+            box-shadow: inset 0 0 10px rgba(255, 255, 255, 0.5);
+            margin-bottom: 10px;
+        }
+
+        button {
+            cursor: pointer;
+            padding: 10px 20px;
+            background-color: transparent;
+            color: white;
+            border: 2px solid white;
+            transition: transform 0.1s ease-in-out;
+        }
+
+        button:hover {
+            transform: scale(1.1);
+        }
+
+        #status {
+            font-size: 2em;
+            margin-top: 20px;
+        }
+
+        @media screen and (max-width: 768px) {
+            #game-container {
+                flex-direction: column;
+                align-items: center;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Cyber Neon Tetris</h1>
+    <div id="game-container">
+        <div id="game-board"></div>
+        <div id="next-piece">Next Piece:</div>
+        <div id="hold-piece">Hold Piece:</div>
+    </div>
+    <div id="controls">
+        <button id="start-button">Start Game</button>
+        <button id="pause-button">Pause</button>
+        <button id="restart-button">Restart</button>
+    </div>
+    <div id="stats">
+        <p id="score">Score: 0</p>
+        <p id="level">Level: 1</p>
+        <p id="lines">Lines Cleared: 0</p>
+    </div>
+    <p id="instructions">
+        Controls:<br>
+        A: Move Left<br>
+        D: Move Right<br>
+        W: Rotate Clockwise<br>
+        S: Soft Drop<br>
+        Space: Hard Drop<br>
+        P: Pause/Resume
+    </p>
+    <p id="status"></p>
+    <script src="game.js"></script>
+</body>
+
+</html>
+<!-- GigaForge live-run scaffold. Generate the complete Tetris interface here. -->

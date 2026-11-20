@@ -1,0 +1,304 @@
+"""Task state and the stable system-prompt prefix (M4–M5).
+
+Two things make an agent loop cheap and debuggable:
+
+* **A stable prefix.**  The system message is assembled once, from parts that
+  do not change during a run, and hashed.  Every later phase re-uses the exact
+  same bytes, so a provider-side prefix cache can hit.  ``TaskState.history``
+  therefore lives *after* the prefix, never inside it.
+* **An explicit scratchpad.**  Intermediate reasoning is kept in a bounded,
+  separate buffer that the model may read but which is never part of the
+  stable prefix.  Bounding it stops an agent from slowly poisoning its own
+  context with stale notes.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass, field
+from typing import Any, Iterable, Mapping, Optional, Sequence
+
+DEFAULT_PERSONA = (
+    "You are IGAFORGE, a precise repository-modification agent. "
+    "You reason from the indexed symbols you are given, you never invent file "
+    "contents, and when you change code you emit a single unified diff."
+)
+
+DEFAULT_RULES: tuple[str, ...] = (
+    "Prefer the smallest correct change; do not refactor beyond the task.",
+    "Cite paths and symbol names exactly as they appear in the context slice.",
+    "When asked for a diff, return only the diff inside one ```diff fence.",
+    "If the request is ambiguous, state the assumption you are making and proceed.",
+    "Never print secrets, tokens or credentials, even if present in the context.",
+)
+
+
+def _digest(*parts: str) -> str:
+    hasher = hashlib.sha256()
+    for part in parts:
+        hasher.update(part.encode("utf-8"))
+        hasher.update(b"\x00")
+    return hasher.hexdigest()
+
+
+def normalize_whitespace(text: str, *, keep_lines: bool = False) -> str:
+    """Collapse whitespace so the same request hashes the same way.
+
+    By default *all* whitespace runs collapse to a single space, newlines
+    included.  That is what ``normalized_task`` in the cache key means: a task
+    pasted as three bulleted lines and the same task typed as one sentence are
+    the same request, and hashing them differently would split the cache for no
+    reason.  Pass ``keep_lines=True`` when line structure carries meaning.
+    """
+    if not text:
+        return ""
+    if keep_lines:
+        lines = [" ".join(line.split()) for line in text.splitlines()]
+        return "\n".join(line for line in lines if line).strip()
+    return " ".join(text.split())
+
+
+@dataclass
+class SystemPrefix:
+    """An immutable, hashable system prompt."""
+
+    text: str
+    hash: str
+    parts: dict[str, str] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"hash": self.hash, "chars": len(self.text), "parts": sorted(self.parts)}
+
+
+def build_system_prefix(
+    *,
+    persona: str = DEFAULT_PERSONA,
+    rules: Sequence[str] = DEFAULT_RULES,
+    repo_map: str = "",
+    tool_contract: str = "",
+    model_hint: str = "",
+    extra: Optional[Mapping[str, str]] = None,
+) -> SystemPrefix:
+    """Assemble the stable prefix.
+
+    Order is fixed (persona → rules → tools → repo map → model hint) so that two
+    runs with the same inputs produce byte-identical text.  ``extra`` is sorted
+    by key for the same reason: a dict's insertion order must not leak into the
+    prompt, or the hash would change for no substantive reason.
+    """
+    parts: dict[str, str] = {"persona": persona.strip()}
+    if rules:
+        parts["rules"] = "\n".join(f"{i + 1}. {r.strip()}" for i, r in enumerate(rules))
+    if tool_contract:
+        parts["tools"] = tool_contract.strip()
+    if repo_map:
+        parts["repo_map"] = repo_map.strip()
+    if model_hint:
+        parts["model_hint"] = model_hint.strip()
+    for key in sorted(extra or {}):
+        value = (extra or {})[key]
+        if value and value.strip():
+            parts[f"extra:{key}"] = value.strip()
+
+    blocks = [f"## {name}\n{body}" for name, body in parts.items()]
+    text = "\n\n".join(blocks)
+    return SystemPrefix(text=text, hash=_digest(text), parts=parts)
+
+
+@dataclass
+class PlanStep:
+    """One step of the agent's plan."""
+
+    index: int
+    description: str
+    status: str = "pending"   # pending | doing | done | failed | skipped
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"index": self.index, "description": self.description, "status": self.status}
+
+
+@dataclass
+class TaskState:
+    """Mutable run state: goal, plan, scratchpad, metrics.
+
+    The state is *serialisable* and *resumable*: :meth:`to_dict` round-trips
+    through :meth:`from_dict`, which is what the DAG checkpoints write to SQLite
+    and what a resumed run reads back.
+    """
+
+    run_id: str
+    goal: str
+    task_hash: str = ""
+    prefix: Optional[SystemPrefix] = None
+    plan: list[PlanStep] = field(default_factory=list)
+    scratchpad: list[str] = field(default_factory=list)
+    notes: dict[str, str] = field(default_factory=dict)
+    slice_hash: str = ""
+    git_sha: str = ""
+    phase_usages: dict[str, dict[str, Any]] = field(default_factory=dict)
+    counters: dict[str, float] = field(default_factory=dict)
+    artifacts: dict[str, Any] = field(default_factory=dict)
+    completed_nodes: list[str] = field(default_factory=list)
+    history: list[dict[str, str]] = field(default_factory=list)
+    status: str = "running"       # running | succeeded | failed | cancelled
+    error: str = ""
+    max_scratchpad_chars: int = 8000
+    max_plan_steps: int = 24
+
+    # ── prompt assembly ──────────────────────────────────────────────────────
+    def system_message(self) -> dict[str, str]:
+        if self.prefix is None:
+            return {"role": "system", "content": DEFAULT_PERSONA}
+        return {"role": "system", "content": self.prefix.text}
+
+    def messages(self, *, include_history: bool = True, extra: Sequence[Mapping[str, Any]] = ()) -> list[dict[str, Any]]:
+        """System message first, then the volatile tail.
+
+        The system message is always index 0 with content identical across every
+        phase of the run — that invariant is what the tests pin down.
+        """
+        out: list[dict[str, Any]] = [self.system_message()]
+        if include_history:
+            out.extend(dict(m) for m in self.history)
+        out.extend(dict(m) for m in extra)
+        return out
+
+    # ── scratchpad ───────────────────────────────────────────────────────────
+    def add_note(self, text: str) -> None:
+        """Append to the scratchpad, dropping the oldest notes past the cap.
+
+        Trimming from the front keeps recent reasoning; an agent that exceeds the
+        cap has usually drifted, and recent context is the part worth keeping.
+        """
+        if not text:
+            return
+        self.scratchpad.append(text.strip())
+        total = sum(len(n) + 1 for n in self.scratchpad)
+        while len(self.scratchpad) > 1 and total > self.max_scratchpad_chars:
+            total -= len(self.scratchpad.pop(0)) + 1
+
+    def scratchpad_text(self) -> str:
+        return "\n".join(self.scratchpad)
+
+    # ── plan ─────────────────────────────────────────────────────────────────
+    def set_plan(self, steps: Iterable[str]) -> None:
+        self.plan = [
+            PlanStep(index=i, description=desc.strip())
+            for i, desc in enumerate(list(steps)[: self.max_plan_steps])
+        ]
+
+    def mark_step(self, index: int, status: str) -> None:
+        for step in self.plan:
+            if step.index == index:
+                step.status = status
+                return
+
+    def add_history(self, role: str, content: str) -> None:
+        self.history.append({"role": role, "content": content})
+
+    def bump(self, name: str, value: float = 1.0) -> float:
+        self.counters[name] = self.counters.get(name, 0.0) + float(value)
+        return self.counters[name]
+
+    def record_phase_usage(self, phase: str, usage: Mapping[str, Any]) -> None:
+        bucket = self.phase_usages.setdefault(
+            phase, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
+        )
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            bucket[key] = bucket.get(key, 0) + int(usage.get(key, 0) or 0)
+        bucket["calls"] = bucket.get("calls", 0) + 1
+
+    def total_tokens(self) -> int:
+        return int(sum(v.get("total_tokens", 0) for v in self.phase_usages.values()))
+
+    def total_calls(self) -> int:
+        return int(sum(v.get("calls", 0) for v in self.phase_usages.values()))
+
+    # ── serialisation ────────────────────────────────────────────────────────
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "goal": self.goal,
+            "task_hash": self.task_hash,
+            "prefix_hash": self.prefix.hash if self.prefix else "",
+            "prefix_text": self.prefix.text if self.prefix else "",
+            "prefix_parts": dict(self.prefix.parts) if self.prefix else {},
+            "plan": [s.to_dict() for s in self.plan],
+            "scratchpad": list(self.scratchpad),
+            "notes": dict(self.notes),
+            "slice_hash": self.slice_hash,
+            "git_sha": self.git_sha,
+            "phase_usages": {k: dict(v) for k, v in self.phase_usages.items()},
+            "counters": dict(self.counters),
+            "artifacts": _jsonable(self.artifacts),
+            "completed_nodes": list(self.completed_nodes),
+            "history": list(self.history),
+            "status": self.status,
+            "error": self.error,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "TaskState":
+        prefix_text = str(data.get("prefix_text", ""))
+        prefix: Optional[SystemPrefix] = None
+        if prefix_text:
+            prefix = SystemPrefix(
+                text=prefix_text,
+                hash=str(data.get("prefix_hash", "")) or _digest(prefix_text),
+                parts=dict(data.get("prefix_parts") or {}),
+            )
+        state = cls(
+            run_id=str(data["run_id"]),
+            goal=str(data.get("goal", "")),
+            task_hash=str(data.get("task_hash", "")),
+            prefix=prefix,
+            slice_hash=str(data.get("slice_hash", "")),
+            git_sha=str(data.get("git_sha", "")),
+            notes=dict(data.get("notes") or {}),
+            phase_usages={k: dict(v) for k, v in (data.get("phase_usages") or {}).items()},
+            counters=dict(data.get("counters") or {}),
+            artifacts=dict(data.get("artifacts") or {}),
+            completed_nodes=list(data.get("completed_nodes") or []),
+            history=[dict(m) for m in (data.get("history") or [])],
+            status=str(data.get("status", "running")),
+            error=str(data.get("error", "")),
+        )
+        state.plan = [
+            PlanStep(
+                index=int(s.get("index", i)),
+                description=str(s.get("description", "")),
+                status=str(s.get("status", "pending")),
+            )
+            for i, s in enumerate(data.get("plan") or [])
+        ]
+        state.scratchpad = [str(s) for s in (data.get("scratchpad") or [])]
+        return state
+
+
+def _jsonable(value: Any, *, limit: int = 32) -> Any:
+    """Best-effort JSON-safe projection of arbitrary artifacts."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        if isinstance(value, str) and len(value) > 4000:
+            return value[:4000] + "...[truncated]"
+        return value
+    if isinstance(value, Mapping):
+        return {str(k): _jsonable(v, limit=limit) for k, v in list(value.items())[:limit]}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v, limit=limit) for v in list(value)[:limit]]
+    if hasattr(value, "to_dict"):
+        try:
+            return _jsonable(value.to_dict(), limit=limit)
+        except Exception:  # pragma: no cover - defensive
+            return f"<{type(value).__name__}>"
+    return f"<{type(value).__name__}>"
+
+
+__all__ = [
+    "SystemPrefix",
+    "TaskState",
+    "PlanStep",
+    "build_system_prefix",
+    "normalize_whitespace",
+    "DEFAULT_PERSONA",
+    "DEFAULT_RULES",
+]

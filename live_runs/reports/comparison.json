@@ -1,0 +1,102 @@
+{
+  "task": "Cyber-neon Tetris, 10x20 board, exact WASD + Space/P controls",
+  "baseline_tree_identical": true,
+  "single": {
+    "run_id": "live-single-20261018T182012",
+    "pipeline_status": "succeeded",
+    "accepted": true,
+    "changed_files": [
+      "index.html",
+      "game.js"
+    ],
+    "llm_calls_from_trace": 3,
+    "tokens_from_trace": 7943,
+    "wall_seconds": 79.05,
+    "generated_bytes": 10705,
+    "generated_lines": 371
+  },
+  "subagents": {
+    "run_id": "live-subagents-20261018T183146",
+    "pipeline_status": "succeeded",
+    "accepted": true,
+    "subagents_enabled": true,
+    "subagent_parallelism": 1,
+    "subagent_diffs_merged": 2,
+    "cache_disabled_in_parent_and_children": true,
+    "changed_files": [
+      "game.js",
+      "index.html"
+    ],
+    "llm_calls_from_trace": 8,
+    "tokens_from_trace": 18157,
+    "wall_seconds": 102.31,
+    "generated_bytes": 13898,
+    "generated_lines": 472
+  },
+  "delta_subagents_vs_single": {
+    "tokens_percent": 128.6,
+    "wall_percent": 29.4,
+    "bytes_percent": 29.8,
+    "lines_percent": 27.2
+  },
+  "browser_findings": {
+    "single": [
+      "Browser console: TypeError in checkCollision because currentPiece is null when tick() runs at script load.",
+      "Rendering rebuilds 200 DOM cells every animation frame; startGame starts another tick loop and window.onload autostarts.",
+      "No seven-bag, level-based gravity, working hold input, or wall kicks in the generated implementation."
+    ],
+    "subagents": [
+      "index.html contains the full page twice and loads game.js twice.",
+      "Browser console: duplicate BOARD_WIDTH declaration, undefined shape in Piece.getShape, and gameState is not defined on Start.",
+      "The piece-shape table contains only seven base shapes while getShape indexes as if all four rotations were stored."
+    ]
+  },
+  "score": "2/4",
+  "score_reason": "Both GigaForge pipelines completed with accepted diffs and wrote index.html plus game.js. Neither generated game passed browser runtime checks, so the quality/efficiency 4/4 bar was not met.",
+  "diagnostic_attempts": {
+    "single": [
+      {
+        "run_id": "live-single-20261018T181543",
+        "tokens": 4971,
+        "successful_router_calls": 2,
+        "accepted": false
+      }
+    ],
+    "subagents": [
+      {
+        "run_id": "live-subagents-20261018T182205",
+        "tokens": 16159,
+        "successful_router_calls": 6,
+        "accepted": false
+      },
+      {
+        "run_id": "live-subagents-20261018T182536",
+        "tokens": 13043,
+        "successful_router_calls": 5,
+        "accepted": true,
+        "cache_hit_contamination": true
+      },
+      {
+        "run_id": "live-subagents-20261018T182719",
+        "tokens": 16180,
+        "successful_router_calls": 6,
+        "accepted": true,
+        "cache_hit_contamination": true
+      },
+      {
+        "run_id": "live-subagents-20261018T183003",
+        "tokens": 9474,
+        "successful_router_calls": 5,
+        "accepted": true,
+        "cache_hit_contamination": true
+      }
+    ],
+    "note": "These diagnostic attempts are excluded from the clean single-vs-subagents comparison. The first sandbox-denied network attempt produced zero model tokens."
+  },
+  "cumulative_live_exercise": {
+    "trace_tokens": 85927,
+    "successful_router_calls": 35,
+    "includes_diagnostic_retries": true,
+    "includes_errors_or_429_requests": false
+  }
+}

@@ -1,0 +1,190 @@
+<!doctype html>
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <title>CyberNeon Tetris</title>
+    <style>
+        body {
+            font-family: monospace;
+            background-color: black;
+            color: white;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+
+        #game-container {
+            text-align: center;
+            position: relative;
+        }
+
+        #game-board,
+#next-piece,
+#hold-piece {
+            border: 1px solid white;
+            display: inline-block;
+            vertical-align: top;
+            margin-right: 10px;
+        }
+
+        #game-board {
+            width: 200px;
+            height: 400px;
+            background-color: rgba(0, 0, 0, 0.5);
+        }
+
+        #next-piece,
+#hold-piece {
+            width: 100px;
+            height: 100px;
+        }
+
+        #score,
+#level,
+#lines {
+            padding-top: 10px;
+            font-size: 18px;
+        }
+
+        #start-button,
+#pause-button,
+#restart-button {
+            cursor: pointer;
+            user-select: none;
+            padding: 5px 10px;
+            margin: 5px;
+            background-color: transparent;
+            border: 1px solid white;
+            color: white;
+            transition: transform 0.1s ease-in-out;
+        }
+
+        #start-button:hover,
+#pause-button:hover,
+#restart-button:hover {
+            transform: scale(1.1);
+        }
+
+        #status {
+            font-size: 24px;
+            margin-bottom: 20px;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="game-container">
+        <h1>CyberNeon Tetris</h1>
+        <canvas id="game-board"></canvas>
+        <canvas id="next-piece"></canvas>
+        <canvas id="hold-piece"></canvas>
+        <p id="score">Score: 0</p>
+        <p id="level">Level: 1</p>
+        <p id="lines">Lines Cleared: 0</p>
+        <button id="start-button">Start Game</button>
+        <button id="pause-button">Pause</button>
+        <button id="restart-button">Restart</button>
+        <p id="status"></p>
+    </div>
+    <script src="game.js"></script>
+</body>
+
+</html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <title>CyberNeon Tetris</title>
+    <style>
+        body {
+            font-family: monospace;
+            background-color: black;
+            color: white;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+
+        #game-container {
+            text-align: center;
+            position: relative;
+        }
+
+        #game-board,
+#next-piece,
+#hold-piece {
+            border: 1px solid white;
+            display: inline-block;
+            vertical-align: top;
+            margin-right: 10px;
+        }
+
+        #game-board {
+            width: 200px;
+            height: 400px;
+            background-color: rgba(0, 0, 0, 0.5);
+        }
+
+        #next-piece,
+#hold-piece {
+            width: 100px;
+            height: 100px;
+        }
+
+        #score,
+#level,
+#lines {
+            padding-top: 10px;
+            font-size: 18px;
+        }
+
+        #start-button,
+#pause-button,
+#restart-button {
+            cursor: pointer;
+            user-select: none;
+            padding: 5px 10px;
+            margin: 5px;
+            background-color: transparent;
+            border: 1px solid white;
+            color: white;
+            transition: transform 0.1s ease-in-out;
+        }
+
+        #start-button:hover,
+#pause-button:hover,
+#restart-button:hover {
+            transform: scale(1.1);
+        }
+
+        #status {
+            font-size: 24px;
+            margin-bottom: 20px;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="game-container">
+        <h1>CyberNeon Tetris</h1>
+        <canvas id="game-board"></canvas>
+        <canvas id="next-piece"></canvas>
+        <canvas id="hold-piece"></canvas>
+        <p id="score">Score: 0</p>
+        <p id="level">Level: 1</p>
+        <p id="lines">Lines Cleared: 0</p>
+        <button id="start-button">Start Game</button>
+        <button id="pause-button">Pause</button>
+        <button id="restart-button">Restart</button>
+        <p id="status"></p>
+    </div>
+    <script src="game.js"></script>
+</body>
+
+</html>

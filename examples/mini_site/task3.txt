@@ -1,0 +1,1 @@
+Remove the trailing inline comment from the build_features function so the code reads cleanly. Do NOT change any behavior, do NOT add any new code, only delete that one trailing comment line. Then run python -m pytest tests/ -q and ensure all tests still pass.

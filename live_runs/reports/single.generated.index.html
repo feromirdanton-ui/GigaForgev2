@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <title>Cyber Neon Tetris</title>
+    <style>
+        body {
+            font-family: 'Courier New', monospace;
+            background-color: black;
+            color: cyan;
+            text-align: center;
+            margin-top: 5%;
+        }
+
+        #game-container {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            max-width: 800px;
+            margin: auto;
+        }
+
+        #game-board,
+#next-piece,
+#hold-piece {
+            border: 2px solid white;
+            padding: 5px;
+            width: 200px;
+            height: 400px;
+            overflow: hidden;
+            position: relative;
+        }
+
+        #score,
+#level,
+#lines {
+            font-size: 24px;
+            margin-bottom: 10px;
+        }
+
+        button {
+            cursor: pointer;
+            background-color: transparent;
+            border: none;
+            outline: none;
+            color: white;
+            font-size: 20px;
+            transition: transform 0.2s ease-in-out;
+        }
+
+        button:hover {
+            transform: scale(1.1);
+        }
+
+        #status {
+            font-size: 36px;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Cyber Neon Tetris</h1>
+    <div id="game-container">
+        <div id="game-board"></div>
+        <div>
+            <p id="next-piece">Next Piece:</p>
+            <p id="hold-piece">Hold Piece:</p>
+            <button id="start-button">Start Game</button>
+            <button id="pause-button">Pause</button>
+            <button id="restart-button">Restart</button>
+        </div>
+    </div>
+    <p id="score">Score: 0</p>
+    <p id="level">Level: 1</p>
+    <p id="lines">Lines Cleared: 0</p>
+    <p id="status"></p>
+    <script src="game.js"></script>
+</body>
+
+</html>

@@ -1,0 +1,1 @@
+Add a build_contact_section(email, phone, address) builder to build.py that returns a Contact <section id="contact"> block. Then expose it via build_page between Pricing and Footer. The section must escape inputs. Use the same _section(...) helper as the other sections. Run `pytest tests/` after applying the change and ensure all existing tests still pass.

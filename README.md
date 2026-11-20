@@ -1,0 +1,245 @@
+# GigaForge V6.fresh
+
+**GigaForge** is an orchestration harness for the **GigaChat** API (Sber): a DAG of
+agents that plans, authors, validates and reviews repository changes under a hard
+token budget, with a deterministic context pipeline and zero-token static analysis.
+
+It ships as a **standalone desktop application**. Double-click the shortcut (or run
+`start.bat`) and a window opens — no browser, no terminal, no server.
+
+```
+L0  deterministic   tree-sitter + SQLite symbol index, AST edits, repo map, lint
+L1  cheap model     retrieval, summarisation, triage, review
+L2  main model      planning, diff authoring, repair
+```
+
+---
+
+## Run it
+
+```bash
+pip install -e .                      # once
+start.bat                             # Windows: opens the Qt Quick workspace
+gigaforge desktop                     # same primary workspace
+gigaforge-desktop                     # or the installed script
+python -m gigaforge.desktop           # or by module
+gigaforge desktop --ui tk             # legacy Tk fallback
+```
+
+The launcher provisions Qt Quick on first start. The Tk window remains available
+as an explicit fallback while the workspace continues to gain editor and agent
+capabilities.
+
+The window opens even **without a credential** — it runs in *read-only* mode:
+dashboards, traces, the symbol index and every `/command` work from the local
+sinks. Runs additionally need:
+
+```bash
+# .env
+GIGAFORGE_AUTH_KEY=<base64(client_id:client_secret)>
+```
+
+The Settings page accepts a credential and endpoint changes without a restart and
+saves them in the local `.env`. TLS verification is off by default for the current
+GigaChat API connection; the same page lets an operator enable it where the API
+certificate chain is reliable.
+
+### The window
+
+| page | what it is for |
+|---|---|
+| **Обзор** | состояние задачи, команда агентов и переходы в рабочие режимы |
+| **Forge** | рабочий чат и режимы `chat`, `agent` и `goal` с потоковыми этапами оркестрации |
+| **Файлы и редактор** | безопасное редактирование UTF-8 файлов проекта и команды системной оболочки в корне проекта |
+| **Агенты** | роли, специализации и состояние команды |
+| **Мониторинг** | актуальное состояние последнего запуска и живые события |
+| **Настройки** | credentials, TLS и подтверждение файловых изменений `Ask` / `Always allow` |
+
+В рабочем пространстве можно менять ширину дерева файлов, размер консоли и её
+положение снизу или справа; раскладка сохраняется между запусками. Редактор
+защищает несохранённый текст и откажется перезаписывать файл, изменённый извне.
+
+In the desktop composer, choose **📂 project** (or click the `REPO` value) to set
+the folder the agent may edit. Attaching a project folder and sending a write task
+in Agent or Goal mode selects that folder as the workspace; attached files are
+passed as workspace-relative context. Files outside the selected workspace stay
+read-only references.
+
+Shortcuts: `ctrl+1…8` pages · `ctrl+n` new chat · `ctrl+,` settings · `ctrl+q` quit.
+`install-shortcut.bat` puts a proper icon on the Desktop and in the Start Menu
+(`install-shortcut.bat /remove` takes it back).
+
+### The browser UI is a feature, not the product
+
+The window renders telemetry straight from the local SQLite/JSONL sinks. The web
+control room exists for the cases a browser genuinely wins — a second monitor, a
+read-only view for a colleague, or a machine without Tk — and can be started from
+the Integrations view or the CLI. The window shows the bound URL and opens it on request.
+
+```bash
+gigaforge web --serve --port 8787 --open   # same server, from a shell
+web.bat          # control room only
+```
+
+---
+
+## What runs under the window
+
+### The task DAG
+
+```
+intake → index → slice → cache → plan → act → validate → fix → review
+                                                              → settle
+                                                              → summarize
+                                                              → persist
+```
+
+Every node is a plain callable with declared inputs/outputs, so the executor can
+checkpoint, resume, retry and time each step, and the UI can show a step timeline
+that is always true.
+
+`plan` and `review` are **policy** stages: the DAG owns their position, order and
+trace, `gigaforge/core/strategies.py` owns what they do.
+
+| stage | strategies | env |
+|---|---|---|
+| plan | `linear` (one call), `tot` (K branches, heuristic scoring, optional judge) | `GIGAFORGE_PLAN_STRATEGY` |
+| review | `none`, `constitutional` (deterministic blockers + one soft-principle call), `llm` | `GIGAFORGE_REVIEW_STRATEGY` |
+
+A reviewer can only ever *narrow* an acceptance: `settle` combines the
+deterministic verdict with the review veto and never revives a rejected diff.
+
+### Agents — 14, all reachable
+
+`planner`, `coder`, `reviewer` (the core trio) · `tot`, `constitutional`, `react`,
+`reflection`, `self_consistency`, `self_debug` (reasoning) · `localizer`,
+`retrieval`, `summarizer`, `memory` (context) · `subagents` (delegation).
+
+```bash
+gigaforge agents          # catalog: name, family, stage, role
+```
+
+### Providers
+
+GigaChat is the default; an OpenAI-compatible endpoint is a drop-in selection:
+
+```bash
+GIGAFORGE_PROVIDER=openai
+GIGAFORGE_OPENAI_BASE_URL=https://api.openai.com/v1
+GIGAFORGE_OPENAI_API_KEY=...
+```
+
+```bash
+gigaforge providers       # what is registered, what is configured
+```
+
+The async transports (HTTPX, SSE) sit under one blocking bridge,
+`core/sync_adapter.SyncChatClient`, so the synchronous DAG never touches an event
+loop and the connection pool survives a whole run.
+
+### MCP
+
+The harness is also an MCP server, so an external IDE can call its tools:
+
+```bash
+gigaforge mcp            # stdio transport
+```
+
+---
+
+## CLI
+
+```bash
+gigaforge desktop                  # the window (primary)
+gigaforge run "<goal>"             # one run, headless
+gigaforge goal "<goal>"            # execute, verify, and improve until done
+gigaforge goal --resume <goal-id>  # resume saved goal progress
+gigaforge chat [-m MSG]            # agentic chat in the terminal
+gigaforge ui --watch               # terminal dashboard
+gigaforge web [--serve|--out F]    # browser control room
+gigaforge report|trace|steps|diff|cost|cache|paths
+gigaforge index|doctor|models|smoke|mcp|bench|providers|agents
+```
+
+Exit codes are part of the contract: `0` ok · `1` run not accepted · `2` no data ·
+`3` usage/configuration error. `--json` bypasses `rich` so it stays pipe-safe.
+
+`run` is the bounded one-shot authoring flow. `goal` is the long-lived task
+flow: it stores progress below `.gigaforge/goals`, runs relevant checks after
+each accepted change, feeds failures back into the next model cycle, and stops
+only after checks pass or the cycle/verifier limit is reached. Goal mode copies
+the selected project into `.gigaforge/workspaces/<goal-id>/project`, writes and
+tests there, then publishes only verified changed files with atomic file
+replacement. If the
+destination changed while the goal was running, publication pauses with a
+conflict report and keeps the workspace for resume. Successful runs remove the
+large project copy while retaining the goal report. The application installs
+its Goal parser/test dependencies and Playwright as core dependencies, checks
+Chromium on startup, and provisions its browser binary automatically if it is
+missing:
+
+```bash
+gigaforge goal "Build a game ..." --max-cycles 4 --json
+```
+
+Use `--static-only` only when accepting syntax/structure checks without actually
+launching an HTML application is intended. Add `--subagents` to delegate each
+implementation cycle while retaining the same final verification gate. The
+complete workflow and status meanings are in [`docs/GOAL_MODE.md`](docs/GOAL_MODE.md).
+Desktop **Settings → file changes** lets you choose a persisted **Ask** mode
+(one approval per complete diff) or **Always allow** mode.
+
+Windows shortcuts: `start.bat` (window) · `menu.bat` (terminal menu) ·
+`web.bat` · `tui.bat` · `chat.bat` · `doctor.bat` · `panel.bat`.
+
+---
+
+## Architecture
+
+| layer | package | responsibility |
+|---|---|---|
+| M1 | `gigaforge/client` | OAuth, SSE streaming, retries, rate limiting, metrics |
+| M2 | `gigaforge/l0` | symbol index, AST tools, repo map, incremental indexing, lint |
+| M3 | `gigaforge/firewall` | context compression, context slicing, diff validation |
+| M4–M5 | `gigaforge/core` | DAG executor, router, cache, fix loop, breaker, strategies, telemetry |
+| M6 | `gigaforge/runtime.py` | the one composition root |
+| agents | `gigaforge/agents` | the 14 reasoning units |
+| providers | `gigaforge/providers` | provider protocol + registry (GigaChat, OpenAI-compatible) |
+| MCP | `gigaforge/mcp` | stdio MCP server |
+| UI | `gigaforge/ui` | store → analytics → snapshot → renderers (TUI, HTML, chat) |
+| **app** | `gigaforge/desktop` | the window: shell, views, widgets, worker |
+| web | `gigaforge/ui/webui.py` | stdlib control room, snapshot API and optional chat bridge |
+
+One snapshot, one truth: the desktop window, the HTML panel, the TUI and
+`gigaforge report` all render `ui.snapshot.build_snapshot`, so they cannot disagree.
+
+### Hard rules
+
+- No LangChain / LiteLLM shims — the GigaChat contract is implemented directly.
+- Never send a whole file to a model; only diffs and bounded context slices.
+- Every provider request has a bounded timeout and retry policy; model calls also
+  pass through the router's budget and circuit breaker.
+- **No credential in the source.** Secrets come from the environment or `.env`; a
+  missing key degrades to read-only instead of impersonating a demo account.
+- One composition root (`gigaforge/runtime.py`): the CLI, the window and the chat
+  backend build the same object graph, so a wiring bug cannot hide in one of them.
+
+## Verifying a checkout
+
+```bash
+gigaforge doctor          # environment, credentials, deps, git, storage, budgets
+gigaforge bench           # offline benchmark across toy tasks
+gigaforge run "<goal>" --dry-run    # full DAG, nothing written to the workspace
+```
+
+## Docs
+
+- [`docs/DESKTOP.md`](docs/DESKTOP.md) — the window: structure, threading, theming
+- [`docs/SYNTHESIS.md`](docs/SYNTHESIS.md) — what the merge brought in and how it wired
+- [`docs/V2_BACKEND_AUDIT.md`](docs/V2_BACKEND_AUDIT.md) — backend audit
+- [`docs/UI_V2.md`](docs/UI_V2.md) — the snapshot/UI layer
+- [`docs/ARCHITECTURE_REVIEW.md`](docs/ARCHITECTURE_REVIEW.md) — current architecture audit and roadmap
+
+## License
+
+Proprietary — internal use.
