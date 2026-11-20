@@ -1637,7 +1637,15 @@ class ReActRunner:
 
     def _parse_step(self, text: str) -> tuple[str, str, str] | None:
         """Parse one ReAct step: (thought, action, action_input). None on failure."""
-        repaired = json_repair(text)
+        # The model frequently emits *two* objects in one answer: the step it
+        # wants to take, then a ``finish`` it has already decided on.  Measured
+        # live on every run of the cyberpunk-site goal — the answer was
+        # ``{"action":"write_file",...}\n{"action":"finish",...}``.  Parsing the
+        # whole text fails ("Extra data"), so the step was counted as a parse
+        # failure, the fallback force-finished, and the file was never written.
+        # The first object is the step; the rest is the model thinking ahead.
+        first = self._first_json_object(text)
+        repaired = json_repair(first if first is not None else text)
         try:
             data = json.loads(repaired)
         except json.JSONDecodeError:
@@ -1668,6 +1676,41 @@ class ReActRunner:
         else:
             ai = str(ai or "").strip()
         return thought, action, ai
+
+    @staticmethod
+    def _first_json_object(text: str) -> str | None:
+        """Return the first balanced ``{...}`` block, or ``None``.
+
+        Brace counting is string-aware: a ``{`` inside a quoted value (HTML,
+        CSS, a regex) must not open a block, and a ``}`` inside one must not
+        close it.  Without that, a step carrying a page of CSS would be cut at
+        the first ``}`` in its own stylesheet.
+        """
+        start = text.find("{")
+        if start < 0:
+            return None
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start:index + 1]
+        return None
 
     #: Keys whose value is a long free-form body, in the order they are tried.
     _BODY_KEYS = ("content", "body", "text", "code")
