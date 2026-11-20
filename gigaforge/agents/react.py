@@ -118,6 +118,11 @@ _OBS_TOKEN_BUDGET = 1500
 #: and "overflow" until the step budget runs out.
 _MAX_COMPACTIONS = 2
 
+#: How many times a ``finish`` may be refused because the produced artifact
+#: does not meet the goal's explicit requirements.  Two is enough for a model
+#: to add the missing colours/sections; more turns a contract miss into a loop.
+_MAX_CONTRACT_RETRIES = 2
+
 # L1 Lite prompt — short and bounded. Asks for ONE JSON object per step.
 _REACT_PROMPT = (
     "Ты агент в цикле ReAct (Reason→Act→Observe). Изучи репозиторий и "
@@ -734,6 +739,10 @@ class ReActRunner:
         # deterministic grep, then a forced finish.
         fallback = ParseFailureFallback()
         parse_failures = 0
+        # How many times a finish has been refused because the artifact did not
+        # meet the goal's explicit requirements.  Bounded so a model that cannot
+        # satisfy the contract does not loop until the step budget runs out.
+        contract_retries = 0
         # Observation cache: a ReAct episode re-reads the same file constantly,
         # and each repeat costs a tool call plus a full observation in the
         # trajectory — which is what pushes a run into compaction.  Only
@@ -933,6 +942,43 @@ class ReActRunner:
 
             # Termination.
             if action == FINISH_ACTION:
+                # Before accepting the finish, check the artifact against the
+                # goal's *explicit* requirements.  A live run asked for a
+                # "neon cyan/magenta palette" and produced a page whose whole
+                # palette was #fff on #000; the model called finish, the plan
+                # was empty, and the run reported success.  Nothing had ever
+                # looked at the file.  "Does the page contain the colours the
+                # user named?" is a string search, so the harness does it.
+                contract = self._check_contract(ctx, state)
+                if not contract.ok and contract_retries < _MAX_CONTRACT_RETRIES:
+                    contract_retries += 1
+                    trajectory.append({"role": "assistant", "content": text})
+                    trajectory.append(
+                        {"role": "user", "content": contract.as_observation()}
+                    )
+                    result.steps.append(
+                        {
+                            "step_idx": step_idx,
+                            "thought": thought,
+                            "action": action,
+                            "action_input": action_input,
+                            "ok": False,
+                            "observation": contract.as_observation(),
+                            "plan_size": 0,
+                            "contract_unmet": list(contract.unmet),
+                        }
+                    )
+                    self._tracer.trace(
+                        state.task_id,
+                        step=f"react_contract_{step_idx}",
+                        kind="decision",
+                        detail={
+                            "unmet": contract.unmet,
+                            "checked": contract.checked,
+                            "retry": contract_retries,
+                        },
+                    )
+                    continue
                 plan = self._parse_finish_plan(action_input)
                 if not plan:
                     # The model said "finish" but its payload did not parse.
@@ -1315,6 +1361,27 @@ class ReActRunner:
         rescued.plan = plan
         rescued.localization = self._extract_localization(plan, thought)
         return rescued
+
+    def _check_contract(self, ctx: ReActContext, state: TaskState):
+        """Check the produced artifact against the goal's explicit requirements.
+
+        Returns a :class:`~gigaforge.harness.goal_contract.ContractVerdict`.
+        A goal with no checkable requirement yields an ``ok`` verdict, so this
+        never invents a standard the user did not set.
+        """
+        from gigaforge.harness.goal_contract import check_artifacts, extract_requirements
+
+        goal = getattr(state, "goal", "") or ""
+        requirements = extract_requirements(goal)
+        if not requirements:
+            from gigaforge.harness.goal_contract import ContractVerdict
+
+            return ContractVerdict()
+        written = [
+            s.get("action_input", "")
+            for s in getattr(self, "_written_files", [])
+        ]
+        return check_artifacts(requirements, ctx.worktree, files=written or None)
 
     def _synthesize_plan(self, trajectory: list[dict[str, str]]) -> list[PlanStep]:
         """Derive a plan from the files the episode actually observed.
