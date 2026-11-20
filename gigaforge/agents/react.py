@@ -625,9 +625,15 @@ class ReActRunner:
         # trajectory — which is what pushes a run into compaction.  Only
         # read-only tools are cached, and any change to the tree drops the whole
         # cache, so a write is always observed.
+        #
+        # The root used to be read from ``self.ctx``, which does not exist on
+        # this class — so it was always ``None``, ``_workspace_stamp()`` always
+        # returned ``""``, and the cache NEVER invalidated.  A cached grep
+        # therefore survived a write to the tree: the model edited a file,
+        # searched again, and was handed the pre-edit answer.  The context is a
+        # parameter of ``run``, so that is where the root comes from.
         self._obs_cache = ObservationCache(
-            root=getattr(getattr(self, "ctx", None), "worktree", None)
-            or getattr(getattr(self, "ctx", None), "repo_root", None)
+            root=getattr(ctx, "worktree", None) or getattr(ctx, "repo_root", None)
         )
 
         for step_idx in range(self._max_steps):
@@ -913,12 +919,28 @@ class ReActRunner:
                 observation = observation[: _OBS_TOKEN_BUDGET * 4] + "\n[truncated]"
 
             trajectory.append({"role": "assistant", "content": text})
-            trajectory.append(
-                {
-                    "role": "user",
-                    "content": f"Observation ({kind}):\n{observation}",
-                }
-            )
+            if cached is not None:
+                # A cache hit means this exact observation is ALREADY earlier in
+                # the trajectory.  Appending it again would pay for the same
+                # tokens twice on every subsequent request — the cache would
+                # save a tool call and cost the budget it was meant to protect.
+                # A pointer is enough: the model can read the earlier step.
+                trajectory.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Observation ({kind}): identical to an earlier step in "
+                            "this episode — see that observation; it has not changed."
+                        ),
+                    }
+                )
+            else:
+                trajectory.append(
+                    {
+                        "role": "user",
+                        "content": f"Observation ({kind}):\n{observation}",
+                    }
+                )
             # SpecificationAudit: after the model inspects a file it just
             # created, nudge it once to check the output against the contract.
             audit = self.guards.after_observation(trajectory)
