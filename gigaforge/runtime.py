@@ -123,7 +123,12 @@ def metrics_sink(collector: Optional[MetricsCollector]) -> Callable[[Dict[str, A
     return sink
 
 
-def build_provider(client: GigaClient, settings: Optional[Settings] = None) -> Provider:
+def build_provider(
+    client: GigaClient,
+    settings: Optional[Settings] = None,
+    *,
+    max_context: Optional[int] = None,
+) -> Provider:
     """Return the provider the harness should talk to.
 
     For the built-in GigaChat path the provider is constructed **from the client
@@ -145,14 +150,14 @@ def build_provider(client: GigaClient, settings: Optional[Settings] = None) -> P
     registry = default_registry()
     selected = (os.environ.get("GIGAFORGE_PROVIDER") or "giga").strip().lower()
     if selected in {"", "giga", "gigachat"}:
-        provider = GigaChatProvider(client)
+        provider = GigaChatProvider(client, max_context=max_context)
         registry.register_instance("giga", provider)
         return provider
     try:
         return registry.default()
     except Exception as exc:  # noqa: BLE001 - fall back to the built-in provider
         log.warning("selected provider unavailable (%s); using GigaChat", exc)
-        provider = GigaChatProvider(client)
+        provider = GigaChatProvider(client, max_context=max_context)
         registry.register_instance("giga", provider)
         return provider
 
@@ -177,7 +182,13 @@ def build_client(
         metrics_sink=metrics_sink(metrics),
         settings=s,
     )
-    provider = build_provider(raw, s)
+    provider = build_provider(
+        raw,
+        s,
+        # 0 means "resolve per model from the measured table"; a positive
+        # value pins one window for every model.
+        max_context=config.max_context or None,
+    )
     return SyncChatClient(provider), raw, token_provider, provider
 
 

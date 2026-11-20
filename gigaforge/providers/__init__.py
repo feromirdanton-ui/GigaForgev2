@@ -27,7 +27,16 @@ from gigaforge.providers.base import (
     ProviderError,
     ProviderNotConfigured,
 )
+from gigaforge.providers.context_windows import (
+    DEFAULT_CONTEXT_WINDOW,
+    GIGACHAT_CONTEXT_WINDOWS,
+    context_window_for,
+    context_window_table,
+    normalize_model_id,
+)
 from gigaforge.providers.gigachat import GigaChatProvider
+from gigaforge.providers.gigachat_sdk_adapter import GigaChatSDKProvider, sdk_available
+from gigaforge.providers.messages import nudge, normalize_messages
 from gigaforge.providers.openai_compat import OpenAICompatProvider
 from gigaforge.providers.registry import (
     ProviderRegistry,
@@ -38,8 +47,17 @@ from gigaforge.providers.registry import (
 )
 
 __all__ = [
+    "DEFAULT_CONTEXT_WINDOW",
+    "GIGACHAT_CONTEXT_WINDOWS",
     "GigaChatProvider",
+    "GigaChatSDKProvider",
     "OpenAICompatProvider",
+    "context_window_for",
+    "context_window_table",
+    "normalize_messages",
+    "normalize_model_id",
+    "nudge",
+    "sdk_available",
     "Provider",
     "ProviderCapabilities",
     "ProviderError",

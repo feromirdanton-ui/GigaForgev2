@@ -57,7 +57,9 @@ class ProviderCapabilities(BaseModel):
 
     streaming: bool = False
     function_calling: bool = False
-    max_context: int = 8192
+    # Measured GigaChat window (261 120), not the stale 8 192 figure. See
+    # gigaforge.providers.context_windows for the per-model table.
+    max_context: int = 261_120
     default_model: str = ""
 
 

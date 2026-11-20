@@ -494,7 +494,11 @@ class GigaClient:
     def _with_nudge(self, plan: RequestPlan) -> RequestPlan:
         """Return a copy of the plan with a corrective instruction appended."""
         messages = list(plan.payload.get("messages") or [])
-        messages.append({"role": "system", "content": TOOL_NUDGE})
+        # GigaChat rejects a system message that is not first in the
+        # conversation (hard 400), so a corrective instruction appended to an
+        # existing history must travel as a HUMAN message. The model still
+        # follows it; the request shape stays legal.
+        messages.append({"role": "user", "content": TOOL_NUDGE})
         payload = dict(plan.payload)
         payload["messages"] = messages
         return RequestPlan(

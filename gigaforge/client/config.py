@@ -33,12 +33,19 @@ _ENV_ALIASES: Dict[str, tuple] = {
     "scope": ("GF_CLIENT__SCOPE", "GIGACHAT_SCOPE"),
     "default_model": ("GF_CLIENT__DEFAULT_MODEL", "GIGACHAT_MODEL"),
     "tls_verify": ("GF_CLIENT__TLS_VERIFY", "GF_CLIENT__VERIFY_SSL"),
+    "max_context": (
+        "GF_CLIENT__MAX_CONTEXT",
+        "GIGAFORGE_GIGA_MAX_CONTEXT",
+        "GIGACHAT_CONTEXT_WINDOW",
+    ),
 }
 
 _BOOL_FIELDS = frozenset(
     {"tls_verify", "backoff_jitter", "retry_on_text_call", "metrics_enabled", "trust_env"}
 )
-_INT_FIELDS = frozenset({"max_retries", "rpm", "tpm", "max_text_call_retries", "max_connections"})
+_INT_FIELDS = frozenset(
+    {"max_retries", "rpm", "tpm", "max_text_call_retries", "max_connections", "max_context"}
+)
 _FLOAT_FIELDS = frozenset(
     {
         "token_ttl",
@@ -128,6 +135,11 @@ class ClientConfig:
     default_model: str = "GigaChat"
     estimate_chars_per_token: float = 4.0
     metrics_enabled: bool = True
+    # 0 means "resolve from the measured per-model table"
+    # (gigaforge.providers.context_windows). A positive value pins one window
+    # for every model; env: GF_CLIENT__MAX_CONTEXT / GIGAFORGE_GIGA_MAX_CONTEXT /
+    # GIGACHAT_CONTEXT_WINDOW.
+    max_context: int = 0
 
     # -- construction ----------------------------------------------------------
     @classmethod
@@ -190,6 +202,8 @@ class ClientConfig:
             problems.append("rpm/tpm must be >= 0")
         if self.estimate_chars_per_token <= 0:
             problems.append("estimate_chars_per_token must be > 0")
+        if self.max_context < 0:
+            problems.append("max_context must be >= 0 (0 = use the measured table)")
         if problems:
             raise ConfigurationError("invalid ClientConfig: " + "; ".join(problems))
         return self

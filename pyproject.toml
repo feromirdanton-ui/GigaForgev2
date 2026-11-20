@@ -38,6 +38,9 @@ languages = [
     "tree-sitter-go>=0.21",
     "tree-sitter-rust>=0.21",
 ]
+# Official GigaChat SDK transport (GigaChatSDKProvider). Optional: the legacy
+# httpx client remains the default and needs no extra install.
+gigachat = ["gigachat>=0.3"]
 # Backward-compatible extra; Playwright is now included in the core install.
 browser = []
 # Local lint/build tooling. Pytest is a core runtime dependency because Goal mode

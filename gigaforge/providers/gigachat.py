@@ -16,7 +16,18 @@ Capabilities:
 - ``streaming=True``    — GigaClient implements SSE-based stream_chat().
 - ``function_calling=True`` — GigaClient parses function_call from BOTH
   ``message.function_call`` AND ``message.additional_kwargs.function_call``.
-- ``max_context=8192``  — GigaChat-2-Pro's published context window.
+- ``max_context``       — resolved from the MEASURED table in
+  :mod:`gigaforge.providers.context_windows` (261 120 tokens for every public
+  chat model), not from the old 8 192 figure. Override per-process with
+  ``GIGAFORGE_GIGA_MAX_CONTEXT`` or ``GIGACHAT_CONTEXT_WINDOW``.
+
+Message shape
+-------------
+Every call is passed through :func:`gigaforge.providers.messages.normalize_messages`
+before it reaches the transport, so the provider's hard constraint — *a system
+message must be the first message* — holds no matter what a caller assembled.
+Mid-conversation instructions (nudges) are built with
+:func:`gigaforge.providers.messages.nudge` and travel as human messages.
 """
 from __future__ import annotations
 
@@ -24,14 +35,18 @@ from typing import Any
 
 from gigaforge.client.giga_client import ChatResult, GigaClient, StreamAccumulator
 from gigaforge.providers.base import ProviderCapabilities
+from gigaforge.providers.context_windows import (
+    DEFAULT_CONTEXT_WINDOW,
+    context_window_for,
+    normalize_model_id,
+)
+from gigaforge.providers.messages import normalize_messages
 
-__all__ = ["GigaChatProvider"]
+__all__ = ["GigaChatProvider", "DEFAULT_CONTEXT_WINDOW"]
 
-# GigaChat-2-Pro's documented context window. Used as a conservative hint
-# for budget pre-flight; the upstream model_catalog may report a different
-# value at runtime (the live list_models() call). Override per-process via
-# env GIGAFORGE_GIGA_MAX_CONTEXT if needed.
-_DEFAULT_MAX_CONTEXT = 8192
+#: Kept for callers that imported the old constant. It is now the measured
+#: default (261 120), not the stale 8 192.
+_DEFAULT_MAX_CONTEXT = DEFAULT_CONTEXT_WINDOW
 
 
 class GigaChatProvider:
@@ -40,11 +55,23 @@ class GigaChatProvider:
     The wrapped client retains ownership of its TokenProvider + RateLimiter +
     metrics sink + httpx transport. ``aclose()`` delegates so callers who
     only hold a Provider reference can still close the underlying resources.
+
+    ``max_context`` is resolved lazily per model: an explicit constructor
+    argument wins, then the environment, then the measured table. That means a
+    provider built once still reports the right window for a model the router
+    switches to later in the run.
     """
 
-    def __init__(self, client: GigaClient, *, max_context: int = _DEFAULT_MAX_CONTEXT) -> None:
+    def __init__(
+        self,
+        client: GigaClient,
+        *,
+        max_context: int | None = None,
+        default_model: str = "GigaChat-2-Pro",
+    ) -> None:
         self._client = client
-        self._max_context = max_context
+        self._max_context_override = max_context
+        self._default_model = default_model
 
     # --- delegation to GigaClient --------------------------------------------
 
@@ -63,7 +90,7 @@ class GigaChatProvider:
     ) -> ChatResult:
         return await self._client.chat(
             model=model,
-            messages=messages,
+            messages=normalize_messages(messages),
             temperature=temperature,
             max_tokens=max_tokens,
             stream=stream,
@@ -90,7 +117,7 @@ class GigaChatProvider:
     ) -> StreamAccumulator:
         return self._client.stream_chat(
             model=model,
-            messages=messages,
+            messages=normalize_messages(messages),
             temperature=temperature,
             max_tokens=max_tokens,
             functions=functions,
@@ -102,13 +129,42 @@ class GigaChatProvider:
     async def aclose(self) -> None:
         await self._client.aclose()
 
+    # --- capabilities --------------------------------------------------------
+
+    def max_context_for(self, model: str | None = None) -> int:
+        """Context window for *model* (override → env → measured table)."""
+        return context_window_for(
+            model or self._default_model,
+            override=self._max_context_override,
+        )
+
     def capabilities(self) -> ProviderCapabilities:
         return ProviderCapabilities(
             streaming=True,
             function_calling=True,
-            max_context=self._max_context,
-            default_model="GigaChat-2-Pro",
+            max_context=self.max_context_for(self._default_model),
+            default_model=self._default_model,
         )
+
+    def capabilities_for(self, model: str) -> ProviderCapabilities:
+        """Capabilities with the window of the model actually being called."""
+        return ProviderCapabilities(
+            streaming=True,
+            function_calling=True,
+            max_context=self.max_context_for(model),
+            default_model=model,
+        )
+
+    def context_window_table(self) -> dict[str, int]:
+        """The measured model→window table (for UI / doctor output)."""
+        from gigaforge.providers.context_windows import context_window_table
+
+        return context_window_table()
+
+    @staticmethod
+    def normalize_model(model: str) -> str:
+        """Expose the ID normalisation used for table lookups."""
+        return normalize_model_id(model)
 
     @property
     def client(self) -> GigaClient:
