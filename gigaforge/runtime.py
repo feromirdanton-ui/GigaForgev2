@@ -421,6 +421,15 @@ class Runtime:
 
         workspace = GoalWorkspace(destination, goal_id)
         workspace_root = workspace.prepare(resume=resume)
+        # Telemetry must outlive the workspace.  ``isolate_storage=True`` anchored
+        # the run's database and trace to ``workspace_root``, and
+        # ``cleanup_project_copy()`` deletes that directory after publication —
+        # so every goal run wrote its runs/node_runs/metrics into a file that was
+        # then removed.  Measured: a completed goal with 6 model calls and 5995
+        # tokens left ``runs`` empty, and ``gigaforge ui`` printed "no run",
+        # "accepted=no" and 0/11 steps while showing the correct token count from
+        # the trace.  The workspace is scratch; the record of what happened is not.
+        telemetry_root = destination
         isolated_runtime = build_runtime(
             settings=self.settings,
             core_config=self.core_config,
@@ -431,6 +440,7 @@ class Runtime:
             repo_root=workspace_root,
             probe_models=False,
             isolate_storage=True,
+            telemetry_root=telemetry_root,
         )
         if not isolated_runtime.can_run:
             isolated_runtime.aclose()
@@ -753,6 +763,7 @@ def build_runtime(
     metrics: Optional[MetricsCollector] = None,
     probe_models: bool = True,
     isolate_storage: bool = False,
+    telemetry_root: Optional[str | Path] = None,
 ) -> Runtime:
     """Assemble the runtime.  Never touches the network; may build offline.
 
@@ -775,10 +786,15 @@ def build_runtime(
 
         root_path = Path(repo_root).resolve()
         overrides: Dict[str, Any] = {"repo_root": str(root_path)}
+        # Where the run's record lives.  Defaults to the repository, but a goal
+        # run passes the *destination*: its repository is a scratch copy that is
+        # deleted after publication, and telemetry written there is deleted with
+        # it.
+        sink_root = Path(telemetry_root).resolve() if telemetry_root else root_path
         if isolate_storage or not _os.environ.get("GIGAFORGE_DB_PATH"):
-            overrides["db_path"] = str(root_path / ".gigaforge" / "core.sqlite3")
+            overrides["db_path"] = str(sink_root / ".gigaforge" / "core.sqlite3")
         if isolate_storage or not _os.environ.get("GIGAFORGE_TRACE_DIR"):
-            overrides["trace_path"] = str(root_path / ".gigaforge" / "traces" / "core.jsonl")
+            overrides["trace_path"] = str(sink_root / ".gigaforge" / "traces" / "core.jsonl")
         if isolate_storage:
             overrides["subagents"] = dataclasses.replace(
                 cfg.subagents,
