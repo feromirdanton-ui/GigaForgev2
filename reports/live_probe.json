@@ -1,5 +1,5 @@
 {
-  "started_at": 1795155163.8040447,
+  "started_at": 1795155378.7142217,
   "credentials_present": true,
   "model": "GigaChat",
   "ok": true,
@@ -9,7 +9,7 @@
     {
       "name": "atokens_count",
       "ok": true,
-      "latency_ms": 1614,
+      "latency_ms": 2001,
       "detail": {
         "short": 8,
         "long": 208
@@ -19,7 +19,7 @@
     {
       "name": "response_format",
       "ok": true,
-      "latency_ms": 447,
+      "latency_ms": 485,
       "detail": {
         "parsed": true,
         "head": "{\"steps\": [{\"tool\": \"grep\"}]}",
@@ -34,7 +34,7 @@
     {
       "name": "context_overflow",
       "ok": true,
-      "latency_ms": 569,
+      "latency_ms": 198,
       "detail": {
         "recognised_as_overflow": true
       },
@@ -43,9 +43,10 @@
     {
       "name": "rate_limit",
       "ok": true,
-      "latency_ms": 1765,
+      "latency_ms": 1817,
       "detail": {
         "errors": [
+          "RateLimitError",
           "RateLimitError"
         ],
         "saw_429": true,
@@ -57,10 +58,10 @@
     {
       "name": "react_plan",
       "ok": true,
-      "latency_ms": 6270,
+      "latency_ms": 5068,
       "detail": {
         "strategy": "react",
-        "steps": 1,
+        "steps": 2,
         "first_step": "edit_function: react.py",
         "llm_calls": null
       },
@@ -69,7 +70,7 @@
     {
       "name": "checkpointer",
       "ok": true,
-      "latency_ms": 4691,
+      "latency_ms": 3749,
       "detail": {
         "checkpoints": 6,
         "db_bytes": 57344,

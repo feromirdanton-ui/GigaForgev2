@@ -693,6 +693,9 @@ class ReActPlan:
         #: ``TaskState`` carries the DAG's own ``run_id`` instead of a
         #: synthetic one.  A separate id would split one run's trace in two.
         self._run_id = ""
+        #: The runner built for the current ``plan`` call, kept so the plan
+        #: guard can read its real tool registry.
+        self._last_runner: Any = None
 
     def bind_run(self, run_id: str) -> None:
         """Attach the current run id (called by the pipeline before ``plan``)."""
@@ -741,6 +744,8 @@ class ReActPlan:
         if runner is None:
             # No exploration capability wired in: fall back to the one-shot plan.
             return self._linear(goal, slice_text, ask=ask, parse=parse)
+        # Kept so the plan guard can read the runner's real tool registry.
+        self._last_runner = runner
 
         from gigaforge.agents.engine import run_react
 
@@ -762,6 +767,23 @@ class ReActPlan:
             # The loop explored but never produced a plan: the slice-based plan
             # is still better than an empty one.
             return self._linear(goal, slice_text, ask=ask, parse=parse)
+        # Validate before the DAG executes it.  A live run produced
+        # ``edit_function: react.py`` \u2014 a step naming the file the episode had
+        # been reading, with no symbol and no verification \u2014 and the pipeline
+        # ran it.  The guard is deterministic and model-free, so it costs
+        # nothing and cannot drift.
+        from gigaforge.harness.plan_guard import validate_plan
+
+        verdict = validate_plan(
+            getattr(result, "plan", None) or [],
+            known_tools=self._known_tools(),
+        )
+        if verdict.changed:
+            log.info("plan guard adjusted the ReAct plan: %s", verdict.to_dict())
+            steps = [_describe_plan_step(step) for step in verdict.steps]
+            steps = [step for step in steps if step]
+            if not steps:
+                return self._linear(goal, slice_text, ask=ask, parse=parse)
         return PlanOutcome(
             steps=steps,
             strategy=self.name,
@@ -772,8 +794,28 @@ class ReActPlan:
                 "score": score_steps(steps),
                 "finish_reason": getattr(result, "finish_reason", ""),
                 "llm_calls": getattr(result, "llm_calls", 0),
+                "plan_guard": verdict.to_dict(),
             }],
         )
+
+    def _known_tools(self) -> set[str]:
+        """Tools the pipeline can actually run, for the plan guard.
+
+        Read from the runner's registry when there is one; otherwise fall back
+        to the DAG's own step vocabulary, which is what the plan is rendered
+        into anyway.
+        """
+        runner = getattr(self, "_last_runner", None)
+        registry = getattr(runner, "_registry", None) if runner is not None else None
+        names = getattr(registry, "names", None)
+        if callable(names):
+            try:
+                found = {str(n) for n in names()}
+            except Exception:  # noqa: BLE001 - a broken registry is not fatal
+                found = set()
+            if found:
+                return found | {"tests", "lint", "reviewer", "coder", "edit_function"}
+        return {"tests", "lint", "reviewer", "coder", "edit_function", "read_structure", "grep"}
 
     def plan_under_harness(
         self,
