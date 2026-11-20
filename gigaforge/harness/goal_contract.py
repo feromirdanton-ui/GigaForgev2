@@ -446,6 +446,20 @@ def requirements_from_plan(plan: Any) -> list[Requirement]:
                 ("feature-card", "feature-item", "card"),
             )
         )
+    # A page has one footer and one header.  Measured live: a page assembled
+    # from three sections carried **two** ``<div class="footer">`` blocks — the
+    # footer child's, and a second the model added while "finishing" the page.
+    # The contract passed it, because nothing checked landmarks: the duplicate
+    # check compares content, and the two footers had different text.
+    for role in ("footer", "header"):
+        if role in kinds:
+            reqs.append(
+                Requirement(
+                    "singleton",
+                    f"exactly one {role} on the page",
+                    (role,),
+                )
+            )
     return reqs
 
 
@@ -525,6 +539,26 @@ def check_artifacts(
                 verdict.met.append(req.label)
             else:
                 verdict.unmet.append(f"{req.label} — no non-empty <h1> in the page")
+            continue
+        if req.kind == "singleton":
+            # Count the role, not the content: ``<footer>`` and
+            # ``<div class="footer">`` are the same landmark, and the two
+            # footers a live run produced had different text.
+            role = req.needles[0]
+            worst = 0
+            for text in texts.values():
+                count = len(re.findall(rf"<{role}\b", text, re.I))
+                count += len(re.findall(
+                    rf'<[a-z][a-z0-9]*\b[^>]*\bclass\s*=\s*["\'][^"\']*\b{role}\b',
+                    text, re.I,
+                ))
+                worst = max(worst, count)
+            if worst <= 1:
+                verdict.met.append(req.label)
+            else:
+                verdict.unmet.append(
+                    f"{req.label} (found {worst} {role} landmarks)"
+                )
             continue
         if req.kind == "card_count":
             # Count the cards in the markup, accepting every spelling a child

@@ -136,6 +136,36 @@ def _named_paths(goal: str) -> list[str]:
     return out
 
 
+def _tracked_in_head(root: Path, rel: str) -> bool | None:
+    """Is *rel* part of the repository's committed state?
+
+    ``None`` when the question cannot be answered (not a git repo, no git
+    binary) — the caller then falls back to the working tree.
+
+    **Why HEAD and not the working tree.**  A goal loop runs several cycles
+    against the same tree, and cycle 1 writes the page.  On cycle 2 the file
+    exists on disk, so a working-tree check says "this path exists → code work"
+    and the run stops generating sections — measured live: cycle 1 built a page
+    section by section, cycle 2 re-classified the goal as code and the model
+    rewrote the whole file in one answer, losing the grid and the palette.  The
+    question the routing asks is "is this path part of the repository the user
+    gave me", and the answer to that is the committed state, not the run's own
+    scratch output.
+    """
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            ["git", "-C", str(root), "ls-tree", "-r", "--name-only", "HEAD", "--", rel],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return bool(result.stdout.strip())
+
+
 def classify_task(goal: str, repo_root: Path | str | None = None) -> TaskKind:
     """Decide what kind of work *goal* asks for, from the filesystem.
 
@@ -143,6 +173,10 @@ def classify_task(goal: str, repo_root: Path | str | None = None) -> TaskKind:
     filesystem step is skipped and only the explicit page phrases can make a
     goal an artifact goal — which is the conservative direction: without a tree
     to check, the harness does not invent an artifact.
+
+    "Exists" means *committed*: see :func:`_tracked_in_head`.  A file the run
+    itself wrote in an earlier cycle is not evidence that the goal is a code
+    change.
     """
     root = Path(repo_root) if repo_root is not None else None
     named = _named_paths(goal or "")
@@ -153,11 +187,16 @@ def classify_task(goal: str, repo_root: Path | str | None = None) -> TaskKind:
 
     for rel in named:
         suffix = Path(rel).suffix.lower()
-        exists = bool(root is not None and (root / rel).is_file())
+        tracked = _tracked_in_head(root, rel) if root is not None else None
+        if tracked is None:
+            exists = bool(root is not None and (root / rel).is_file())
+        else:
+            exists = tracked
         if exists:
             code_paths.append(rel)
         elif suffix in _ARTIFACT_SUFFIXES:
-            # An artifact path that is not there: the run is asked to create it.
+            # An artifact path that is not in the repository: the run is asked
+            # to create it.
             artifact_paths.append(rel)
         elif root is not None:
             # A code path that is not there is still code work (a new module).

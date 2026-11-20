@@ -289,6 +289,80 @@ def duplicate_blocks(html: str) -> list[tuple[str, int]]:
     return found
 
 
+#: Landmark roles that may appear at most once on a page.  Two of them is not a
+#: style choice, it is a defect — and it is the defect a section-by-section
+#: generator produces when two children both decide to close the page.
+_SINGLETON_ROLES = ("footer", "header", "main")
+
+
+def _landmark_spans(html: str, role: str) -> list[tuple[int, int]]:
+    """Spans of every element that plays *role* — by tag name or class token.
+
+    ``<footer>`` and ``<div class="footer">`` are the same landmark.  The span
+    covers the whole element, found by matching the opening tag to its closing
+    tag with a depth counter, so removing it does not leave a dangling ``</div>``
+    behind.  A self-closing or unclosed element yields a span to the end of the
+    document, which is the honest reading of malformed markup.
+    """
+    spans: list[tuple[int, int]] = []
+    pattern = re.compile(
+        rf"<(?P<tag>[a-z][a-z0-9]*)\b(?P<attrs>[^>]*)>",
+        re.I,
+    )
+    for match in pattern.finditer(html):
+        tag = match.group("tag").lower()
+        attrs = match.group("attrs") or ""
+        is_role = tag == role or bool(
+            re.search(rf'\bclass\s*=\s*["\'][^"\']*\b{re.escape(role)}\b', attrs, re.I)
+        )
+        if not is_role:
+            continue
+        if attrs.rstrip().endswith("/"):
+            spans.append((match.start(), match.end()))
+            continue
+        depth = 1
+        cursor = match.end()
+        close = re.compile(rf"</?{re.escape(tag)}\b[^>]*>", re.I)
+        while depth and cursor < len(html):
+            step = close.search(html, cursor)
+            if step is None:
+                cursor = len(html)
+                break
+            if step.group(0).startswith("</"):
+                depth -= 1
+            else:
+                depth += 1
+            cursor = step.end()
+        spans.append((match.start(), cursor))
+    return spans
+
+
+def duplicate_landmarks(html: str) -> list[tuple[str, int]]:
+    """``(role, count)`` for landmark roles that appear more than once.
+
+    Measured live: a page assembled from three sections had **two**
+    ``<div class="footer">`` blocks — one from the footer child, one the model
+    added while "finishing" the page.  ``duplicate_blocks`` did not see it: the
+    two blocks had different text, so they were not identical, and the tag was
+    ``div``, which is not in ``_BLOCK_TAGS`` at all.
+
+    A page has one footer.  The check is on the *role* — the tag name or a class
+    token — not on the content, because the content is exactly what differs.
+    """
+    found: list[tuple[str, int]] = []
+    for role in _SINGLETON_ROLES:
+        count = 0
+        # ``<footer>`` and ``<div class="footer">`` are the same role.
+        count += len(re.findall(rf"<{role}\b", html, re.I))
+        count += len(re.findall(
+            rf'<[a-z][a-z0-9]*\b[^>]*\bclass\s*=\s*["\'][^"\']*\b{role}\b[^"\']*["\']',
+            html, re.I,
+        ))
+        if count > 1:
+            found.append((role, count))
+    return found
+
+
 def duplicate_style_blocks(html: str) -> int:
     """How many ``<style>`` blocks repeat content already present."""
     seen: set[str] = set()
@@ -311,6 +385,7 @@ class StructureReport:
     duplicate_blocks: list[tuple[str, int]] = field(default_factory=list)
     duplicate_styles: int = 0
     stray_style_tags: int = 0
+    duplicate_landmarks: list[tuple[str, int]] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -319,6 +394,7 @@ class StructureReport:
             or self.duplicate_blocks
             or self.duplicate_styles
             or self.stray_style_tags
+            or self.duplicate_landmarks
         )
 
     def issues(self) -> list[str]:
@@ -335,6 +411,10 @@ class StructureReport:
             out.append(f"{self.duplicate_styles} duplicate <style> block(s)")
         for tag, count in self.duplicate_blocks:
             out.append(f"<{tag}> emitted {count} times with identical content")
+        for role, count in self.duplicate_landmarks:
+            out.append(
+                f"{count} {role} landmarks on one page — a page has one {role}"
+            )
         return out
 
 
@@ -348,6 +428,7 @@ def audit_html_structure(html: str) -> StructureReport:
         duplicate_blocks=duplicate_blocks(html),
         duplicate_styles=duplicate_style_blocks(html),
         stray_style_tags=stray,
+        duplicate_landmarks=duplicate_landmarks(html),
     )
 
 
@@ -463,5 +544,22 @@ def repair_html_structure(html: str) -> tuple[str, list[str]]:
         if spans:
             out = _remove_spans(out, spans)
             actions.append(f"removed {len(spans)} duplicate <{tag}> block(s)")
+
+    # 5. Duplicate landmarks.  A page has one footer and one header; a second
+    # one is the section-by-section generator's characteristic defect (two
+    # children both closing the page).  The *first* one is kept: the assembler
+    # writes the sections in plan order, so the first footer is the one the
+    # footer child produced and the later one is whatever was appended after it.
+    # Measured live: a page carried two <div class="footer"> blocks and the
+    # contract passed it, because the duplicate check compares content and the
+    # two footers had different text.
+    for role in _SINGLETON_ROLES:
+        spans = _landmark_spans(out, role)
+        if len(spans) > 1:
+            drop = spans[1:]
+            out = _remove_spans(out, drop)
+            actions.append(
+                f"removed {len(drop)} duplicate {role} landmark(s), kept the first"
+            )
 
     return out, actions
