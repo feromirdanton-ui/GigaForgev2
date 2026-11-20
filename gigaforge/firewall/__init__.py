@@ -25,8 +25,21 @@ Typical use::
 
 from __future__ import annotations
 
-from typing import Any, Optional, Sequence
+from collections.abc import Sequence
+from typing import Any, Optional
 
+from gigaforge.firewall.compressors import (
+    BuildErrCompressor,
+)
+from gigaforge.firewall.compressors import (
+    GitDiffCompressor as GitDiffCompressorOld,
+)
+from gigaforge.firewall.compressors import (
+    GrepCompressor as GrepCompressorOld,
+)
+from gigaforge.firewall.compressors import (
+    PytestCompressor as PytestCompressorOld,
+)
 from gigaforge.l0.store import L0Store
 
 from .compress import (
@@ -36,16 +49,12 @@ from .compress import (
     GitDiffCompressor,
     GrepCompressor,
     PytestCompressor,
-    compress as compress_m5,
     compress_auto,
     passthrough,
     sniff,
 )
-from gigaforge.firewall.compressors import (
-    BuildErrCompressor,
-    GitDiffCompressor as GitDiffCompressorOld,
-    GrepCompressor as GrepCompressorOld,
-    PytestCompressor as PytestCompressorOld,
+from .compress import (
+    compress as compress_m5,
 )
 
 COMPRESSORS: dict[str, Any] = {
@@ -59,7 +68,7 @@ COMPRESSORS: dict[str, Any] = {
 def compress(
     arg1: str,
     arg2: str = "",
-    config: Optional[FirewallConfig] = None,
+    config: FirewallConfig | None = None,
     *,
     limit_tokens: int = 4000,
     **kwargs: Any,
@@ -122,8 +131,8 @@ from .config import (
     FirewallConfig,
 )
 from .diff import (
-    ApplyResult,
     Applier,
+    ApplyResult,
     DiffFile,
     Hunk,
     MatchResult,
@@ -173,11 +182,11 @@ class ContextFirewall:
 
     def __init__(
         self,
-        store: Optional[L0Store] = None,
+        store: L0Store | None = None,
         *,
-        config: Optional[FirewallConfig] = None,
-        slicer: Optional[ContextSlicer] = None,
-        validator: Optional[DiffValidator] = None,
+        config: FirewallConfig | None = None,
+        slicer: ContextSlicer | None = None,
+        validator: DiffValidator | None = None,
     ) -> None:
         self.store = store
         self.config = config or FirewallConfig()
@@ -216,9 +225,9 @@ class ContextFirewall:
         *,
         files: Sequence[str] = (),
         symbols: Sequence[str] = (),
-        budget_tokens: Optional[int] = None,
+        budget_tokens: int | None = None,
         focus_paths: Sequence[str] = (),
-        include_repo_map: Optional[bool] = None,
+        include_repo_map: bool | None = None,
     ) -> ContextSlice:
         """Assemble a deterministic context slice for ``task``."""
         return self.slicer.build(
@@ -244,7 +253,7 @@ class ContextFirewall:
         retry_fn: Any = None,
         task: str = "",
         dry_run: bool = False,
-        max_retries: Optional[int] = None,
+        max_retries: int | None = None,
     ) -> ValidationOutcome:
         """Apply and verify a diff, with the bounded repair loop."""
         return self.validator.validate(

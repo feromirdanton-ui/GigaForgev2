@@ -6,8 +6,6 @@ finish — instead of spending the whole step budget on reformat requests.
 """
 from __future__ import annotations
 
-import pytest
-
 from gigaforge.agents.fallback import (
     EXPLORE,
     FORCE_FINISH,

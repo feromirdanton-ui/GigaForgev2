@@ -17,8 +17,9 @@ This module owns the mechanics that are identical across compressors:
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Optional, Sequence, TypeVar
+from typing import Any, TypeVar
 
 T = TypeVar("T")
 
@@ -57,7 +58,7 @@ def clip(
     limit: int,
     *,
     marker: str = MARKER,
-    truncator: Optional[Truncator] = None,
+    truncator: Truncator | None = None,
 ) -> str:
     """Clip ``text`` to ``limit`` characters on a word-ish boundary.
 
@@ -89,9 +90,9 @@ def clip_multiline(
     max_lines: int,
     max_chars: int,
     *,
-    line_chars: Optional[int] = None,
+    line_chars: int | None = None,
     marker: str = MARKER,
-    truncator: Optional[Truncator] = None,
+    truncator: Truncator | None = None,
 ) -> str:
     """Clip a multi-line excerpt by line count and by total characters."""
     lines = text.splitlines()
@@ -109,7 +110,7 @@ def take(
     seq: Sequence[T],
     limit: int,
     *,
-    truncator: Optional[Truncator] = None,
+    truncator: Truncator | None = None,
 ) -> list[T]:
     """Return at most ``limit`` items, flagging when items were dropped."""
     if limit < 0:
@@ -238,8 +239,8 @@ def finalise(
     truncator: Truncator,
     *,
     chars_per_token: float = 4.0,
-    truncated_fields: Optional[Iterable[str]] = None,
-    meta: Optional[dict[str, Any]] = None,
+    truncated_fields: Iterable[str] | None = None,
+    meta: dict[str, Any] | None = None,
 ) -> CompressionResult:
     """Build the result envelope, computing the compressed size from ``data``."""
     payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
