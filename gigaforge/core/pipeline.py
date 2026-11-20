@@ -2020,6 +2020,28 @@ class TaskPipeline:
             ctx.state.bump("review_reject")
             for issue in outcome.issues[:5]:
                 ctx.state.add_note(f"review: {issue}")
+            # An advisory rejection is a *suggestion*, not a verdict.
+            #
+            # Measured live on a two-file bug fix: the diff was correct — both
+            # functions fixed, the repo's own tests passed — and the reviewer
+            # rejected it three cycles running for "the comment added in
+            # math_utils.py", "the comment '# Updated implementation'", and
+            # "the function signature for 'add'".  Every cycle was discarded and
+            # the run ended with the original bug.
+            #
+            # A model asked "is this good?" will always find something; that is
+            # what makes it useful as advice and useless as a gate.  The gate is
+            # the deterministic one — the validator, the constitution's hard
+            # principles, the goal contract — and it already ran.  So a
+            # model-only rejection is recorded, fed back to the coder as a note,
+            # and does not fail the run on its own.
+            if outcome.advisory:
+                ctx.state.bump("review_advisory")
+                self._event(
+                    "pipeline.review_advisory", run_id=ctx.run_id,
+                    issues=outcome.issues[:5],
+                )
+                return {"review_verdict": {**outcome.to_dict(), "verdict": "ok"}}
         else:
             ctx.state.bump("review_pass")
         self._event(

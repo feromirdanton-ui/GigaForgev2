@@ -387,6 +387,10 @@ class ReviewOutcome:
     strategy: str = "none"
     llm_used: bool = False
     principles: list[dict[str, Any]] = field(default_factory=list)
+    #: True when the verdict came from a model rather than a deterministic
+    #: check.  An advisory rejection is recorded and fed back to the coder, but
+    #: it does not by itself fail the run — see ``_node_review``.
+    advisory: bool = False
 
     @property
     def rejected(self) -> bool:
@@ -399,6 +403,7 @@ class ReviewOutcome:
             "issues": list(self.issues),
             "llm_used": self.llm_used,
             "principles": list(self.principles),
+            "advisory": self.advisory,
         }
 
 
@@ -556,7 +561,7 @@ class ConstitutionalReview:
             )
         return ReviewOutcome(
             verdict=verdict, issues=issues, strategy=self.name, llm_used=True,
-            principles=principles,
+            principles=principles, advisory=True,
         )
 
 
@@ -596,7 +601,10 @@ class LLMReview:
                 strategy=self.name,
                 llm_used=True,
             )
-        return ReviewOutcome(verdict=verdict, issues=issues, strategy=self.name, llm_used=True)
+        return ReviewOutcome(
+            verdict=verdict, issues=issues, strategy=self.name, llm_used=True,
+            advisory=True,
+        )
 
 
 def _parse_review_json(text: str) -> tuple[str | None, list[str]]:
