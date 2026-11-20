@@ -486,6 +486,15 @@ class TaskPipeline:
                 description="bounded repair loop when the proposal was rejected",
             ),
             NodeSpec(
+                name="repair",
+                fn=self._node_repair,
+                requires=("validation",),
+                provides=("repair_report",),
+                retries=0,
+                critical=False,
+                description="deterministic structural repair of generated HTML, before the contract",
+            ),
+            NodeSpec(
                 name="review",
                 fn=self._node_review,
                 # Reviews the diff that ``fix``/``act`` produced, so it must run
@@ -499,7 +508,7 @@ class TaskPipeline:
             NodeSpec(
                 name="settle",
                 fn=self._node_settle,
-                requires=("proposal", "validation", "fix_report", "review_verdict"),
+                requires=("proposal", "validation", "fix_report", "review_verdict", "repair_report"),
                 provides=("final_diff", "accepted", "changed_files"),
                 retries=0,
                 description="join node: pick the diff that won, then apply the review veto",
@@ -1324,7 +1333,7 @@ class TaskPipeline:
             newest = max(newest, stat.st_mtime_ns)
         return f"{len(files)}:{total}:{newest}"
 
-    def _episode_diff(self, ctx: RunContext) -> str:
+    def _episode_diff(self, ctx: RunContext, files: Sequence[str] | None = None) -> str:
         """Compute the diff for files the exploration episode wrote itself.
 
         The episode's ``write_file`` tool edits the worktree directly.  The
@@ -1338,8 +1347,14 @@ class TaskPipeline:
         The diff is computed, not asked for: ``git diff`` against HEAD, plus the
         untracked files the episode created.  Returns an empty string when the
         episode wrote nothing, so a run that never used the tool is unaffected.
+
+        ``files`` overrides the episode's own list.  The repair node uses it to
+        recompute the diff for a file it rewrote on disk: ``final_diff`` was
+        computed before the repair, so without this the run reports a page that
+        is not the page on disk.
         """
-        written = list(ctx.extras.get("episode_written_files") or [])
+        written = list(files if files is not None
+                       else (ctx.extras.get("episode_written_files") or []))
         if not written:
             return ""
         root = Path(str(getattr(self.config, "repo_root", ".") or ".")).resolve()
@@ -2123,9 +2138,74 @@ class TaskPipeline:
         )
         return {"review_verdict": outcome.to_dict()}
 
+    def _node_repair(self, ctx: RunContext, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Repair generated HTML structurally, before anything grades it.
+
+        **Why this is a node and not a step inside the contract.**  The repair
+        used to live at the top of ``_check_goal_contract``, after two early
+        returns::
+
+            requirements = extract_requirements(ctx.state.goal)
+            if not requirements:
+                return None          # ← repair never ran
+            files = [...]
+            if not files:
+                return None          # ← nor here
+            self._repair_html_artifacts(ctx, files)
+
+        ``extract_requirements`` returns **zero** requirements for "Create a
+        single-file index.html", "Build a landing page" and "Make a website for
+        my bakery" — three of the four ordinary ways to ask for a page.  So the
+        repair was unreachable for exactly the goals that need it, and a broken
+        page passed.  A repair that only runs when a *different* check happens
+        to have something to say is not a repair, it is a coincidence.
+
+        As its own node it runs for every run that changed an ``.html`` file,
+        whether or not the goal produced requirements, and it runs before the
+        contract so the contract grades the page a browser will render.
+
+        It also recomputes ``final_diff``: the diff was computed from the
+        pre-repair file, so without this the run reports a page that is not the
+        page on disk — measured, ``final_diff`` had 4 sections where the tree
+        had 1.
+        """
+        validation = inputs.get("validation")
+        changed = list(dict.fromkeys(
+            str(p) for p in (getattr(validation, "changed_files", []) or []) if str(p).strip()
+        ))
+        if not changed:
+            return {"repair_report": {"files": [], "actions": []}}
+        before = len(ctx.extras.get("html_repairs") or [])
+        self._repair_html_artifacts(ctx, changed)
+        repairs = list(ctx.extras.get("html_repairs") or [])[before:]
+        if not repairs:
+            return {"repair_report": {"files": [], "actions": []}}
+
+        # The tree changed under the diff.  Recompute it from the worktree so
+        # every consumer of ``final_diff`` — summary, cache, report, persist —
+        # sees the file that is actually there.
+        repaired_files = [str(item.get("file")) for item in repairs if item.get("file")]
+        recomputed = self._episode_diff(ctx, repaired_files)
+        if recomputed:
+            ctx.extras["repaired_diff"] = recomputed
+            self._event("pipeline.repair_diff_recomputed", run_id=ctx.run_id,
+                        files=len(repaired_files), chars=len(recomputed))
+        return {"repair_report": {
+            "files": repaired_files,
+            "actions": [a for item in repairs for a in (item.get("actions") or [])],
+        }}
+
     def _node_settle(self, ctx: RunContext, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
         validation = inputs.get("validation")
         final = self._winning_diff(inputs)
+        # The repair node rewrote files on disk after the diff was computed.
+        # ``final_diff`` must describe the tree that exists, not the tree that
+        # existed before the repair — measured, the diff had 4 sections where
+        # the file had 1, and every consumer of the diff (summary, cache,
+        # report, persist) was reading a page nobody would ever see.
+        repaired = str(ctx.extras.get("repaired_diff") or "")
+        if repaired:
+            final = _merge_repaired_diff(final, repaired)
         validated = bool(validation and validation.accepted)
         verdict = inputs.get("review_verdict") or {}
         review_rejected = str((verdict or {}).get("verdict") or "ok") == "reject"
@@ -2216,7 +2296,11 @@ class TaskPipeline:
             files = [str(p) for p in changed if str(p).strip()]
             if not files:
                 return None
-            self._repair_html_artifacts(ctx, files)
+            # The repair is NOT done here.  It used to be, after these two early
+            # returns — and ``extract_requirements`` returns nothing for "Create
+            # a single-file index.html", so the repair never ran for the goals
+            # that need it.  It is its own node now (``_node_repair``), which
+            # runs before this check for every run that changed an .html file.
             return check_artifacts(requirements, self._repo_root(), files=files)
         except Exception as exc:  # noqa: BLE001 - a broken check must not fail a run
             self._event("pipeline.contract_error", run_id=ctx.run_id,
@@ -2779,6 +2863,43 @@ def _parse_plan(text: str) -> list[str]:
         if stripped:
             steps.append(stripped)
     return steps[:24]
+
+
+def _merge_repaired_diff(original: str, repaired: str) -> str:
+    """Replace the per-file hunks of *original* with the ones in *repaired*.
+
+    The repair node recomputes a diff for the files it rewrote.  Those files
+    must come from the recomputed diff — it is the only one that matches the
+    tree — while every other file keeps the hunk the run already produced.
+
+    A file is identified by its ``diff --git a/X b/X`` header.  When the
+    original has no hunk for a file (the repair created it), the recomputed
+    hunk is appended.
+    """
+    if not repaired:
+        return original
+    if not original:
+        return repaired
+
+    def split(diff: str) -> dict[str, str]:
+        chunks: dict[str, str] = {}
+        current: list[str] = []
+        key = ""
+        for line in diff.splitlines(keepends=True):
+            if line.startswith("diff --git "):
+                if key:
+                    chunks[key] = "".join(current)
+                key = line.strip()
+                current = [line]
+            elif key:
+                current.append(line)
+        if key:
+            chunks[key] = "".join(current)
+        return chunks
+
+    merged = split(original)
+    merged.update(split(repaired))
+    return "".join(merged.values())
 
 
 def _original_goal(goal: str) -> str:
