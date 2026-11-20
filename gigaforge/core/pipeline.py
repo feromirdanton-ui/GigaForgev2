@@ -2396,6 +2396,17 @@ class TaskPipeline:
         if render_unmet:
             accepted = False
             ctx.extras["contract_unmet"] = list(ctx.extras.get("contract_unmet") or []) + render_unmet
+        # A code change is graded by a contract too.  "The tests passed" is both
+        # too weak (a diff that touches files the goal never named, or deletes a
+        # public function, passes as long as some test is green) and too strong
+        # (a correct change the tests do not cover is rejected for a reason that
+        # has nothing to do with the change).  The four facts a code change can
+        # be held to without guessing are the files it touched, the tests, the
+        # linter, and the public symbols it kept.
+        code_unmet = self._check_code_contract(ctx, changed)
+        if code_unmet:
+            accepted = False
+            ctx.extras["contract_unmet"] = list(ctx.extras.get("contract_unmet") or []) + code_unmet
         # A partial fan-out cannot settle as accepted.  The accepted children's
         # work is kept — it is already in the tree — but the run is not done,
         # and the goal loop must spend another cycle on what is left.  Measured:
@@ -2430,6 +2441,53 @@ class TaskPipeline:
                     diff_chars=len(final), files=len(changed),
                     reviewed=bool(verdict), review_rejected=review_rejected)
         return {"final_diff": final, "accepted": accepted, "changed_files": changed}
+
+    def _check_code_contract(self, ctx: RunContext, changed: Sequence[str]) -> list[str]:
+        """Grade a code change: files, tests, linter, public symbols.
+
+        Only for code goals.  An artifact goal has its own contract (the plan's
+        sections, the palette, the render) and holding a page to a Python
+        symbol check would be a check of something the run never claimed.
+
+        The "before" content comes from the run's own baseline: the worktree is
+        a copy of the repository, so ``git show HEAD:path`` is what the file
+        looked like when the run started.  Without it the public-symbol check
+        cannot tell a removal from a rename.
+        """
+        kind = ctx.extras.get("task_kind") or {}
+        if kind.get("kind") not in ("code", "mixed"):
+            return []
+        try:
+            from gigaforge.harness.code_contract import CodeContract, check_code_contract
+        except Exception as exc:  # noqa: BLE001 - an optional module
+            self._degraded("code_contract_import", exc, "settle")
+            return []
+        allowed = tuple(kind.get("code_paths") or ())
+        before: dict[str, str] = {}
+        root = self._repo_root()
+        for path in changed:
+            if not str(path).endswith(".py"):
+                continue
+            try:
+                proc = subprocess.run(
+                    ["git", "show", f"HEAD:{path}"], cwd=root,
+                    capture_output=True, text=True, timeout=20,
+                )
+            except Exception:  # noqa: BLE001 - no git, no baseline
+                continue
+            if proc.returncode == 0:
+                before[str(path)] = proc.stdout
+        verdict = check_code_contract(
+            CodeContract(allowed_paths=allowed),
+            root,
+            changed=changed,
+            before=before,
+        )
+        ctx.extras["code_contract"] = verdict.to_dict()
+        self._event("pipeline.code_contract", run_id=ctx.run_id,
+                    ok=verdict.ok, unmet=verdict.unmet[:4],
+                    not_checked=verdict.not_checked[:4])
+        return [f"code: {item}" for item in verdict.unmet]
 
     def _check_render(self, ctx: RunContext, changed: Sequence[str]) -> list[str]:
         """Render the page the run wrote and return what a browser disagrees with.
