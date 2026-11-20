@@ -26,7 +26,7 @@ silently rewrote the prompt would make a run unreproducible.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Optional, Sequence
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 from gigaforge.providers.context_windows import (
     DEFAULT_CONTEXT_WINDOW,
@@ -140,6 +140,11 @@ class ContextWindowGuard:
     trigger_fraction: float = DEFAULT_TRIGGER_FRACTION
     minimum_messages: int = DEFAULT_MINIMUM_MESSAGES
     chars_per_token: float = 4.0
+    #: Optional server-side counter (``Provider.count_tokens``).  When set, the
+    #: guard asks the provider for the real count instead of estimating from
+    #: characters.  It is a callable so the guard stays a pure dataclass and a
+    #: test can inject a stub; a failure falls back to the estimate.
+    token_counter: Optional[Callable[[Sequence[Any], Any], Optional[int]]] = None
 
     def __post_init__(self) -> None:
         if self.context_window is not None and self.context_window <= 0:
@@ -158,6 +163,27 @@ class ContextWindowGuard:
     def trigger_tokens_for(self, model: Any = None) -> int:
         return int(self.window_for(model) * self.trigger_fraction)
 
+    def count_tokens(
+        self,
+        messages: Sequence[Any],
+        model: Any = None,
+    ) -> int:
+        """Token count for *messages*: server-side when available, else estimate.
+
+        The server count is the real number the provider will bill; the char/4
+        estimate is the fallback for transports that cannot count (the legacy
+        client) and for a counter that fails.  Returning one number either way
+        keeps every caller free of branching.
+        """
+        if self.token_counter is not None:
+            try:
+                counted = self.token_counter(messages, model)
+            except Exception:  # noqa: BLE001 - counting is an optimisation
+                counted = None
+            if counted is not None and counted >= 0:
+                return int(counted)
+        return estimate_message_tokens(messages, chars_per_token=self.chars_per_token)
+
     # -- the check -----------------------------------------------------------
     def check(
         self,
@@ -166,13 +192,13 @@ class ContextWindowGuard:
         model: Any = None,
         already_compacted: bool = False,
     ) -> int:
-        """Return the estimated token count, raising if compaction is due.
+        """Return the token count, raising if compaction is due.
 
         ``already_compacted=True`` suppresses the proactive raise: the caller
         has just summarised and is retrying, and a second overflow from that
         retry would escape its own handler.
         """
-        estimated = estimate_message_tokens(messages, chars_per_token=self.chars_per_token)
+        estimated = self.count_tokens(messages, model)
         if already_compacted or len(messages) < self.minimum_messages:
             return estimated
         window = self.window_for(model)

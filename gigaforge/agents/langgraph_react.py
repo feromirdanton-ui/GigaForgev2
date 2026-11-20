@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Annotated, Any, Callable, Mapping, Optional, TypedDict
+from typing import Annotated, Any, Callable, Mapping, Optional, Sequence, TypedDict
 
 from gigaforge.core.context_window_guard import ContextOverflowError, ContextWindowGuard
 from gigaforge.core.loop_breaker import LoopBreaker
@@ -150,6 +150,35 @@ def _breaker_view(
     return view
 
 
+def _server_token_counter(runner: Any) -> Optional[Callable[[Sequence[Any], Any], Optional[int]]]:
+    """A guard counter backed by the provider's server-side ``count_tokens``.
+
+    The context guard used to estimate every request at ``len(text)/4`` even
+    when the transport could ask GigaChat for the real number.  This adapter
+    closes that gap: it calls ``Provider.count_tokens`` through the runner's
+    client, and returns ``None`` (so the guard keeps its estimate) when the
+    transport cannot count — the legacy client, or a failed call.
+
+    ``SyncChatClient`` is synchronous, so the counter is too: the guard runs
+    inside a graph node, and blocking there is exactly what the rest of the
+    node already does.
+    """
+    client = getattr(runner, "_client", None)
+    if client is None:
+        return None
+    counter = getattr(client, "count_tokens", None)
+    if not callable(counter):
+        return None
+
+    def _count(messages: Sequence[Any], model: Any) -> Optional[int]:
+        try:
+            return counter(list(messages), model=str(model or ""))
+        except Exception:  # noqa: BLE001 - counting is an optimisation
+            return None
+
+    return _count
+
+
 def build_react_graph(
     runner: ReActRunner,
     *,
@@ -170,7 +199,9 @@ def build_react_graph(
 
     if not runner.registry.names():
         runner.registry.install_defaults(sandbox=ctx.sandbox)
-    window_guard = guard or ContextWindowGuard()
+    window_guard = guard or ContextWindowGuard(
+        token_counter=_server_token_counter(runner)
+    )
     loop_breaker = breaker or LoopBreaker()
     # The same four ported guards the classic loop uses, so both engines behave
     # identically: tool contract, shell safety, specification audit, think tool.

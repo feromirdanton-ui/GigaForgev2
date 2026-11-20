@@ -196,6 +196,29 @@ class SyncChatClient:
     def list_models(self) -> List[Dict[str, Any]]:
         return await_blocking(self._provider.list_models(), timeout=self._timeout)
 
+    def count_tokens(
+        self,
+        messages: Sequence[Any],
+        *,
+        model: str = "",
+    ) -> Optional[int]:
+        """Server-side token count, or ``None`` when the transport cannot count.
+
+        The context guard calls this to replace its char/4 estimate with the
+        real number.  A provider without ``count_tokens`` (the legacy client)
+        returns ``None`` and the guard keeps its estimate.
+        """
+        counter = getattr(self._provider, "count_tokens", None)
+        if not callable(counter):
+            return None
+        payload: List[Dict[str, Any]] = [_as_message(m) for m in messages]
+        try:
+            return await_blocking(
+                counter(payload, model=model), timeout=self._timeout
+            )
+        except Exception:  # noqa: BLE001 - counting is an optimisation
+            return None
+
     # -- closing -----------------------------------------------------------
     def aclose(self) -> None:
         """Close the underlying provider, then retire the shared loop."""
