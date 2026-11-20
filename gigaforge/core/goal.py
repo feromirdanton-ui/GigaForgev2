@@ -48,6 +48,11 @@ _SENSITIVE_OUTPUT = re.compile(
 )
 _PRUNE_DIRS = {".git", ".hg", ".svn", ".venv", "venv", "node_modules", "__pycache__", ".gigaforge"}
 
+#: How many times a throttled cycle is retried before the goal reports that the
+#: provider, not the work, is the problem.  Three retries with 5/10/20s backoff
+#: covers a short quota window without hanging a run for minutes.
+_MAX_TRANSIENT_RETRIES = 3
+
 
 @dataclass
 class VerificationCheck:
@@ -954,6 +959,7 @@ class GoalRunner:
                     return self._result(record)
                 self.store.save(record)
 
+        transient_retries = 0
         for _ in range(max_cycles):
             if cancel.cancelled:
                 self._set_status(record, "cancelled", error=cancel.reason or "cancelled")
@@ -1045,6 +1051,42 @@ class GoalRunner:
                 )
             elif not error:
                 error = self._pipeline_feedback(result)
+
+            # A provider that is throttling us has not judged the work.  Measured
+            # live: two runs in parallel exhausted the quota, every cycle failed
+            # with GF-RATE-429, and the goal burned all three cycles in under a
+            # minute and reported "cycle limit reached before verification
+            # passed" — a statement about the work that was really a statement
+            # about the quota.  A transient failure waits and retries the same
+            # cycle; it does not consume one.
+            if not accepted and _is_transient_provider_error(error):
+                if transient_retries < _MAX_TRANSIENT_RETRIES:
+                    transient_retries += 1
+                    delay = min(60.0, 5.0 * (2 ** (transient_retries - 1)))
+                    self._emit_goal_event(
+                        "goal.rate_limited", node=f"Цикл {cycle_index} из {max_cycles}",
+                        status=f"Провайдер ограничил запросы, жду {delay:.0f}с",
+                        goal_id=goal_id, cycle_index=cycle_index,
+                        retry=transient_retries, delay_s=delay,
+                        summary=_safe_excerpt(error, limit=300),
+                    )
+                    record["active_run_id"] = ""
+                    record["active_cycle_index"] = 0
+                    self._set_status(record, "running", accepted=False, error=error)
+                    self.store.save(record)
+                    if _wait_or_cancel(cancel, delay):
+                        self._set_status(record, "cancelled", error=cancel.reason or "cancelled")
+                        break
+                    continue
+                self._set_status(
+                    record, "blocked", accepted=False,
+                    error=("the provider kept rate-limiting after "
+                           f"{_MAX_TRANSIENT_RETRIES} retries; the work was not judged: "
+                           + _safe_excerpt(error, limit=400)),
+                )
+                self.store.save(record)
+                break
+            transient_retries = 0
 
             cycle = GoalCycle(
                 index=cycle_index,
@@ -1266,6 +1308,49 @@ class GoalRunner:
             workspace_root=str(record.get("workspace_root") or ""),
             published_files=list(record.get("published_files") or []),
         )
+
+
+def _is_transient_provider_error(error: str) -> bool:
+    """True when the failure is the provider throttling us, not the work.
+
+    A 429 (or a 5xx from the gateway) says nothing about the artifact.  Treating
+    it as a failed cycle made a goal burn its whole cycle budget in under a
+    minute and then report "cycle limit reached before verification passed" —
+    a verdict on the work that was really a verdict on the quota.
+    """
+    low = (error or "").lower()
+    return any(
+        marker in low
+        for marker in (
+            "gf-rate-429",
+            "429",
+            "too many requests",
+            "rate limit",
+            "ratelimit",
+            "gf-upstream-5",
+            "502",
+            "503",
+            "504",
+            "service unavailable",
+            "temporarily unavailable",
+        )
+    )
+
+
+def _wait_or_cancel(cancel: Any, delay: float) -> bool:
+    """Sleep for *delay* seconds, returning True if the run was cancelled.
+
+    ``CancellationToken`` has no ``wait``; polling it in short slices keeps a
+    cancel responsive without adding a method to the token.
+    """
+    remaining = max(0.0, float(delay))
+    while remaining > 0:
+        if getattr(cancel, "cancelled", False):
+            return True
+        step = min(0.5, remaining)
+        time.sleep(step)
+        remaining -= step
+    return bool(getattr(cancel, "cancelled", False))
 
 
 def _safe_excerpt(value: str, *, limit: int = 900) -> str:

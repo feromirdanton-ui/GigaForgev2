@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import concurrent.futures as futures
 import hashlib
+import itertools
 import logging
 import os
 import shutil
@@ -94,6 +95,8 @@ class WorktreeManager:
         self.root = str(Path(root).resolve())
         self._created: dict[str, Worktree] = {}
         self._lock = threading.RLock()
+        #: Monotonic per-manager counter used to make branch names unique.
+        self._branch_seq = itertools.count(1)
 
     # ── git plumbing ─────────────────────────────────────────────────────────
     def _run(self, *args: str, cwd: Optional[str] = None) -> str:
@@ -195,7 +198,12 @@ class WorktreeManager:
         ``worktree_root`` so cleanup is a bounded operation.
         """
         safe = _slug(name)
-        branch_name = branch or f"gigaforge/{safe}-{int(time.time())}"
+        # ``int(time.time())`` gave two children spawned in the same second the
+        # same branch name, so ``git worktree add -b`` failed for the second one
+        # with "branch already exists" — a flaky fan-out that passed or failed
+        # depending on timing.  A per-call counter makes the name unique within
+        # the process, and the pid keeps two processes apart.
+        branch_name = branch or f"gigaforge/{safe}-{os.getpid()}-{next(self._branch_seq)}"
         path = os.path.join(self.root, safe)
         if not self.is_repo():
             return self._copy_fallback(name, path)

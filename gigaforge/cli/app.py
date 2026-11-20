@@ -262,7 +262,18 @@ def run(
     store = _store(repo)
     snapshot = _snapshot(store, run_id or None)
     if as_json:
-        _emit(R.render_json(snapshot), machine=True)
+        # ``--json`` is the machine-readable *result*, not the dashboard.
+        # It used to emit the UI snapshot, whose keys are ``run``/``kpis``/
+        # ``steps`` — so a caller reading ``status`` or ``accepted`` from
+        # ``run --json`` got ``None`` for both, and a script could not tell a
+        # successful run from a failed one.  The snapshot is still available,
+        # nested, for callers that want the telemetry.
+        payload = dict(report or {})
+        payload.setdefault("run_id", run_id)
+        payload.setdefault("status", str(getattr(result, "status", "") or ""))
+        payload.setdefault("accepted", bool(getattr(result, "accepted", False)))
+        payload["snapshot"] = snapshot
+        _emit(json.dumps(payload, indent=2, ensure_ascii=False, default=str), machine=True)
     elif dashboard:
         T.print_dashboard(snapshot, diff_lines=20)
 
