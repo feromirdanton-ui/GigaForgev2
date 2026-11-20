@@ -118,9 +118,22 @@ def _store(repo: Optional[Path] = None) -> UiStore:
         config = CoreConfig.from_env()
         if repo is not None:
             # Same resolution the runtime uses, so the two cannot disagree.
+            #
+            # ``db_path`` moves with ``trace_path``.  It used to move alone, so
+            # the store read the trace from the repository and the database from
+            # the process's working directory: measured, ``gigaforge run --repo
+            # /workspace/live/a2 --json`` finished with ``accepted: True`` and
+            # two files changed, and the snapshot it printed said
+            #
+            #     "status": "unknown", "accepted": false,
+            #     "totals": {"runs_recorded": 0, ...}
+            #
+            # because it was reading a different database.  A report that
+            # contradicts the run it is reporting on is worse than no report.
             config = replace(
                 config,
                 repo_root=str(repo),
+                db_path=str(Path(repo) / ".gigaforge" / "core.sqlite3"),
                 trace_path=str(Path(repo) / ".gigaforge" / "traces" / "core.jsonl"),
             )
         return UiStore.from_config(config)
