@@ -25,11 +25,12 @@ from pathlib import Path
 #: Colour words a goal may name, mapped to the CSS spellings that satisfy them.
 #:
 #: Only words that appear *in the goal* become requirements — this is not a
-#: style guide, it is a checklist of what the user said.
+#: style guide, it is a checklist of what the user said.  "neon" is deliberately
+#: absent: it is a style modifier ("neon cyan"), not a colour, and treating it as
+#: one let a page satisfy the contract by writing the word in prose.
 _COLOUR_WORDS: dict[str, tuple[str, ...]] = {
-    "cyan": ("cyan", "#0ff", "#00ffff", "aqua", "#0ff"),
+    "cyan": ("cyan", "#0ff", "#00ffff", "aqua"),
     "magenta": ("magenta", "#f0f", "#ff00ff", "fuchsia"),
-    "neon": ("neon", "text-shadow", "box-shadow", "drop-shadow"),
     "purple": ("purple", "#800080", "#a020f0", "#9d00ff"),
     "violet": ("violet", "#8a2be2", "#7f00ff"),
     "orange": ("orange", "#ffa500", "#ff7f00"),
@@ -40,6 +41,24 @@ _COLOUR_WORDS: dict[str, tuple[str, ...]] = {
     "pink": ("pink", "#ffc0cb", "#ff69b4"),
     "gold": ("gold", "#ffd700"),
 }
+
+#: A colour only counts when it sits in a CSS declaration, not in prose.  The
+#: live run produced a page whose only colours were #fff and #000, and the
+#: contract still passed "cyan" because the word appeared in a comment.
+_CSS_COLOUR_CONTEXT = (
+    "color",
+    "background",
+    "shadow",
+    "border",
+    "fill",
+    "stroke",
+    "outline",
+    "rgba(",
+    "rgb(",
+    "hsl(",
+    "hsla(",
+    "gradient",
+)
 
 #: Section words a goal may name, mapped to the markup that satisfies them.
 _SECTION_WORDS: dict[str, tuple[str, ...]] = {
@@ -84,6 +103,17 @@ class Requirement:
             return not re.search(r'(?:src|href)\s*=\s*["\']https?://', low)
         if self.kind == "min_size":
             return len(text) >= _MIN_ARTIFACT_BYTES
+        if self.kind == "colour":
+            # The colour must sit in a CSS declaration.  A page whose only
+            # colours are #fff and #000 satisfied "cyan" because the word
+            # appeared in a comment — the check has to look where colour is
+            # actually used, not anywhere in the document.
+            for line in low.splitlines():
+                if not any(n in line for n in self.needles):
+                    continue
+                if any(ctx in line for ctx in _CSS_COLOUR_CONTEXT):
+                    return True
+            return False
         return any(n in low for n in self.needles)
 
 
