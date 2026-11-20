@@ -485,9 +485,15 @@ def _default_css(accent: str, secondary: str) -> str:
            ``<div class="feature-grid">``, so the grid rules never applied:
            measured in headless Chromium, four cards laid out as
            ``684px 684px 0px 0px 0px`` — the third and fourth collapsed to zero
-           width and were invisible.  Both spellings are styled, because a child
-           may emit either. */
-        .features, .feature-grid, .features-grid {{
+           width and were invisible.
+
+           ``.features`` is excluded when it is a ``<section>``: the section is
+           the *wrapper* around the heading and the grid, so making it a grid
+           lays out two columns — the heading and the whole grid — which is the
+           same defect from the other side.  Measured after the first fix: the
+           section resolved to ``684px 684px`` and the cards were squeezed into
+           the second column. */
+        .feature-grid, .features-grid, .features:not(section) {{
             display: grid;
             gap: 1.5rem;
             grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));

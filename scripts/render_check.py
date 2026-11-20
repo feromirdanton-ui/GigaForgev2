@@ -20,7 +20,18 @@ PROBE = """
 () => {
   const cs = (el) => el ? getComputedStyle(el) : null;
   const h1 = document.querySelector('h1');
-  const grid = document.querySelector('.feature-grid, .features, [class*="grid"]');
+  const grid = (() => {
+    // The grid is the element that actually lays out as a grid, not merely the
+    // first element whose class mentions "grid" — a section wrapper can carry
+    // the class too, and reporting its columns says nothing about the cards.
+    const candidates = document.querySelectorAll(
+      '.feature-grid, .features-grid, .features, [class*="grid"]'
+    );
+    for (const el of candidates) {
+      if (getComputedStyle(el).display === 'grid') return el;
+    }
+    return candidates[0] || null;
+  })();
   const cards = document.querySelectorAll(
     '.feature-card, .feature-item, .card, [class*="card"]'
   );
