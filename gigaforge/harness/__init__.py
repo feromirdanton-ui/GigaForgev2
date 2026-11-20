@@ -31,8 +31,9 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, Sequence
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 
 from gigaforge.client.errors import (
     AuthError,
@@ -44,7 +45,6 @@ from gigaforge.client.errors import (
     ServerError,
 )
 from gigaforge.core.context_window_guard import ContextOverflowError
-from gigaforge.harness.compaction import compact_trajectory
 from gigaforge.harness.ledger import RunLedger
 
 __all__ = [
@@ -95,7 +95,7 @@ class HarnessResult:
     """What a harness run produced."""
 
     result: Any = None
-    ledger: Optional[RunLedger] = None
+    ledger: RunLedger | None = None
     finish_reason: str = FINISH_OK
     error: str = ""
     attempts: int = 0
@@ -155,7 +155,7 @@ def is_retryable(exc: BaseException) -> bool:
     return isinstance(exc, GigaForgeError)
 
 
-def _retry_after(exc: BaseException) -> Optional[float]:
+def _retry_after(exc: BaseException) -> float | None:
     """The server's ``Retry-After``, when the exception carries one."""
     for attr in ("retry_after", "retry_after_s"):
         value = getattr(exc, attr, None)
@@ -192,7 +192,7 @@ class Harness:
     def __init__(
         self,
         *,
-        policy: Optional[HarnessPolicy] = None,
+        policy: HarnessPolicy | None = None,
         tracer: Any = None,
         budgets: Any = None,
     ) -> None:
@@ -210,7 +210,7 @@ class Harness:
         ctx: Any = None,
         run_id: str = "",
         engine: str = "",
-        bootstrap_hint: Optional[str] = None,
+        bootstrap_hint: str | None = None,
     ) -> HarnessResult:
         """Run *runner* under the policy and return a :class:`HarnessResult`."""
         from gigaforge.core.sync_adapter import await_blocking

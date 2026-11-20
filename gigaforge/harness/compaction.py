@@ -34,7 +34,8 @@ Invariants this module guarantees (and the tests pin):
 """
 from __future__ import annotations
 
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 from gigaforge.firewall.tokens import estimate_tokens
 from gigaforge.providers.messages import normalize_messages

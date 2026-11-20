@@ -35,7 +35,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 __all__ = ["ProbeResult", "LiveProbeReport", "run_probes", "main"]
 
@@ -255,7 +255,7 @@ async def _probe_rate_limit(provider: Any, report: LiveProbeReport) -> None:
     started = time.monotonic()
     message = [{"role": "user", "content": "say ok"}]
     seen: list[str] = []
-    retry_after: Optional[float] = None
+    retry_after: float | None = None
     try:
         results = await asyncio.gather(
             *(
@@ -309,7 +309,7 @@ async def run_probes(*, model: str = "") -> LiveProbeReport:
     return report
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Live GigaChat API probe")
     parser.add_argument("--out", default="reports/live_probe.json")
     parser.add_argument("--model", default="")

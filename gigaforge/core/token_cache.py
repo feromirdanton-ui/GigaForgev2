@@ -23,7 +23,8 @@ from __future__ import annotations
 import hashlib
 import threading
 from collections import OrderedDict
-from typing import Any, Callable, Optional, Sequence
+from collections.abc import Callable, Sequence
+from typing import Any
 
 __all__ = ["CachedTokenCounter", "trajectory_key"]
 
@@ -68,7 +69,7 @@ class CachedTokenCounter:
 
     def __init__(
         self,
-        counter: Callable[[Sequence[Any], Any], Optional[int]],
+        counter: Callable[[Sequence[Any], Any], int | None],
         *,
         capacity: int = DEFAULT_CAPACITY,
     ) -> None:
@@ -81,7 +82,7 @@ class CachedTokenCounter:
         self.hits = 0
         self.misses = 0
 
-    def __call__(self, messages: Sequence[Any], model: Any = None) -> Optional[int]:
+    def __call__(self, messages: Sequence[Any], model: Any = None) -> int | None:
         key = trajectory_key(messages, model)
         with self._lock:
             if key in self._cache:

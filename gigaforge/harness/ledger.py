@@ -15,7 +15,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 __all__ = ["RunLedger", "StepRecord"]
 
@@ -54,7 +54,7 @@ class RunLedger:
     goal: str = ""
     engine: str = ""
     started_at: float = field(default_factory=time.time)
-    finished_at: Optional[float] = None
+    finished_at: float | None = None
     finish_reason: str = ""
     steps: list[StepRecord] = field(default_factory=list)
     compactions: int = 0
@@ -64,8 +64,8 @@ class RunLedger:
     #: Authoritative token totals from the shared budget tracker.  ``None``
     #: means "sum the steps"; a number means the tracker knows better, because
     #: the runner commits real usage there after every call.
-    tokens_in_override: Optional[int] = None
-    tokens_out_override: Optional[int] = None
+    tokens_in_override: int | None = None
+    tokens_out_override: int | None = None
 
     # -- recording -----------------------------------------------------------
     def add(self, record: StepRecord) -> StepRecord:
