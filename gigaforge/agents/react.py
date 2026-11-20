@@ -75,6 +75,12 @@ FINISH_ACTION = "finish"
 # payloads, but we cap the worst case here as defence-in-depth.
 _OBS_TOKEN_BUDGET = 1500
 
+#: How many times one episode may compact its own trajectory.  Two is enough
+#: for a normal run (the first compaction buys most of the window back); the
+#: cap exists so a pathological trajectory cannot oscillate between "compact"
+#: and "overflow" until the step budget runs out.
+_MAX_COMPACTIONS = 2
+
 # L1 Lite prompt — short and bounded. Asks for ONE JSON object per step.
 _REACT_PROMPT = (
     "Ты агент в цикле ReAct (Reason→Act→Observe). Изучи репозиторий и "
@@ -310,6 +316,10 @@ class ReActRunner:
         #: was unreachable in the configuration most deployments run.  Built
         #: lazily so the guard can pick up the client's counter.
         self._window_guard: Any = None
+        #: Compactions performed in the current episode.  Bounded so a
+        #: pathological trajectory cannot oscillate between compact and
+        #: overflow; reset at the start of every ``run``.
+        self._compactions = 0
 
     @property
     def registry(self) -> ToolRegistry:
@@ -346,6 +356,52 @@ class ReActRunner:
             )
         return self._window_guard
 
+    def _compact(
+        self,
+        trajectory: list[dict[str, str]],
+        state: TaskState,
+        step_idx: int,
+        exc: ContextOverflowError,
+    ) -> list[dict[str, str]] | None:
+        """Compact *trajectory* so the next request fits; ``None`` if hopeless.
+
+        Returns the compacted trajectory, or ``None`` when compaction cannot
+        buy enough room — in which case the caller stops the run with
+        ``finish_reason="context_overflow"``, which is the old behaviour and
+        still the right answer when the goal itself is too large.
+
+        The compaction is bounded: at most ``_MAX_COMPACTIONS`` per episode, so
+        a pathological trajectory cannot spin between "compact" and "overflow"
+        forever.  Each compaction is traced, because a run that silently
+        rewrote its own history is a run whose token accounting needs a note.
+        """
+        from gigaforge.harness.compaction import compact_trajectory
+
+        if self._compactions >= _MAX_COMPACTIONS:
+            return None
+        before = sum(len(str(m.get("content", ""))) for m in trajectory) // 4
+        window = self.window_guard.window_for(self._router.route("plan"))
+        target = int(window * self.window_guard.trigger_fraction * 0.75)
+        compacted = compact_trajectory(trajectory, target_tokens=target)
+        after = sum(len(str(m.get("content", ""))) for m in compacted) // 4
+        if after >= before:
+            # Nothing was dropped: the goal alone is over the limit.
+            return None
+        self._compactions += 1
+        self._tracer.trace(
+            state.task_id,
+            step=f"react_step_{step_idx}_compaction",
+            kind="decision",
+            detail={
+                "step_idx": step_idx,
+                "before_tokens": before,
+                "after_tokens": after,
+                "dropped_messages": len(trajectory) - len(compacted),
+                "trigger": str(exc)[:200],
+            },
+        )
+        return compacted
+
     async def run(
         self,
         task: str,
@@ -363,6 +419,7 @@ class ReActRunner:
         """
         if not self._registry.names():
             self._registry.install_defaults(sandbox=ctx.sandbox)
+        self._compactions = 0
         # The think tool is a real tool, not a prompt trick: registering it is
         # what lets the model externalise a reasoning step.
         self.guards.install(self._registry)
@@ -376,21 +433,26 @@ class ReActRunner:
 
         for step_idx in range(self._max_steps):
             # ContextWindowGuard: compact before the request, not after a 422.
-            # The guard is advisory — it raises and the loop stops with a
-            # typed reason, so the caller can compact and retry.
+            # Detection alone used to *end* the run; a long episode died at 80%
+            # of the window with most of its trajectory being stale observation
+            # text.  Now the guard's verdict triggers a compaction and the step
+            # is retried, so the run continues instead of stopping.
             try:
                 self.window_guard.check(trajectory, model=self._router.route("plan"))
             except ContextOverflowError as exc:
-                result.finished = True
-                result.finish_reason = "context_overflow"
-                result.llm_calls = step_idx
-                self._tracer.trace(
-                    state.task_id,
-                    step=f"react_step_{step_idx}_context_overflow",
-                    kind="decision",
-                    detail={"step_idx": step_idx, "detail": str(exc)[:400]},
-                )
-                return result
+                compacted = self._compact(trajectory, state, step_idx, exc)
+                if compacted is None:
+                    result.finished = True
+                    result.finish_reason = "context_overflow"
+                    result.llm_calls = step_idx
+                    self._tracer.trace(
+                        state.task_id,
+                        step=f"react_step_{step_idx}_context_overflow",
+                        kind="decision",
+                        detail={"step_idx": step_idx, "detail": str(exc)[:400]},
+                    )
+                    return result
+                trajectory = compacted
 
             # Pre-budget check. Phase = "plan" (L1 Lite caps).
             est_in = sum(len(m["content"]) for m in trajectory) // 4
