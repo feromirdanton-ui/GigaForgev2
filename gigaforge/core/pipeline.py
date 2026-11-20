@@ -1148,7 +1148,18 @@ class TaskPipeline:
             paths = Extractor(config).extract(goal).paths
         except Exception:  # noqa: BLE001 - extra context must never fail a run
             return ""
-        root = Path(str(getattr(config, "repo_root", ".") or ".")).resolve()
+        # The repository root comes from the pipeline's own config, NOT from the
+        # firewall.  ``getattr(self.firewall, "config", None)`` is ``None``
+        # whenever no firewall is wired in — which is the case for the plain
+        # ``TaskPipeline(config=…)`` the live probe and the integration test
+        # build — and the root then fell back to ``"."``, i.e. the *process's*
+        # working directory.  Measured: a goal naming ``math_utils.py`` in a
+        # temp repository produced "files mentioned but not found:
+        # math_utils.py — create them at exactly these relative paths", so the
+        # coder was told to CREATE a file that already existed and never saw its
+        # text.  It then invented the file's contents, the hunk could not
+        # anchor, and the run reported a diff that does not apply.
+        root = Path(str(getattr(self.config, "repo_root", ".") or ".")).resolve()
         candidates: list[Path] = []
         unreadable_absolute: list[str] = []
 
@@ -1246,6 +1257,31 @@ class TaskPipeline:
         return ("\n\nTarget files — copy hunk context lines VERBATIM from here and "
                 "match their real line numbers:\n\n" + "\n\n".join(blocks))
 
+    def _repo_root(self) -> Path:
+        """The repository this pipeline writes to.
+
+        One resolver, used everywhere.  The root was previously read as
+        ``getattr(self.firewall, "config", None)`` and then
+        ``getattr(config, "repo_root", ".")`` — which is ``None`` whenever no
+        firewall is wired in, so the root silently became ``"."``, the
+        *process's* working directory.  Measured: a goal naming
+        ``math_utils.py`` in a temp repository produced "files mentioned but not
+        found: math_utils.py — create them at exactly these relative paths", so
+        the coder was told to create a file that already existed, never saw its
+        text, invented its contents, and emitted a hunk that could not anchor.
+
+        The pipeline's own config is authoritative: it is what the caller set,
+        and it is what the firewall is built from when there is one.
+        """
+        raw = str(getattr(self.config, "repo_root", "") or "")
+        if not raw:
+            firewall_config = getattr(getattr(self, "firewall", None), "config", None)
+            raw = str(getattr(firewall_config, "repo_root", "") or ".")
+        try:
+            return Path(raw).resolve()
+        except OSError:  # pragma: no cover - an unresolvable root is used as given
+            return Path(raw)
+
     def _repo_fingerprint(self, limit: int = 400) -> str:
         """Cheap content identity of the worktree, for cache keys without a slice.
 
@@ -1254,8 +1290,7 @@ class TaskPipeline:
         hit — including runs after the files had changed.  A count+bytes+newest
         stamp invalidates the key as soon as the worktree moves.
         """
-        root = Path(str(getattr(getattr(self, "firewall", None), "config", None)
-                        and getattr(self.firewall.config, "repo_root", ".") or "."))
+        root = self._repo_root()
         try:
             files = list(self.indexer.discover())[:limit] if self.indexer else []
         except Exception:  # noqa: BLE001
@@ -1379,7 +1414,7 @@ class TaskPipeline:
             paths = Extractor(config).extract(ctx.state.goal).paths
         except Exception:  # noqa: BLE001
             return ""
-        root = Path(str(getattr(config, "repo_root", ".") or ".")).resolve()
+        root = self._repo_root()
         named = [
             rel for raw in dict.fromkeys(paths)
             if (rel := _workspace_relative_path(raw, root))
@@ -1627,7 +1662,7 @@ class TaskPipeline:
             paths = Extractor(config).extract(ctx.state.goal).paths
         except Exception:  # noqa: BLE001
             return diff
-        root = Path(str(getattr(config, "repo_root", ".") or ".")).resolve()
+        root = self._repo_root()
         paths = [
             rel for raw in dict.fromkeys(paths)
             if (rel := _workspace_relative_path(raw, root))
@@ -1681,7 +1716,7 @@ class TaskPipeline:
         if not blocks:
             return {}
         config = getattr(self.firewall, "config", None)
-        root = Path(str(getattr(config, "repo_root", ".") or "."))
+        root = self._repo_root()
         keep: dict[str, str] = {}
         for path, content in blocks.items():
             try:
@@ -1748,7 +1783,7 @@ class TaskPipeline:
         if not ctx.extras.get("self_debug", True):
             return {}
         config = getattr(getattr(self, "firewall", None), "config", None)
-        root = Path(str(getattr(config, "repo_root", ".") or "."))
+        root = self._repo_root()
         changed = [str(p) for p in (getattr(validation, "changed_files", []) or [])]
         if not changed:
             return {}

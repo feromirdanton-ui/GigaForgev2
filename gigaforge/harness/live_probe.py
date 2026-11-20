@@ -753,8 +753,9 @@ async def _probe_goal_to_diff(provider: Any, report: LiveProbeReport) -> None:
         # The real acceptance test: apply the diff and run the repo's own suite.
         applied = False
         tests_pass = False
+        apply_error = ""
         if diff:
-            applied = _apply_unified_diff(tmp, diff)
+            applied, apply_error = _apply_unified_diff(tmp, diff)
             if applied:
                 proc = subprocess.run(
                     [sys.executable, "-m", "pytest", "-q", "test_math_utils.py"],
@@ -764,6 +765,8 @@ async def _probe_goal_to_diff(provider: Any, report: LiveProbeReport) -> None:
                     timeout=120,
                 )
                 tests_pass = proc.returncode == 0
+                if not tests_pass:
+                    apply_error = (proc.stdout or proc.stderr or "")[-400:]
 
         ok = bool(diff) and applied and tests_pass
         report.probes.append(
@@ -777,6 +780,14 @@ async def _probe_goal_to_diff(provider: Any, report: LiveProbeReport) -> None:
                     "repo_tests_pass": tests_pass,
                     "finish_reason": str(getattr(result, "finish_reason", "")),
                     "plan_used": bool(getattr(result, "plan_used", False)),
+                    # The diff and the applier's own error.  A probe that reports
+                    # "did not apply" without saying why is not diagnosable, and
+                    # this one spent a whole iteration failing for a reason that
+                    # was invisible in its own report.  The fixture is a
+                    # synthetic two-file repository, so there is nothing here to
+                    # redact.
+                    "diff": diff[:2000],
+                    "apply_error": apply_error[:600],
                 },
                 error="" if ok else "the goal did not produce a diff that passes the repo's tests",
             )
@@ -794,12 +805,17 @@ async def _probe_goal_to_diff(provider: Any, report: LiveProbeReport) -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def _apply_unified_diff(root: Path, diff: str) -> bool:
-    """Apply a unified diff to *root*; returns True when it applied cleanly.
+def _apply_unified_diff(root: Path, diff: str) -> tuple[bool, str]:
+    """Apply a unified diff to *root*; returns ``(applied, error)``.
 
     ``git apply`` is used rather than a hand-rolled parser: the model emits real
     unified diffs, and a parser that is more forgiving than git would report
     success for a patch the repository would reject.
+
+    The error is returned rather than swallowed.  This function used to return a
+    bare ``False``, so a probe that failed here could not say whether the diff
+    was malformed, targeted the wrong path, or was rejected by the applier — and
+    the failure was attributed to the model for a whole iteration.
     """
     import re
 
@@ -808,7 +824,7 @@ def _apply_unified_diff(root: Path, diff: str) -> bool:
     if fence:
         body = fence.group(1)
     if not body.strip():
-        return False
+        return False, "the diff was empty after unwrapping"
     patch = root / ".gigaforge_probe.patch"
     patch.write_text(body if body.endswith("\n") else body + "\n")
     proc = subprocess.run(
@@ -818,16 +834,23 @@ def _apply_unified_diff(root: Path, diff: str) -> bool:
         text=True,
         timeout=60,
     )
-    if proc.returncode != 0:
-        # Fall back to a plain patch(1) for diffs git refuses (no index lines).
-        proc = subprocess.run(
-            ["patch", "-p1", "--forward", "--batch", "-i", str(patch)],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-    return proc.returncode == 0
+    if proc.returncode == 0:
+        return True, ""
+    git_error = (proc.stderr or proc.stdout or "").strip()
+    # Fall back to a plain patch(1) for diffs git refuses (no index lines).
+    fallback = subprocess.run(
+        ["patch", "-p1", "--forward", "--batch", "-i", str(patch)],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if fallback.returncode == 0:
+        return True, ""
+    return False, (
+        f"git apply: {git_error[:300]} | "
+        f"patch: {(fallback.stderr or fallback.stdout or '').strip()[:300]}"
+    )
 
 
 def main(argv: list[str] | None = None, *, settings: Any = None) -> int:
