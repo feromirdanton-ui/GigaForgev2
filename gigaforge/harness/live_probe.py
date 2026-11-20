@@ -519,9 +519,89 @@ async def run_probes(*, model: str = "", settings: Any = None) -> LiveProbeRepor
     await _probe_overflow(provider, report)
     await _probe_rate_limit(provider, report)
     await _probe_react_plan(provider, report)
+    await _probe_repl_tool(provider, report)
     await _probe_checkpointer(provider, report)
     await _probe_goal_to_diff(provider, report)
     return report
+
+
+async def _probe_repl_tool(provider: Any, report: LiveProbeReport) -> None:
+    """Does the live model actually USE the REPL when the prompt offers it?
+
+    A tool the prompt does not describe is a tool the model will not use, and a
+    tool the model will not use is dead code with tests.  This probe is the only
+    place that answers the question end to end: the harness prompt lists
+    ``repl``, the registry installs it, and the model is given a goal whose
+    cheapest correct answer is to run a program rather than guess.
+
+    The check is deliberately about *use*, not about the answer: a model that
+    calls ``repl`` and gets the arithmetic wrong has still proved the wiring,
+    and a model that answers from memory has proved the wiring is decorative.
+    """
+    started = time.monotonic()
+    try:
+        from gigaforge.agents.react import ReActContext, ReActRunner, ToolRegistry
+        from gigaforge.core.budgets import BudgetTracker
+        from gigaforge.core.router import ModelRouter
+        from gigaforge.core.sync_adapter import SyncChatClient
+        from gigaforge.core.task_state import TaskState
+        from gigaforge.core.trace import Tracer
+        from gigaforge.sandbox.executor import SandboxExecutor
+
+        root = Path.cwd()
+        client = SyncChatClient(provider)
+        router = ModelRouter(client)
+        tracer = Tracer(trace_dir=Path(".gigaforge/traces"))
+        sandbox = SandboxExecutor(worktree=root)
+        registry = ToolRegistry()
+        registry.install_defaults(sandbox=sandbox)
+        runner = ReActRunner(
+            client,
+            router,
+            BudgetTracker(),
+            tracer,
+            registry=registry,
+            max_steps=4,
+        )
+        state = TaskState(goal="compute a value with the repl", task_id="live-probe-repl")
+        ctx = ReActContext(repo_root=root, worktree=root, index=None, sandbox=sandbox)
+
+        result = await runner.run(
+            "Use the repl tool to compute 17 * 23 and report the exact number. "
+            "Do not compute it yourself — run it.",
+            state,
+            ctx=ctx,
+        )
+        actions = [str(step.get("action", "")) for step in result.steps]
+        used_repl = "repl" in actions
+        # The observation must carry the real product, which is what proves the
+        # program actually ran rather than the model narrating a plausible one.
+        observations = " ".join(str(step.get("observation", "")) for step in result.steps)
+        got_answer = "391" in observations
+        report.probes.append(
+            ProbeResult(
+                name="repl_tool",
+                ok=used_repl,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                detail={
+                    "actions": actions,
+                    "used_repl": used_repl,
+                    "answer_in_observation": got_answer,
+                    "llm_calls": result.llm_calls,
+                    "finish_reason": result.finish_reason,
+                },
+                error="" if used_repl else "the model never called the repl tool",
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 - a probe records, never raises
+        report.probes.append(
+            ProbeResult(
+                name="repl_tool",
+                ok=False,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        )
 
 
 async def _probe_goal_to_diff(provider: Any, report: LiveProbeReport) -> None:

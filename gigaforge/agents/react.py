@@ -808,15 +808,11 @@ class ReActRunner:
             # that has stopped answering in this shape, not for one that
             # stumbled once.
             parse_failures = 0
-            result.steps.append(
-                {
-                    "step_idx": step_idx,
-                    "thought": thought,
-                    "action": action,
-                    "action_input": action_input,
-                    "ok": True,
-                }
-            )
+            # NOTE: the step is recorded AFTER it runs, not here.  This used to
+            # append ``ok: True`` before the tool was even looked up, so the run
+            # record claimed success for calls that were blocked, unknown or
+            # raised — and then a second append after execution produced a
+            # duplicate entry for every call that worked.
 
             # Termination.
             if action == FINISH_ACTION:
@@ -834,6 +830,19 @@ class ReActRunner:
                 result.localization = self._extract_localization(plan, thought)
                 result.finished = True
                 result.finish_reason = "finish_action"
+                # The finish is a step too: a run record that omits it cannot
+                # say how the episode ended.
+                result.steps.append(
+                    {
+                        "step_idx": step_idx,
+                        "thought": thought,
+                        "action": action,
+                        "action_input": action_input,
+                        "ok": True,
+                        "observation": "",
+                        "plan_size": len(plan),
+                    }
+                )
                 self._tracer.trace(
                     state.task_id,
                     step=f"react_finish_{step_idx}",
@@ -946,6 +955,23 @@ class ReActRunner:
             audit = self.guards.after_observation(trajectory)
             if audit is not None:
                 trajectory.append(audit)
+            # Record the step.  The successful path never appended to
+            # ``result.steps`` — only the blocked path did — so the run record
+            # omitted every tool call that actually worked.  A live probe read
+            # ``observation: None`` for a REPL step whose program had printed
+            # the right answer, and any report built from ``result.steps``
+            # described a run that never touched a tool.
+            result.steps.append(
+                {
+                    "step_idx": step_idx,
+                    "thought": thought,
+                    "action": action,
+                    "action_input": action_input,
+                    "ok": True,
+                    "observation": observation,
+                    "cached": cached is not None,
+                }
+            )
             # LoopBreaker: the same three-signature detector the LangGraph
             # ``observe`` node runs.  Without it the classic loop — which is the
             # engine the product actually drives — had no defence against a

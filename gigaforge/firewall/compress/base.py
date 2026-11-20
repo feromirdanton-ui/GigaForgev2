@@ -178,6 +178,12 @@ class CompressionResult:
     truncated_fields: list[str] = field(default_factory=list)
     chars_per_token: float = 4.0
     meta: dict[str, Any] = field(default_factory=dict)
+    #: When set, ``text`` returns this verbatim instead of a JSON rendering of
+    #: ``data``.  Used by the passthrough path: a payload that is already the
+    #: smallest form must not be wrapped in ``{"text": ...}``, which would add
+    #: 12 characters to a 4-character answer and hand the model
+    #: ``{"text":"391\n"}`` where it asked for ``391``.
+    raw: str | None = None
 
     # ── derived ──────────────────────────────────────────────────────────
     @property
@@ -216,6 +222,8 @@ class CompressionResult:
 
     @property
     def text(self) -> str:
+        if self.raw is not None:
+            return self.raw
         return json.dumps(self.data, ensure_ascii=False, separators=(",", ":"))
 
     def render(self) -> str:
@@ -318,8 +326,16 @@ def shrink_or_passthrough(result: CompressionResult, source: str) -> Compression
     The fix is not to disable the structured form (it is what makes a *large*
     payload cheap); it is to compare and take the smaller one.  The result says
     which happened, so a report can tell "compressed 40x" from "passed through".
+
+    The comparison is against the **rendered** text, not ``compressed_chars``:
+    the first version of this function compared the wrong number and then
+    wrapped the source in ``{"text": ...}``, so a 4-character answer became a
+    16-character JSON object — the passthrough was itself an expansion.
     """
-    if not source or result.compressed_chars <= result.source_chars:
+    if not source:
+        return result
+    rendered = result.text
+    if len(rendered) <= len(source):
         return result
     return CompressionResult(
         kind=result.kind,
@@ -329,6 +345,9 @@ def shrink_or_passthrough(result: CompressionResult, source: str) -> Compression
         truncated=False,
         chars_per_token=result.chars_per_token,
         meta={**result.meta, "passthrough": "structured payload was larger"},
+        # Verbatim: the source IS the smallest form.  Wrapping it would make the
+        # passthrough an expansion, which is the defect it exists to prevent.
+        raw=source,
     )
 
 

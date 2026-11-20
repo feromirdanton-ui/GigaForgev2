@@ -35,12 +35,26 @@ def test_every_kind_returns_a_result_envelope(kind: str) -> None:
     )
 
 
-def test_text_is_non_empty_json_for_every_kind() -> None:
-    """``.text`` is the documented way to get the prompt payload."""
+def test_text_is_non_empty_for_every_kind() -> None:
+    """``.text`` is the documented way to get the prompt payload.
+
+    It is *not* always JSON: a payload that would be larger as a structured
+    object is passed through verbatim, so ``.text`` may be the raw output.  What
+    the contract guarantees is that it is non-empty and ready to drop into a
+    prompt — not that it parses.
+    """
     for kind in ("grep", "pytest", "gitdiff", "builderr"):
         text = compress(kind, GREP_RAW).text
         assert text, f"compress({kind!r}, ...).text is empty"
-        json.loads(text)  # must be valid JSON, not a repr
+        assert isinstance(text, str)
+
+
+def test_a_structured_payload_is_valid_json() -> None:
+    """When the payload IS structured, ``.text`` is its JSON rendering."""
+    big = "\n".join(f"src/mod{i}.py:{i}:def handler_{i}(request):" for i in range(400))
+    result = compress("grep", big)
+    assert not result.meta.get("passthrough")
+    json.loads(result.text)
 
 
 def test_both_call_shapes_agree() -> None:
@@ -73,6 +87,20 @@ def test_a_small_payload_is_never_expanded() -> None:
     )
     assert result.tokens_before >= result.tokens_after
     assert result.meta.get("passthrough"), "the result must say it passed through"
+
+
+def test_a_passthrough_returns_the_source_verbatim() -> None:
+    """The passthrough must not itself be an expansion.
+
+    The first version compared the wrong number and then wrapped the source in
+    ``{"text": ...}``, so a 4-character answer became a 16-character JSON object
+    and the model was handed ``{"text":"391\\n"}`` where it asked for ``391``.
+    Found by a live probe: the REPL ran, printed 391, and the answer was not in
+    the observation the model received.
+    """
+    result = compress("builderr", "391\n")
+    assert result.text == "391\n", f"passthrough wrapped the source: {result.text!r}"
+    assert len(result.text) <= len("391\n")
 
 
 def test_a_large_payload_is_still_compressed() -> None:
