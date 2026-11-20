@@ -1,0 +1,59 @@
+name: ci
+
+# The bench was not wired to CI and contained no HTML task, so a regression that
+# broke page generation outright would have left every check green.  This
+# workflow runs the unit suite AND the bench, and the bench now includes a page
+# fixture -- the artifact path is measured, not assumed.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]" || pip install -e .
+          pip install pytest
+      - name: Unit tests
+        run: python -m pytest -q
+      - name: Bench (deterministic, no API calls)
+        # The bench is the product's own measurement: five fixtures, one of them
+        # a page.  It must pass on every push, not only when someone remembers
+        # to run it.
+        run: python -m gigaforge.cli bench --out bench.json
+      - name: Bench must be all-green
+        run: |
+          python - <<'PY'
+          import json, sys
+          rows = json.load(open("bench.json"))
+          failed = [r for r in rows if not r.get("success")]
+          for r in rows:
+              print(f"{r['name']:<28} {'PASS' if r['success'] else 'FAIL'}  "
+                    f"{r['tokens_total']:>6} tok  {r.get('error','')[:80]}")
+          if failed:
+              print(f"\n{len(failed)} bench task(s) failed", file=sys.stderr)
+              sys.exit(1)
+          print(f"\nall {len(rows)} bench tasks passed")
+          PY
+      - name: Upload bench report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.python-version }}
+          path: bench.json
+          if-no-files-found: ignore
