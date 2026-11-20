@@ -428,6 +428,42 @@ def _layout_invariants() -> str:
     )
 
 
+def _fallback_section(section: "SectionSpec", plan: "GenerationPlan") -> str:
+    """Minimal valid markup for a planned section whose child returned nothing.
+
+    Deliberately plain: the harness is not trying to out-design the model, it is
+    keeping the page structurally complete.  The comment the caller prepends says
+    the section was filled by the harness, so a reader of the file can tell.
+    """
+    kind = getattr(section, "kind", "")
+    title = _escape(getattr(plan, "title", "") or "GigaForge")
+    if kind == "hero":
+        return (
+            f'<section class="hero"><h1>{title}</h1>'
+            f"<p>{_escape(getattr(plan, 'tagline', '') or '')}</p></section>"
+        )
+    if kind in ("features", "feature_grid", "grid"):
+        cards = "".join(
+            f'<div class="feature-card"><h3>{_escape(name)}</h3>'
+            f"<p>{_escape(desc)}</p></div>"
+            for name, desc in (getattr(plan, "features", None) or [])
+        )
+        if not cards:
+            cards = "".join(
+                f'<div class="feature-card"><h3>Feature {i}</h3>'
+                f"<p>Details to follow.</p></div>"
+                for i in range(1, 4)
+            )
+        return f'<section class="features"><h2>Features</h2><div class="feature-grid">{cards}</div></section>'
+    if kind in ("footer",):
+        return f'<footer class="footer"><p>{title} — built by the GigaForge harness.</p></footer>'
+    if kind in ("cta",):
+        return '<section class="cta"><h2>Get started</h2><a class="cta-button" href="#">Try it</a></section>'
+    if kind in ("nav", "header"):
+        return f'<nav class="nav"><a href="#">{title}</a></nav>'
+    return ""
+
+
 def assemble_page(plan: GenerationPlan, fragments: dict[str, str], *, css: str = "") -> str:
     """Assemble the final page from per-section fragments.
 
@@ -444,7 +480,20 @@ def assemble_page(plan: GenerationPlan, fragments: dict[str, str], *, css: str =
         raw = fragments.get(section.kind, "")
         fragment = _strip_document_wrapper(raw)
         if not fragment:
-            continue
+            # A planned section with no fragment used to be skipped silently, so
+            # the page came out missing a part the plan promised.  Measured live
+            # on ``subagents``: the footer child returned nothing usable, the
+            # footer vanished, and the run still reported ``accepted: True`` —
+            # the contract had no footer requirement to fail on.
+            #
+            # The plan is the harness's own promise.  If a child cannot fill a
+            # section, the harness fills it from the plan rather than shipping a
+            # page that is missing a section it said it would have.
+            fragment = _fallback_section(section, plan)
+            if not fragment:
+                continue
+            self_note = f"<!-- {section.kind}: filled by the harness, child returned nothing -->"
+            fragment = f"{self_note}\n{fragment}"
         body_parts.append(f"    {section.anchor}\n    {fragment}")
         # The child's own rules are kept, scoped to its section.  Dropping them
         # was the defect: a child told "draw with CSS" had its CSS deleted, so
