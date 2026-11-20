@@ -92,6 +92,7 @@ class GigaChatProvider:
         function_name_hint: str | None = None,
         task_id: str = "",
         phase: str = "unknown",
+        response_format: dict[str, Any] | None = None,
     ) -> ChatResult:
         return await self._client.chat(
             model=model,
@@ -103,6 +104,7 @@ class GigaChatProvider:
             function_name_hint=function_name_hint,
             task_id=task_id,
             phase=phase,
+            response_format=response_format,
         )
 
     async def list_models(self) -> list[dict[str, Any]]:
@@ -133,6 +135,26 @@ class GigaChatProvider:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+    async def count_tokens(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str = "",
+    ) -> int | None:
+        """Server-side token count, when the transport can provide one.
+
+        The legacy client has no ``tokens_count`` endpoint, so this returns
+        ``None`` and the caller keeps its char/4 estimate.  The official-SDK
+        provider overrides it with the real server count.
+        """
+        counter = getattr(self._client, "count_tokens", None)
+        if counter is None:
+            return None
+        try:
+            return await counter(normalize_messages(messages), model=model)
+        except Exception:  # noqa: BLE001 - counting is an optimisation
+            return None
 
     # --- capabilities --------------------------------------------------------
 

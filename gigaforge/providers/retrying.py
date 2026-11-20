@@ -98,6 +98,7 @@ class RetryingProvider:
         function_name_hint: str | None = None,
         task_id: str = "",
         phase: str = "unknown",
+        response_format: dict[str, Any] | None = None,
     ) -> Any:
         """Call the wrapped provider, retrying retryable failures."""
         attempt = 0
@@ -114,6 +115,7 @@ class RetryingProvider:
                     function_name_hint=function_name_hint,
                     task_id=task_id,
                     phase=phase,
+                    response_format=response_format,
                 )
             except BaseException as exc:  # noqa: BLE001 - classified below
                 error = error_for_exception(exc)
@@ -146,6 +148,7 @@ class RetryingProvider:
         function_name_hint: str | None = None,
         task_id: str = "",
         phase: str = "unknown",
+        response_format: dict[str, Any] | None = None,
     ) -> Any:
         """Streaming is not retried: a partially consumed stream cannot restart."""
         return self._inner.stream_chat(
@@ -157,6 +160,7 @@ class RetryingProvider:
             function_name_hint=function_name_hint,
             task_id=task_id,
             phase=phase,
+            response_format=response_format,
         )
 
     async def aclose(self) -> None:

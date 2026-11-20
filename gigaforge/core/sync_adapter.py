@@ -172,6 +172,7 @@ class SyncChatClient:
         model: Optional[str] = None,
         temperature: float = 0.2,
         max_tokens: Optional[int] = None,
+        response_format: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Any:
         """Blocking chat completion. Mirrors ``Provider.chat`` minus the await."""
@@ -179,6 +180,8 @@ class SyncChatClient:
             raise RuntimeError("this SyncChatClient has been closed")
         payload: List[Dict[str, Any]] = [_as_message(m) for m in messages]
         self._calls += 1
+        if response_format is not None:
+            kwargs["response_format"] = response_format
         return await_blocking(
             self._provider.chat(
                 payload,

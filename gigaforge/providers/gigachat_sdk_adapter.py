@@ -237,6 +237,7 @@ class GigaChatSDKProvider:
         function_name_hint: str | None = None,
         task_id: str = "",
         phase: str = "unknown",
+        response_format: dict[str, Any] | None = None,
     ) -> ChatResult:
         if stream:
             raise ValueError("Use stream_chat() for streaming responses")
@@ -247,6 +248,7 @@ class GigaChatSDKProvider:
             temperature=temperature,
             max_tokens=max_tokens,
             functions=functions,
+            response_format=response_format,
         )
         try:
             completion = await client.achat(payload)
@@ -281,6 +283,7 @@ class GigaChatSDKProvider:
         temperature: float,
         max_tokens: int | None,
         functions: list[dict[str, Any]] | None,
+        response_format: dict[str, Any] | None = None,
     ) -> Any:
         """Build the SDK's typed ``Chat`` request model.
 
@@ -301,6 +304,8 @@ class GigaChatSDKProvider:
                 payload["max_tokens"] = max_tokens
             if functions:
                 payload["functions"] = functions
+            if response_format:
+                payload["response_format"] = response_format
             return payload
 
         role_map = {
@@ -323,6 +328,11 @@ class GigaChatSDKProvider:
         }
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
+        # Native structured output: ``Chat.response_format`` is a real SDK field
+        # (verified against gigachat 0.3.0a1), so the provider validates the
+        # answer against the schema instead of the harness repairing almost-JSON.
+        if response_format:
+            kwargs["response_format"] = response_format
         if functions:
             allowed = set(Function.model_fields)
             kwargs["functions"] = [
@@ -412,6 +422,28 @@ class GigaChatSDKProvider:
         )
 
     # -- extras the official SDK gives us for free ---------------------------
+    async def count_tokens(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str = "",
+    ) -> int | None:
+        """Server-side token count for a message list.
+
+        This is the real count from ``atokens_count``, not the char/4 estimate
+        the context guard falls back to.  Returns ``None`` when the endpoint is
+        unavailable so the caller keeps its estimate instead of failing.
+        """
+        client = self._ensure_client()
+        texts = [str(m.get("content", "") or "") for m in normalize_messages(messages)]
+        if not texts:
+            return 0
+        try:
+            result = await client.atokens_count(texts, model=model or self._model)
+        except Exception:  # noqa: BLE001 - counting is an optimisation
+            return None
+        return sum(int(getattr(item, "tokens", 0) or 0) for item in result)
+
     async def tokens_count(self, texts: Sequence[str], *, model: str | None = None) -> list[int]:
         """Server-side token counting — replaces the char/4 estimate."""
         client = self._ensure_client()

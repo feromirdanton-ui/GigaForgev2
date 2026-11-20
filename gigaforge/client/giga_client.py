@@ -331,6 +331,7 @@ class GigaClient:
         function_name_hint: str | None = None,
         task_id: str = "",
         phase: str = "unknown",
+        response_format: dict[str, Any] | None = None,
     ) -> ChatResult:
         if stream:
             raise ValueError("Use stream_chat() for streaming responses")
@@ -344,6 +345,10 @@ class GigaClient:
             payload["functions"] = functions
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
+        # Native structured output: the provider validates the answer against
+        # the schema instead of the harness repairing almost-JSON afterwards.
+        if response_format:
+            payload["response_format"] = response_format
 
         started = time.monotonic()
         retries = 0

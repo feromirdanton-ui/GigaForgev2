@@ -84,6 +84,7 @@ class Provider(Protocol):
         function_name_hint: str | None = None,
         task_id: str = "",
         phase: str = "unknown",
+        response_format: dict[str, Any] | None = None,
     ) -> ChatResult: ...
 
     async def list_models(self) -> list[dict[str, Any]]: ...
@@ -99,8 +100,16 @@ class Provider(Protocol):
         function_name_hint: str | None = None,
         task_id: str = "",
         phase: str = "unknown",
+        response_format: dict[str, Any] | None = None,
     ) -> StreamAccumulator: ...
 
     async def aclose(self) -> None: ...
 
     def capabilities(self) -> ProviderCapabilities: ...
+
+    async def count_tokens(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str = "",
+    ) -> int | None: ...
