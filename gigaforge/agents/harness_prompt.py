@@ -114,6 +114,12 @@ Your final action is `finish`, and its payload is the plan the executor runs.
 - A plan that edits and never verifies is a plan that hopes: include a
   verification step (`run_tests`) when you change code.
 - Do not restate the goal as a step.
+
+### Read-only tasks
+If the task only asks you to FIND, LOCATE, REPORT, LIST or EXPLAIN something,
+the plan is the read steps themselves — `grep` and `read_structure` — not an
+edit. Emitting `edit_function` for a read-only task is wrong: the step has no
+symbol to edit, so it is dropped and the episode ends with an empty plan.
 """
 
 BUDGET_PROMPT = """\

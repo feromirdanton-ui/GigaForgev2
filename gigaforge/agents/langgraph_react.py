@@ -27,8 +27,10 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Annotated, Any, Callable, Mapping, Optional, Sequence, TypedDict
+from collections.abc import Callable, Mapping, Sequence
+from typing import Annotated, Any, TypedDict
 
+from gigaforge.agents.react import _REACT_PHASE
 from gigaforge.core.context_window_guard import ContextOverflowError, ContextWindowGuard
 from gigaforge.core.loop_breaker import LoopBreaker
 from gigaforge.core.sync_adapter import await_blocking
@@ -103,7 +105,7 @@ def _writer() -> Callable[[dict[str, Any]], None]:
 
 def _breaker_view(
     steps: list[dict[str, Any]],
-    nudges: Optional[list[str]] = None,
+    nudges: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Rebuild the tool-shaped history the LoopBreaker inspects.
 
@@ -150,7 +152,7 @@ def _breaker_view(
     return view
 
 
-def _server_token_counter(runner: Any) -> Optional[Callable[[Sequence[Any], Any], Optional[int]]]:
+def _server_token_counter(runner: Any) -> Callable[[Sequence[Any], Any], int | None] | None:
     """A guard counter backed by the provider's server-side ``count_tokens``.
 
     The context guard used to estimate every request at ``len(text)/4`` even
@@ -170,7 +172,7 @@ def _server_token_counter(runner: Any) -> Optional[Callable[[Sequence[Any], Any]
     if not callable(counter):
         return None
 
-    def _count(messages: Sequence[Any], model: Any) -> Optional[int]:
+    def _count(messages: Sequence[Any], model: Any) -> int | None:
         try:
             return counter(list(messages), model=str(model or ""))
         except Exception:  # noqa: BLE001 - counting is an optimisation
@@ -185,8 +187,8 @@ def build_react_graph(
     ctx: ReActContext,
     state: Any,
     checkpointer: Any = None,
-    guard: Optional[ContextWindowGuard] = None,
-    breaker: Optional[LoopBreaker] = None,
+    guard: ContextWindowGuard | None = None,
+    breaker: LoopBreaker | None = None,
 ) -> Any:
     """Compile the ReAct graph around an existing :class:`ReActRunner`.
 
@@ -234,7 +236,7 @@ def build_react_graph(
 
         # ContextWindowGuard: compact before the request, not after a 422.
         try:
-            window_guard.check(trajectory, model=runner.router.route("plan"))
+            window_guard.check(trajectory, model=runner.router.route(_REACT_PHASE))
         except ContextOverflowError as exc:
             _emit("react.context_overflow", step_idx=step_idx, detail=str(exc)[:400])
             return {
@@ -245,16 +247,16 @@ def build_react_graph(
 
         est_in = sum(len(m.get("content") or "") for m in trajectory) // 4
         est_out = max(int(settings.budget_plan_out) // 3, 200)
-        runner.budgets.check("plan", est_in, est_out, task_id=task_state.task_id)
+        runner.budgets.check(_REACT_PHASE, est_in, est_out, task_id=task_state.task_id)
 
         started = time.monotonic()
         chat_result = await runner.client.chat(
-            runner.router.route("plan"),
+            runner.router.route(_REACT_PHASE),
             trajectory,
             temperature=0.1,
             max_tokens=int(settings.budget_plan_out),
             task_id=task_state.task_id,
-            phase="plan",
+            phase=_REACT_PHASE,
         )
         latency_ms = int((time.monotonic() - started) * 1000)
         text = chat_result.content or ""
@@ -263,9 +265,9 @@ def build_react_graph(
         tokens_out = int(usage.get("completion_tokens", 0) or 0)
         try:
             runner.budgets.commit_task(
-                task_state.task_id, "plan", tokens_in, tokens_out
+                task_state.task_id, _REACT_PHASE, tokens_in, tokens_out
             )
-            runner.budgets.check_overshoot("plan", task_id=task_state.task_id)
+            runner.budgets.check_overshoot(_REACT_PHASE, task_id=task_state.task_id)
         except Exception:  # noqa: BLE001 - accounting is best effort here
             pass
         runner.tracer.trace(
@@ -434,7 +436,7 @@ def build_react_graph(
 
 
 def _initial_state(
-    runner: ReActRunner, task: str, bootstrap_hint: Optional[str]
+    runner: ReActRunner, task: str, bootstrap_hint: str | None
 ) -> ReActState:
     """The state a fresh ReAct episode starts from."""
     return {
@@ -464,6 +466,11 @@ def _to_result(values: Mapping[str, Any]) -> ReActResult:
     result.finish_reason = str(values.get("finish_reason") or "max_steps")
     result.localization = dict(values.get("localization") or {})
     result.plan = [PlanStep(**item) for item in (values.get("plan") or [])]
+    # The trajectory travels with the result so a caller can salvage a plan
+    # from what the episode observed when the model's finish payload is
+    # unusable.  Without it the guard's (correct) rejection of an untargeted
+    # edit left the run reporting zero steps.
+    result.trajectory = list(values.get("trajectory") or [])
     return result
 
 
@@ -473,11 +480,11 @@ async def run_react_graph_async(
     state: Any,
     *,
     ctx: ReActContext,
-    bootstrap_hint: Optional[str] = None,
+    bootstrap_hint: str | None = None,
     checkpointer: Any = None,
     thread_id: str = "",
-    guard: Optional[ContextWindowGuard] = None,
-    breaker: Optional[LoopBreaker] = None,
+    guard: ContextWindowGuard | None = None,
+    breaker: LoopBreaker | None = None,
 ) -> ReActResult:
     """Async entry point: drive the graph on the **caller's** loop.
 
@@ -510,11 +517,11 @@ def run_react_graph(
     state: Any,
     *,
     ctx: ReActContext,
-    bootstrap_hint: Optional[str] = None,
+    bootstrap_hint: str | None = None,
     checkpointer: Any = None,
     thread_id: str = "",
-    guard: Optional[ContextWindowGuard] = None,
-    breaker: Optional[LoopBreaker] = None,
+    guard: ContextWindowGuard | None = None,
+    breaker: LoopBreaker | None = None,
 ) -> ReActResult:
     """Run the ReAct graph and return the same :class:`ReActResult` as the loop.
 

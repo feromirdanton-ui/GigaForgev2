@@ -38,6 +38,8 @@ PHASE_CAP_ATTRS: dict[str, tuple[str, str]] = {
     "code": ("budget_code_in", "budget_code_out"),
     "hard_reasoning": ("budget_code_in", "budget_code_out"),
     "fixloop": ("budget_fixloop_in", "budget_fixloop_out"),
+    # A ReAct episode is a loop, not one call: it needs its own cap.
+    "react": ("budget_react_in", "budget_react_out"),
 }
 
 

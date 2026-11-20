@@ -36,8 +36,9 @@ import json
 import logging
 import os
 import re
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Optional, Protocol, Sequence
+from typing import Any, Protocol
 
 log = logging.getLogger("gigaforge.core.strategies")
 
@@ -236,7 +237,7 @@ class TreeOfThoughtPlan:
 
     def _arbitrate(
         self, goal: str, parsed: Sequence[dict[str, Any]], *, ask: AskFn
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """One cheap call: "which of these plans is best?" — fail-safe to None."""
         listing = []
         for i, cand in enumerate(parsed, start=1):
@@ -255,7 +256,7 @@ class TreeOfThoughtPlan:
         return parsed[index] if index is not None else None
 
 
-def _parse_choice(text: str, *, upper: int) -> Optional[int]:
+def _parse_choice(text: str, *, upper: int) -> int | None:
     """Extract a 1-based choice from a judge answer (JSON first, then prose)."""
     raw = (text or "").strip()
     if not raw:
@@ -274,7 +275,7 @@ def _parse_choice(text: str, *, upper: int) -> Optional[int]:
     return None
 
 
-def _as_index(value: Any, *, upper: int) -> Optional[int]:
+def _as_index(value: Any, *, upper: int) -> int | None:
     try:
         index = int(str(value).strip().strip('"').rstrip("."))
     except (TypeError, ValueError):
@@ -585,7 +586,7 @@ class LLMReview:
         return ReviewOutcome(verdict=verdict, issues=issues, strategy=self.name, llm_used=True)
 
 
-def _parse_review_json(text: str) -> tuple[Optional[str], list[str]]:
+def _parse_review_json(text: str) -> tuple[str | None, list[str]]:
     """Extract ``(verdict, issues)`` from a reviewer answer. ``None`` verdict = garbage."""
     raw = (text or "").strip()
     if not raw:
@@ -604,7 +605,7 @@ def _parse_review_json(text: str) -> tuple[Optional[str], list[str]]:
     return None, []
 
 
-def _normalise_verdict(value: Any) -> Optional[str]:
+def _normalise_verdict(value: Any) -> str | None:
     token = str(value or "").strip().strip('"').lower()
     if token in {"ok", "approve", "approved", "accept", "accepted", "pass", "lgtm", "yes"}:
         return "ok"
@@ -684,7 +685,7 @@ class ReActPlan:
     def __init__(
         self,
         *,
-        runner_factory: Optional[Callable[..., Any]] = None,
+        runner_factory: Callable[..., Any] | None = None,
         max_steps: int = 6,
     ) -> None:
         self._runner_factory = runner_factory
@@ -837,7 +838,29 @@ class ReActPlan:
                     if f"{getattr(step, 'tool', '')}:" not in " ".join(det.blocked)
                 ]
         steps = [_describe_plan_step(step) for step in (verdict.steps or [])]
-        return [step for step in steps if step], verdict
+        if not steps:
+            # The guard rejected every step.  That is the right verdict — a
+            # plan of ``edit_function`` with no target cannot be executed — but
+            # returning nothing throws away everything the episode observed.
+            # Measured live: the model grepped, found the files, then emitted
+            # ``[{"tool": "edit_function", "args": {}}]`` for a read-only task;
+            # the guard dropped it and the run reported zero steps despite
+            # having the answer in its trajectory.
+            #
+            # Salvage from the observations instead.  This is deterministic and
+            # model-free, and it is the same recovery the classic loop already
+            # applies when a finish payload does not parse.
+            trajectory = getattr(result, "trajectory", None)
+            if trajectory:
+                salvaged = runner.synthesize_plan(trajectory) if runner is not None else []
+                steps = [_describe_plan_step(step) for step in salvaged]
+                steps = [step for step in steps if step]
+                if steps:
+                    log.info(
+                        "plan guard emptied the plan; salvaged %d step(s) from observations",
+                        len(steps),
+                    )
+        return steps, verdict
 
     def plan_under_harness(
         self,
@@ -933,7 +956,7 @@ REVIEW_STRATEGIES: dict[str, Callable[[], ReviewStrategy]] = {
 def build_plan_strategy(
     name: str | None = None,
     *,
-    react_runner_factory: Optional[Callable[[], Any]] = None,
+    react_runner_factory: Callable[[], Any] | None = None,
 ) -> PlanStrategy:
     """Build a plan strategy by name; env ``GIGAFORGE_PLAN_STRATEGY`` wins.
 

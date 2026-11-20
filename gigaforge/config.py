@@ -76,6 +76,14 @@ class Settings:
     # Sandbox (default so manual Settings() construction in tests stays stable)
     sandbox_timeout_s: int = 120
 
+    # A ReAct episode is a multi-step loop, not one planning call.  It used to
+    # spend the ``plan`` phase budget (2 000 input tokens), which the harness
+    # prompt alone consumes more than half of — so a live episode died on its
+    # second step with BudgetExceeded and produced an empty plan.  It gets its
+    # own, larger cap.
+    budget_react_in: int = 40_000
+    budget_react_out: int = 8_000
+
     # Model routing (names per GigaChat model catalog)
     models: dict[str, str] = field(default_factory=dict)
 
@@ -151,6 +159,8 @@ def get_settings() -> Settings:
         budget_fixloop_out=_env_int("GIGAFORGE_BUDGET_FIXLOOP_OUT", 1000),
         budget_fixloop_iters=_env_int("GIGAFORGE_BUDGET_FIXLOOP_ITERS", 3),
         budget_task_cap=_env_int("GIGAFORGE_BUDGET_TASK_CAP", 60_000),
+        budget_react_in=_env_int("GIGAFORGE_BUDGET_REACT_IN", 40_000),
+        budget_react_out=_env_int("GIGAFORGE_BUDGET_REACT_OUT", 8_000),
         sandbox_timeout_s=_env_int("GIGAFORGE_SANDBOX_TIMEOUT_S", 120),
         db_path=Path(_env("GIGAFORGE_DB_PATH", ".gigaforge/gigaforge.db")),
         trace_dir=Path(_env("GIGAFORGE_TRACE_DIR", ".gigaforge/traces")),

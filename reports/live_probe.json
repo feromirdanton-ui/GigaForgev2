@@ -1,5 +1,5 @@
 {
-  "started_at": 1795155527.0956967,
+  "started_at": 1795160116.95978,
   "credentials_present": true,
   "model": "GigaChat",
   "ok": true,
@@ -9,7 +9,7 @@
     {
       "name": "atokens_count",
       "ok": true,
-      "latency_ms": 1943,
+      "latency_ms": 1001,
       "detail": {
         "short": 8,
         "long": 208
@@ -19,7 +19,7 @@
     {
       "name": "response_format",
       "ok": true,
-      "latency_ms": 438,
+      "latency_ms": 356,
       "detail": {
         "parsed": true,
         "head": "{\"steps\": [{\"tool\": \"grep\"}]}",
@@ -34,7 +34,7 @@
     {
       "name": "context_overflow",
       "ok": true,
-      "latency_ms": 214,
+      "latency_ms": 453,
       "detail": {
         "recognised_as_overflow": true
       },
@@ -43,23 +43,27 @@
     {
       "name": "rate_limit",
       "ok": true,
-      "latency_ms": 1976,
+      "latency_ms": 997,
       "detail": {
-        "errors": [],
-        "saw_429": false,
+        "errors": [
+          "RateLimitError",
+          "RateLimitError",
+          "RateLimitError"
+        ],
+        "saw_429": true,
         "retry_after": null,
-        "note": "no 429 in this burst: the account had headroom, so the Retry-After branch is NOT confirmed live by this run"
+        "note": "429 observed: the Retry-After branch is confirmed live"
       },
       "error": ""
     },
     {
       "name": "react_plan",
       "ok": true,
-      "latency_ms": 5283,
+      "latency_ms": 5473,
       "detail": {
         "strategy": "react",
-        "steps": 2,
-        "first_step": "edit_function: react.py",
+        "steps": 4,
+        "first_step": "edit_function: live_probe.py",
         "llm_calls": null
       },
       "error": ""
@@ -67,10 +71,10 @@
     {
       "name": "checkpointer",
       "ok": true,
-      "latency_ms": 3498,
+      "latency_ms": 1764,
       "detail": {
         "checkpoints": 6,
-        "db_bytes": 57344,
+        "db_bytes": 49152,
         "llm_calls": 2,
         "finish_reason": "max_steps"
       },

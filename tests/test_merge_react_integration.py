@@ -178,7 +178,10 @@ def test_react_plan_executes_end_to_end(tmp_path: Any) -> None:
     assert outcome.strategy == "react", "the ReAct path must win, not the fallback"
     assert outcome.steps == ["edit_function: validate_email", "run_tests"]
     assert provider.calls, "the model was never called"
-    assert provider.calls[0]["phase"] == "plan"
+    # A ReAct episode is a loop, not one planning call: it bills the ``react``
+    # phase, which has its own (larger) cap.  Billing it to ``plan`` meant the
+    # 2 000-token single-call cap killed the episode on its second step.
+    assert provider.calls[0]["phase"] == "react"
 
 
 def test_react_plan_records_llm_calls_in_the_candidate(tmp_path: Any) -> None:

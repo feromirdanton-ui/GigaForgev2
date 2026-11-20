@@ -70,6 +70,15 @@ DEFAULT_REACT_MAX_STEPS = 5
 # The special action that terminates the loop with a synthesized plan.
 FINISH_ACTION = "finish"
 
+#: Budget/routing phase for a ReAct episode.
+#:
+#: It used to be ``"plan"``, which is a *single-call* phase with a 2 000-token
+#: input cap.  A ReAct episode is a loop: the harness prompt alone is ~1 100
+#: tokens, so the second step of a live episode died with ``BudgetExceeded``
+#: and the run fell back to the linear plan with zero steps.  ``"react"`` has
+#: its own, larger cap (``GIGAFORGE_BUDGET_REACT_IN``).
+_REACT_PHASE = "react"
+
 # Tool output hard cap (tokens). Each observation fits comfortably under the
 # Lite model's input budget. The Firewall compressors may produce smaller
 # payloads, but we cap the worst case here as defence-in-depth.
@@ -145,6 +154,11 @@ class ReActResult:
     finished: bool = False
     finish_reason: str = ""  # "finish_action" | "max_steps" | "budget_exceeded" | "error"
     llm_calls: int = 0
+    #: The episode's own trajectory.  Carried out of the run so a caller can
+    #: salvage a plan from what was actually observed when the model's finish
+    #: payload is unusable — the guard drops an untargeted edit, and without
+    #: this the run reports zero steps despite having the answer in hand.
+    trajectory: list[dict[str, Any]] = field(default_factory=list)
 
 
 # --- Built-in tools ---------------------------------------------------------
@@ -241,7 +255,7 @@ class GrepTool:
         hits: list[str] = []
         for path in root.rglob("*"):
             if len(hits) >= 200:
-                hits.append(f"... (truncated at 200 matches)")
+                hits.append("... (truncated at 200 matches)")
                 break
             if not path.is_file():
                 continue
@@ -353,7 +367,7 @@ class ReActRunner:
     """Bounded ReAct (Reason→Act→Observe) loop over the L1 Lite model.
 
     Each iteration issues exactly ONE LLM call (Lite) and at most ONE tool
-    invocation. Every LLM call is budget-checked (phase="plan", Lite caps) and
+    invocation. Every LLM call is budget-checked (phase="react") and
     traced. Tool output is compressed through the Firewall before the next
     iteration's prompt sees it.
 
@@ -443,6 +457,10 @@ class ReActRunner:
         """Public wrapper over the finish-payload parser."""
         return self._parse_finish_plan(action_input)
 
+    def synthesize_plan(self, trajectory: list[dict[str, Any]]) -> list[Any]:
+        """Public wrapper over the observation-based plan salvage."""
+        return self._synthesize_plan(trajectory)
+
     def extract_localization(
         self, plan: list[Any], last_thought: str = ""
     ) -> dict[str, str]:
@@ -513,7 +531,7 @@ class ReActRunner:
         if self._compactions >= _MAX_COMPACTIONS:
             return None
         before = sum(len(str(m.get("content", ""))) for m in trajectory) // 4
-        window = self.window_guard.window_for(self._router.route("plan"))
+        window = self.window_guard.window_for(self._router.route(_REACT_PHASE))
         target = int(window * self.window_guard.trigger_fraction * 0.75)
         # Two passes, cheapest first (ported from deepagents-gigachat):
         #   1. trim the bodies of large STALE file observations — keeps the
@@ -582,7 +600,7 @@ class ReActRunner:
             # text.  Now the guard's verdict triggers a compaction and the step
             # is retried, so the run continues instead of stopping.
             try:
-                self.window_guard.check(trajectory, model=self._router.route("plan"))
+                self.window_guard.check(trajectory, model=self._router.route(_REACT_PHASE))
             except ContextOverflowError as exc:
                 compacted = self._compact(trajectory, state, step_idx, exc)
                 if compacted is None:
@@ -601,17 +619,17 @@ class ReActRunner:
             # Pre-budget check. Phase = "plan" (L1 Lite caps).
             est_in = sum(len(m["content"]) for m in trajectory) // 4
             est_out = max(self._s.budget_plan_out // 3, 200)
-            self._budgets.check("plan", est_in, est_out, task_id=state.task_id)
+            self._budgets.check(_REACT_PHASE, est_in, est_out, task_id=state.task_id)
 
             # Reason — one LLM call.
             started = time.monotonic()
             chat_result: ChatResult = await self._client.chat(
-                self._router.route("plan"),
+                self._router.route(_REACT_PHASE),
                 trajectory,
                 temperature=0.1,
                 max_tokens=int(self._s.budget_plan_out),
                 task_id=state.task_id,
-                phase="plan",
+                phase=_REACT_PHASE,
             )
             latency_ms = int((time.monotonic() - started) * 1000)
             text = chat_result.content or ""
@@ -620,8 +638,8 @@ class ReActRunner:
             tokens_out = int(usage.get("completion_tokens", 0) or 0)
 
             try:
-                self._budgets.commit_task(state.task_id, "plan", tokens_in, tokens_out)
-                self._budgets.check_overshoot("plan", task_id=state.task_id)
+                self._budgets.commit_task(state.task_id, _REACT_PHASE, tokens_in, tokens_out)
+                self._budgets.check_overshoot(_REACT_PHASE, task_id=state.task_id)
             except BudgetExceeded:
                 result.finish_reason = "budget_exceeded"
                 result.llm_calls = step_idx + 1
@@ -830,6 +848,9 @@ class ReActRunner:
             kind="decision",
             detail={"max_steps": self._max_steps, "llm_calls": result.llm_calls},
         )
+        # Carry the trajectory out: a caller that finds the plan unusable can
+        # salvage one from what the episode actually observed.
+        result.trajectory = list(trajectory)
         return result
 
     async def _force_finish(
@@ -856,12 +877,12 @@ class ReActRunner:
         )
         try:
             chat_result: ChatResult = await self._client.chat(
-                self._router.route("plan"),
+                self._router.route(_REACT_PHASE),
                 convo,
                 temperature=0.0,
                 max_tokens=int(self._s.budget_plan_out),
                 task_id=state.task_id,
-                phase="plan",
+                phase=_REACT_PHASE,
             )
         except Exception as exc:  # noqa: BLE001 - a failed rescue is not fatal
             self._tracer.trace(
