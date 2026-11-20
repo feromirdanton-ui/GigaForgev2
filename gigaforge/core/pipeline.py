@@ -2368,6 +2368,16 @@ class TaskPipeline:
                 "pipeline.contract_rejected", run_id=ctx.run_id,
                 unmet=contract.unmet[:6], files=contract.files[:6],
             )
+        # A page is a RENDERED artifact.  The contract counts tags; a browser
+        # shows what the tags produce, and the two disagreed twice: 1956
+        # characters of CSS printed as text in the body, a doubled grid and
+        # footer — every one of them invisible to a tag counter and to a size
+        # check.  So for an artifact goal the page is rendered and the facts a
+        # browser computes are part of the verdict.
+        render_unmet = self._check_render(ctx, changed)
+        if render_unmet:
+            accepted = False
+            ctx.extras["contract_unmet"] = list(ctx.extras.get("contract_unmet") or []) + render_unmet
         # A partial fan-out cannot settle as accepted.  The accepted children's
         # work is kept — it is already in the tree — but the run is not done,
         # and the goal loop must spend another cycle on what is left.  Measured:
@@ -2402,6 +2412,55 @@ class TaskPipeline:
                     diff_chars=len(final), files=len(changed),
                     reviewed=bool(verdict), review_rejected=review_rejected)
         return {"final_diff": final, "accepted": accepted, "changed_files": changed}
+
+    def _check_render(self, ctx: RunContext, changed: Sequence[str]) -> list[str]:
+        """Render the page the run wrote and return what a browser disagrees with.
+
+        Only for artifact goals: a code change has no page to render, and
+        rendering one would be a check of something the run never claimed.
+
+        A missing browser is a **degradation**, not a pass and not a failure:
+        the run records that the page was not rendered, so the report can say
+        "not checked" instead of implying "checked and fine".
+        """
+        kind = ctx.extras.get("task_kind") or {}
+        if not kind.get("kind") or kind.get("kind") == "code":
+            return []
+        pages = [p for p in changed if str(p).lower().endswith((".html", ".htm"))]
+        if not pages:
+            return []
+        root = self._repo_root()
+        page = (root / str(pages[0])).resolve()
+        try:
+            page.relative_to(root)
+        except ValueError:
+            return []
+        if not page.is_file():
+            return []
+        try:
+            from gigaforge.harness.render_check import render_facts, render_verdict
+        except Exception as exc:  # noqa: BLE001 - an optional module
+            self._degraded("render_check_import", exc, "settle")
+            return []
+        shot = Path(str(getattr(self.config, "trace_path", ".gigaforge/traces/core.jsonl"))).parent / f"{ctx.run_id}_render.png"
+        facts = render_facts(page, screenshot=shot)
+        ctx.extras["render"] = facts
+        if not facts.get("available"):
+            ctx.state.note_degraded(
+                what="render_check", why=str(facts.get("reason") or "unavailable"),
+                where="settle",
+            )
+            self._event("pipeline.render_unavailable", run_id=ctx.run_id,
+                        reason=str(facts.get("reason"))[:200])
+            return []
+        plan = ctx.extras.get("generation_plan") or {}
+        min_cards = 3 if "features" in (plan.get("sections") or []) else 0
+        unmet = render_verdict(facts, min_cards=min_cards)
+        self._event("pipeline.render", run_id=ctx.run_id,
+                    h1=facts.get("h1"), cards=facts.get("cards"),
+                    css_leak=facts.get("css_leak_chars"),
+                    unmet=unmet[:4])
+        return [f"render: {item}" for item in unmet]
 
     def _check_goal_contract(self, ctx: RunContext, changed: Sequence[str]) -> Any:
         """Check the artifact on disk against the goal's explicit requirements.
