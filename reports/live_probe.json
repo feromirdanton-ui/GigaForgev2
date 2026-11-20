@@ -1,15 +1,15 @@
 {
-  "started_at": 1795167492.915002,
+  "started_at": 1795169312.51129,
   "credentials_present": true,
   "model": "GigaChat",
   "ok": true,
-  "passed": 8,
-  "total": 8,
+  "passed": 9,
+  "total": 9,
   "probes": [
     {
       "name": "atokens_count",
       "ok": true,
-      "latency_ms": 1782,
+      "latency_ms": 1603,
       "detail": {
         "short": 8,
         "long": 208
@@ -19,7 +19,7 @@
     {
       "name": "response_format",
       "ok": true,
-      "latency_ms": 419,
+      "latency_ms": 413,
       "detail": {
         "parsed": true,
         "head": "{\"steps\": [{\"tool\": \"grep\"}]}",
@@ -34,7 +34,7 @@
     {
       "name": "context_overflow",
       "ok": true,
-      "latency_ms": 889,
+      "latency_ms": 551,
       "detail": {
         "recognised_as_overflow": true
       },
@@ -43,9 +43,10 @@
     {
       "name": "rate_limit",
       "ok": true,
-      "latency_ms": 2007,
+      "latency_ms": 1610,
       "detail": {
         "errors": [
+          "RateLimitError",
           "RateLimitError"
         ],
         "saw_429": true,
@@ -57,7 +58,7 @@
     {
       "name": "react_plan",
       "ok": true,
-      "latency_ms": 7501,
+      "latency_ms": 8031,
       "detail": {
         "strategy": "react",
         "steps": 3,
@@ -70,7 +71,7 @@
     {
       "name": "repl_tool",
       "ok": true,
-      "latency_ms": 2830,
+      "latency_ms": 3050,
       "detail": {
         "actions": [
           "repl",
@@ -84,9 +85,23 @@
       "error": ""
     },
     {
+      "name": "compaction",
+      "ok": true,
+      "latency_ms": 24068,
+      "detail": {
+        "compacted": true,
+        "finish_reason": "finish_action",
+        "steps": 8,
+        "llm_calls": 9,
+        "window": 4000,
+        "compactions": 10
+      },
+      "error": ""
+    },
+    {
       "name": "checkpointer",
       "ok": true,
-      "latency_ms": 3707,
+      "latency_ms": 5187,
       "detail": {
         "checkpoints": 6,
         "db_bytes": 94208,
@@ -98,7 +113,7 @@
     {
       "name": "goal_to_diff",
       "ok": true,
-      "latency_ms": 8918,
+      "latency_ms": 14705,
       "detail": {
         "diff_chars": 206,
         "diff_applied": true,

@@ -520,6 +520,7 @@ async def run_probes(*, model: str = "", settings: Any = None) -> LiveProbeRepor
     await _probe_rate_limit(provider, report)
     await _probe_react_plan(provider, report)
     await _probe_repl_tool(provider, report)
+    await _probe_compaction(provider, report)
     await _probe_checkpointer(provider, report)
     await _probe_goal_to_diff(provider, report)
     return report
@@ -597,6 +598,111 @@ async def _probe_repl_tool(provider: Any, report: LiveProbeReport) -> None:
         report.probes.append(
             ProbeResult(
                 name="repl_tool",
+                ok=False,
+                latency_ms=int((time.monotonic() - started) * 1000),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        )
+
+
+async def _probe_compaction(provider: Any, report: LiveProbeReport) -> None:
+    """A live run long enough to compact, driven by the real client.
+
+    Every other probe checks one capability in isolation, and the compaction
+    path was the one link the harness never executed: the real window is
+    261 120 tokens, so a live run that reaches 85% of it would need a quarter of
+    a million tokens of trajectory.  That is not a reason to leave the recovery
+    path unproven — it is a reason to shrink the *number*, which is what a
+    deployment with a smaller model does anyway.
+
+    The guard is injected with a small window; the client, the loop, the
+    compactor and the tracer are all the real ones.  The probe asserts the run
+    compacted AND finished, because detection without recovery was the original
+    defect: the guard's verdict used to *end* the run.
+    """
+    started = time.monotonic()
+    try:
+        from gigaforge.agents.react import ReActContext, ReActRunner, ToolRegistry
+        from gigaforge.core.budgets import BudgetTracker
+        from gigaforge.core.context_window_guard import ContextWindowGuard
+        from gigaforge.core.router import ModelRouter
+        from gigaforge.core.sync_adapter import SyncChatClient
+        from gigaforge.core.task_state import TaskState
+        from gigaforge.core.trace import Tracer
+        from gigaforge.sandbox.executor import SandboxExecutor
+
+        root = Path.cwd()
+        client = SyncChatClient(provider)
+        router = ModelRouter(client)
+        tracer = Tracer(trace_dir=Path(".gigaforge/traces"))
+        sandbox = SandboxExecutor(worktree=root)
+        registry = ToolRegistry()
+        registry.install_defaults(sandbox=sandbox)
+        runner = ReActRunner(
+            client,
+            router,
+            BudgetTracker(),
+            tracer,
+            registry=registry,
+            max_steps=10,
+            # The opening message (harness prompt + task) is ~1 400 tokens on
+            # its own, and compaction targets 75% of the trigger, so the window
+            # must leave room above the prompt or recovery is arithmetically
+            # impossible: at 2 500 the target is 1 594 and the run died on
+            # overflow with zero compactions.  4 000 gives a 2 550-token target,
+            # which a real trajectory can be compacted into.  The code path is
+            # identical at 261 120; only the number is smaller, which is what a
+            # deployment with a smaller model would set anyway.
+            window_guard=ContextWindowGuard(context_window=4000, trigger_fraction=0.85),
+        )
+        state = TaskState(goal="explore the repository", task_id="live-probe-compaction")
+        ctx = ReActContext(repo_root=root, worktree=root, index=None, sandbox=sandbox)
+
+        result = await runner.run(
+            "Explore this repository thoroughly: list the top-level Python "
+            "packages under gigaforge/, then read the first 40 lines of at "
+            "least four different modules in different packages. Report what "
+            "each one does in one line, then finish.",
+            state,
+            ctx=ctx,
+        )
+        compactions = [
+            step for step in result.steps if "compaction" in str(step.get("step_idx", ""))
+        ]
+        # The tracer writes JSONL to disk; that file is the record of truth for
+        # compactions, because ``result.steps`` only carries tool steps.  Reading
+        # it is also what proves the compaction was *reported*, not just done.
+        if not compactions:
+            trace_file = Path(".gigaforge/traces") / "live-probe-compaction.jsonl"
+            if trace_file.is_file():
+                for line in trace_file.read_text(encoding="utf-8").splitlines():
+                    if "compaction" in line:
+                        compactions.append({"step_idx": "compaction"})
+        compacted = bool(compactions)
+        report.probes.append(
+            ProbeResult(
+                name="compaction",
+                ok=compacted and result.finish_reason != "context_overflow",
+                latency_ms=int((time.monotonic() - started) * 1000),
+                detail={
+                    "compacted": compacted,
+                    "finish_reason": result.finish_reason,
+                    "steps": len(result.steps),
+                    "llm_calls": result.llm_calls,
+                    "window": 4000,
+                    "compactions": len(compactions),
+                },
+                error=(
+                    ""
+                    if compacted and result.finish_reason != "context_overflow"
+                    else "the run did not compact, or died on overflow instead of recovering"
+                ),
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 - a probe records, never raises
+        report.probes.append(
+            ProbeResult(
+                name="compaction",
                 ok=False,
                 latency_ms=int((time.monotonic() - started) * 1000),
                 error=f"{type(exc).__name__}: {exc}",
