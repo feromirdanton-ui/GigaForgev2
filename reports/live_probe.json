@@ -1,5 +1,5 @@
 {
-  "started_at": 1795155378.7142217,
+  "started_at": 1795155527.0956967,
   "credentials_present": true,
   "model": "GigaChat",
   "ok": true,
@@ -9,7 +9,7 @@
     {
       "name": "atokens_count",
       "ok": true,
-      "latency_ms": 2001,
+      "latency_ms": 1943,
       "detail": {
         "short": 8,
         "long": 208
@@ -19,7 +19,7 @@
     {
       "name": "response_format",
       "ok": true,
-      "latency_ms": 485,
+      "latency_ms": 438,
       "detail": {
         "parsed": true,
         "head": "{\"steps\": [{\"tool\": \"grep\"}]}",
@@ -34,7 +34,7 @@
     {
       "name": "context_overflow",
       "ok": true,
-      "latency_ms": 198,
+      "latency_ms": 214,
       "detail": {
         "recognised_as_overflow": true
       },
@@ -43,22 +43,19 @@
     {
       "name": "rate_limit",
       "ok": true,
-      "latency_ms": 1817,
+      "latency_ms": 1976,
       "detail": {
-        "errors": [
-          "RateLimitError",
-          "RateLimitError"
-        ],
-        "saw_429": true,
+        "errors": [],
+        "saw_429": false,
         "retry_after": null,
-        "note": "429 observed: the Retry-After branch is confirmed live"
+        "note": "no 429 in this burst: the account had headroom, so the Retry-After branch is NOT confirmed live by this run"
       },
       "error": ""
     },
     {
       "name": "react_plan",
       "ok": true,
-      "latency_ms": 5068,
+      "latency_ms": 5283,
       "detail": {
         "strategy": "react",
         "steps": 2,
@@ -70,7 +67,7 @@
     {
       "name": "checkpointer",
       "ok": true,
-      "latency_ms": 3749,
+      "latency_ms": 3498,
       "detail": {
         "checkpoints": 6,
         "db_bytes": 57344,
