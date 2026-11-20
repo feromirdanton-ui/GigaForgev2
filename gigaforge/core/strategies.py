@@ -86,6 +86,14 @@ class PlanOutcome:
     score: float = 0.0
     candidates: list[dict[str, Any]] = field(default_factory=list)
     judge_used: bool = False
+    #: ``{"target_function": ..., "target_file": ...}`` when the strategy could
+    #: localise the change.  Carried out of planning because the coder needs it:
+    #: without it the model re-derives the target from the goal and guesses.
+    localization: dict[str, str] = field(default_factory=dict)
+    #: The structured steps, when the strategy produced them.  ``steps`` is the
+    #: rendered form the DAG executes; this is the same plan before rendering,
+    #: so a consumer can read ``tool``/``args`` instead of parsing a string.
+    structured: list[Any] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -93,6 +101,7 @@ class PlanOutcome:
             "steps": list(self.steps),
             "score": round(float(self.score), 3),
             "judge_used": self.judge_used,
+            "localization": dict(self.localization),
             "candidates": [
                 {
                     "branch": c.get("branch"),
@@ -631,6 +640,23 @@ def _slice_proxy(slice_obj: Any) -> Any:
 # ══════════════════════════════════════════════════════════════════════════
 # selection
 # ══════════════════════════════════════════════════════════════════════════
+def _step_signature(step: Any) -> str:
+    """The ``tool:key=value`` signature the deterministic-output guard reports.
+
+    Kept next to the filter that uses it so the two cannot drift: the guard
+    emits ``f"{tool}:{key}={value}"`` and this must produce the identical
+    string, or the filter silently stops matching.
+    """
+    tool = str(getattr(step, "tool", "") or "").strip()
+    args = getattr(step, "args", None) or {}
+    if not isinstance(args, dict):
+        return tool
+    for key, value in args.items():
+        if isinstance(value, str):
+            return f"{tool}:{key}={value.strip()}"
+    return tool
+
+
 def _describe_plan_step(step: Any) -> str:
     """Render one ReAct ``PlanStep`` as the DAG's plan line.
 
@@ -771,6 +797,8 @@ class ReActPlan:
             steps=steps,
             strategy=self.name,
             score=score_steps(steps),
+            localization=dict(getattr(result, "localization", None) or {}),
+            structured=list(getattr(result, "plan", None) or []),
             candidates=[{
                 "branch": "react",
                 "steps": steps,
@@ -784,10 +812,23 @@ class ReActPlan:
     def _known_tools(self) -> set[str]:
         """Tools the pipeline can actually run, for the plan guard.
 
-        Read from the runner's registry when there is one; otherwise fall back
-        to the DAG's own step vocabulary, which is what the plan is rendered
-        into anyway.
+        Two vocabularies meet here and they are **not** the same set:
+
+        * ``react_tools`` — what the ReAct registry can execute (``grep``,
+          ``read_structure``, ``run_tests``, ``think``, ``finish``).  A plan
+          step naming anything else cannot be run by the episode.
+        * ``dag_tools`` — the DAG's own step vocabulary (``coder``, ``tests``,
+          ``lint``, ``reviewer``, ``edit_function``).  A plan is *rendered into*
+          these, so a step naming one is legitimate even though the ReAct
+          registry has never heard of it.
+
+        The previous version unioned the two without saying so, which made the
+        guard's "known tools" check meaningless: ``edit_function`` was allowed
+        because it is a DAG step, even on a path where the registry could not
+        have produced it.  Keeping the sets separate and naming them is what
+        makes the check mean something again.
         """
+        dag_tools = {"tests", "lint", "reviewer", "coder", "edit_function"}
         runner = getattr(self, "_last_runner", None)
         registry = getattr(runner, "registry", None) if runner is not None else None
         names = getattr(registry, "names", None)
@@ -797,8 +838,8 @@ class ReActPlan:
             except Exception:  # noqa: BLE001 - a broken registry is not fatal
                 found = set()
             if found:
-                return found | {"tests", "lint", "reviewer", "coder", "edit_function"}
-        return {"tests", "lint", "reviewer", "coder", "edit_function", "read_structure", "grep"}
+                return found | dag_tools
+        return dag_tools | {"read_structure", "grep", "run_tests", "think"}
 
     def _guarded_steps(self, result: Any) -> tuple[list[str], Any]:
         """Render the episode's plan into DAG steps, after the plan guard.
@@ -832,10 +873,17 @@ class ReActPlan:
             if not det.ok:
                 log.warning("deterministic-output guard: %s", det.to_dict())
                 verdict.dropped_untargeted.extend(det.blocked)
+                # Drop only the steps the guard actually named.  The previous
+                # filter compared ``f"{tool}:"`` against the blocked strings, so
+                # one blocked ``edit_function:name=5`` removed *every*
+                # ``edit_function`` in the plan — a single invented value
+                # destroyed the legitimate edits around it.  Match the full
+                # signature instead.
+                blocked = {str(b) for b in det.blocked}
                 verdict.steps = [
                     step
                     for step in (verdict.steps or [])
-                    if f"{getattr(step, 'tool', '')}:" not in " ".join(det.blocked)
+                    if _step_signature(step) not in blocked
                 ]
         steps = [_describe_plan_step(step) for step in (verdict.steps or [])]
         if not steps:
@@ -906,6 +954,13 @@ class ReActPlan:
             ctx=runner.ctx,
             run_id=self._run_id or "react-plan",
             engine="react",
+            # ``react=True`` is what makes the harness dispatch through
+            # ``run_react`` — the only function that honours
+            # ``GIGAFORGE_REACT_ENGINE``.  Without it the harness called
+            # ``runner.run`` directly, so the LangGraph ReAct graph was
+            # unreachable on the product path while the ledger still said
+            # ``engine: react``.
+            react=True,
         )
         if not outcome.ok:
             log.warning(
@@ -924,6 +979,8 @@ class ReActPlan:
                 steps=steps,
                 strategy=self.name,
                 score=score_steps(steps),
+                localization=dict(getattr(result, "localization", None) or {}),
+                structured=list(getattr(result, "plan", None) or []),
                 candidates=[{
                     "branch": "react",
                     "steps": steps,

@@ -195,10 +195,12 @@ class Harness:
         policy: HarnessPolicy | None = None,
         tracer: Any = None,
         budgets: Any = None,
+        checkpointer: Any = None,
     ) -> None:
         self.policy = policy or HarnessPolicy()
         self._tracer = tracer
         self._budgets = budgets
+        self.checkpointer = checkpointer
 
     # -- public API ----------------------------------------------------------
     def run(
@@ -211,14 +213,31 @@ class Harness:
         run_id: str = "",
         engine: str = "",
         bootstrap_hint: str | None = None,
+        react: bool = False,
     ) -> HarnessResult:
-        """Run *runner* under the policy and return a :class:`HarnessResult`."""
+        """Run *runner* under the policy and return a :class:`HarnessResult`.
+
+        ``react=True`` dispatches through :func:`gigaforge.agents.engine.run_react`
+        instead of calling ``runner.run`` directly.  That distinction is the
+        whole point of the flag: ``run_react`` is the only function that knows
+        about ``GIGAFORGE_REACT_ENGINE``, so a harness that called ``runner.run``
+        itself made the LangGraph ReAct graph unreachable on the product path
+        while still labelling the ledger ``engine: react``.  Reporting one
+        engine and running another is exactly the class of defect the stack
+        command exists to prevent.
+        """
         from gigaforge.core.sync_adapter import await_blocking
+
+        resolved_engine = engine
+        if react:
+            from gigaforge.agents.engine import react_engine
+
+            resolved_engine = engine or react_engine()
 
         ledger = RunLedger(
             run_id=run_id or getattr(state, "task_id", "") or "run",
             goal=task,
-            engine=engine or type(runner).__name__,
+            engine=resolved_engine or type(runner).__name__,
         )
         outcome = HarnessResult(ledger=ledger)
         compactions = 0
@@ -226,9 +245,23 @@ class Harness:
         while True:
             outcome.attempts += 1
             try:
-                result = await_blocking(
-                    runner.run(task, state, ctx=ctx, bootstrap_hint=bootstrap_hint)
-                )
+                if react:
+                    from gigaforge.agents.engine import run_react
+
+                    result = run_react(
+                        runner,
+                        task,
+                        state,
+                        ctx=ctx,
+                        bootstrap_hint=bootstrap_hint,
+                        checkpointer=self.checkpointer,
+                        thread_id=run_id or getattr(state, "task_id", "") or "react-plan",
+                        engine=resolved_engine,
+                    )
+                else:
+                    result = await_blocking(
+                        runner.run(task, state, ctx=ctx, bootstrap_hint=bootstrap_hint)
+                    )
             except ContextOverflowError as exc:
                 # Recovery, not termination: compact and try the episode again.
                 if compactions >= self.policy.max_compactions:

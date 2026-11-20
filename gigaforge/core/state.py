@@ -14,7 +14,7 @@ Two things make an agent loop cheap and debuggable:
 from __future__ import annotations
 
 import hashlib
-import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
@@ -107,14 +107,78 @@ def build_system_prefix(
 
 @dataclass
 class PlanStep:
-    """One step of the agent's plan."""
+    """One step of the agent's plan — both faces of it.
 
-    index: int
-    description: str
+    Two shapes meet here and both are real:
+
+    * the **DAG's** plan is a list of human-readable lines, built by
+      :meth:`TaskState.set_plan` from strings — ``index`` + ``description``;
+    * the **agent layer's** plan is structured — ``tool`` + ``args``, which is
+      what ``ReActRunner`` emits and what ``plan_guard`` validates.
+
+    They used to be two different classes in two different modules
+    (``core.state.PlanStep`` and ``core.task_state.PlanStep``), so a plan
+    produced by one could not be read by the other.  That is the mechanical
+    reason the ReAct plan never reached the coder: there was no object both
+    sides agreed on, so "pass the plan along" had nothing to pass.
+    """
+
+    index: int = 0
+    description: str = ""
     status: str = "pending"   # pending | doing | done | failed | skipped
+    tool: str = ""
+    args: dict[str, Any] = field(default_factory=dict)
+    done: bool = False
+    result: Optional[dict[str, Any]] = None
+
+    def __post_init__(self) -> None:
+        # A DAG line (``"edit_function: foo"``) carries its tool in the text.
+        # Only an identifier-shaped prefix is treated as a tool name, so prose
+        # like ``"Note: check the tests"`` is not mistaken for one.
+        if not self.tool and self.description:
+            head, sep, rest = self.description.partition(":")
+            if sep and rest.strip() and _TOOL_NAME.match(head.strip()):
+                self.tool = head.strip()
+                self.args = self.args or {"target": rest.strip()}
+        if not self.description and self.tool:
+            self.description = render_plan_step(self.tool, self.args)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"index": self.index, "description": self.description, "status": self.status}
+        return {
+            "index": self.index,
+            "description": self.description,
+            "status": self.status,
+            "tool": self.tool,
+            "args": dict(self.args),
+            "done": self.done,
+        }
+
+    def to_status_dict(self) -> dict[str, Any]:
+        """Minimal stable-ordered dict for the KV-cache prefix.
+
+        Insertion order is fixed (tool, args, done) and ``result`` is excluded:
+        it changes after every step and would bust the prefix cache.
+        """
+        return {"tool": self.tool, "args": self.args, "done": self.done}
+
+
+#: A tool name is an identifier — never a sentence.
+_TOOL_NAME = re.compile(r"^[a-z_][a-z0-9_]*$")
+
+
+def render_plan_step(tool: str, args: Mapping[str, Any] | None = None) -> str:
+    """Render a structured step as the DAG's human-readable plan line."""
+    tool = str(tool or "").strip()
+    if not tool:
+        return ""
+    args = args if isinstance(args, Mapping) else {}
+    for key in ("name", "path", "file", "query", "target", "value"):
+        if key in args and str(args[key]).strip():
+            return f"{tool}: {args[key]}"
+    if args:
+        first = next(iter(args))
+        return f"{tool}: {args[first]}"
+    return tool
 
 
 @dataclass
@@ -126,8 +190,8 @@ class TaskState:
     and what a resumed run reads back.
     """
 
-    run_id: str
-    goal: str
+    run_id: str = ""
+    goal: str = ""
     task_hash: str = ""
     prefix: Optional[SystemPrefix] = None
     plan: list[PlanStep] = field(default_factory=list)
@@ -144,6 +208,63 @@ class TaskState:
     error: str = ""
     max_scratchpad_chars: int = 8000
     max_plan_steps: int = 24
+    #: The agent layer keys its trace and budget accounting on ``task_id``; the
+    #: DAG keys its checkpoints on ``run_id``.  They are the same run, so the
+    #: two names are kept in sync rather than being two classes.
+    task_id: str = ""
+    #: Free-form per-run metrics (the agent layer's name for ``counters``).
+    metrics: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.task_id and not self.run_id:
+            self.run_id = self.task_id
+        elif self.run_id and not self.task_id:
+            self.task_id = self.run_id
+
+    # ── agent-layer API ──────────────────────────────────────────────────────
+    def serialize_prefix(self) -> dict[str, Any]:
+        """Minimal stable-ordered prefix prepended before each LLM call.
+
+        Fixed key order: ``["goal", "plan", "slice_hash"]``.  Excludes the
+        scratchpad, metrics and per-step results — those mutate per step and
+        would bust any prefix-based KV cache.
+        """
+        return {
+            "goal": self.goal,
+            "plan": [s.to_status_dict() for s in self.plan],
+            "slice_hash": self.slice_hash,
+        }
+
+    def serialize_full(self) -> dict[str, Any]:
+        """Full state for persistence/tracing.  NOT used as the LLM prefix."""
+        return {
+            "goal": self.goal,
+            "task_id": self.task_id,
+            "git_sha": self.git_sha,
+            "slice_hash": self.slice_hash,
+            "plan": [s.to_dict() for s in self.plan],
+            "scratchpad": list(self.scratchpad),
+            "metrics": dict(self.metrics),
+        }
+
+    def add_fact(self, fact: str) -> None:
+        """Append a compact fact to the scratchpad.  No dedup — caller's job."""
+        if not isinstance(fact, str):
+            raise TypeError(f"add_fact expects str, got {type(fact).__name__}")
+        self.scratchpad.append(fact)
+
+    def mark_step_done(self, idx: int, result: dict[str, Any]) -> None:
+        """Flip step *idx* to done and record its result.
+
+        Raises ``IndexError`` when out of range — a silent no-op here would
+        make a plan look executed when nothing ran.
+        """
+        if idx < 0 or idx >= len(self.plan):
+            raise IndexError(f"plan step idx out of range: {idx} (len={len(self.plan)})")
+        step = self.plan[idx]
+        step.done = True
+        step.result = result
+        step.status = "done"
 
     # ── prompt assembly ──────────────────────────────────────────────────────
     def system_message(self) -> dict[str, str]:
@@ -181,11 +302,22 @@ class TaskState:
         return "\n".join(self.scratchpad)
 
     # ── plan ─────────────────────────────────────────────────────────────────
-    def set_plan(self, steps: Iterable[str]) -> None:
-        self.plan = [
-            PlanStep(index=i, description=desc.strip())
-            for i, desc in enumerate(list(steps)[: self.max_plan_steps])
-        ]
+    def set_plan(self, steps: Iterable[Any]) -> None:
+        """Install the plan, accepting either shape of step.
+
+        A ``str`` is a DAG line (``"edit_function: foo"``); a ``PlanStep`` is
+        already structured and is kept as it is.  Accepting both is what lets
+        the ReAct episode's plan — a list of ``PlanStep`` — be installed here
+        without a lossy round-trip through strings.
+        """
+        out: list[PlanStep] = []
+        for i, step in enumerate(list(steps)[: self.max_plan_steps]):
+            if isinstance(step, PlanStep):
+                step.index = i
+                out.append(step)
+            else:
+                out.append(PlanStep(index=i, description=str(step).strip()))
+        self.plan = out
 
     def mark_step(self, index: int, status: str) -> None:
         for step in self.plan:
@@ -228,6 +360,8 @@ class TaskState:
             "notes": dict(self.notes),
             "slice_hash": self.slice_hash,
             "git_sha": self.git_sha,
+            "task_id": self.task_id,
+            "metrics": _jsonable(self.metrics),
             "phase_usages": {k: dict(v) for k, v in self.phase_usages.items()},
             "counters": dict(self.counters),
             "artifacts": _jsonable(self.artifacts),
@@ -262,12 +396,17 @@ class TaskState:
             history=[dict(m) for m in (data.get("history") or [])],
             status=str(data.get("status", "running")),
             error=str(data.get("error", "")),
+            task_id=str(data.get("task_id", "")),
+            metrics=dict(data.get("metrics") or {}),
         )
         state.plan = [
             PlanStep(
                 index=int(s.get("index", i)),
                 description=str(s.get("description", "")),
                 status=str(s.get("status", "pending")),
+                tool=str(s.get("tool", "")),
+                args=dict(s.get("args") or {}),
+                done=bool(s.get("done", False)),
             )
             for i, s in enumerate(data.get("plan") or [])
         ]
@@ -299,6 +438,7 @@ __all__ = [
     "PlanStep",
     "build_system_prefix",
     "normalize_whitespace",
+    "render_plan_step",
     "DEFAULT_PERSONA",
     "DEFAULT_RULES",
 ]

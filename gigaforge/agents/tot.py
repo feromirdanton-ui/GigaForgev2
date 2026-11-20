@@ -533,9 +533,9 @@ class ToTPlanner:
                     f"{prompt}\n\n"
                     f"Задача: {task}\n\n"
                     f"План A (score={best.score:.1f}):\n"
-                    f"{json.dumps([s.model_dump(mode='json') for s in best.steps], ensure_ascii=False)}\n\n"
+                    f"{json.dumps([s.to_dict() for s in best.steps], ensure_ascii=False)}\n\n"
                     f"План B (score={runner_up.score:.1f}):\n"
-                    f"{json.dumps([s.model_dump(mode='json') for s in runner_up.steps], ensure_ascii=False)}"
+                    f"{json.dumps([s.to_dict() for s in runner_up.steps], ensure_ascii=False)}"
                 ),
             }
         ]

@@ -44,12 +44,14 @@ from gigaforge.client.giga_client import ChatResult, GigaClient
 from gigaforge.config import Settings, get_settings
 from gigaforge.core.budgets import BudgetTracker
 from gigaforge.core.context_window_guard import ContextOverflowError
+from gigaforge.core.loop_breaker import LoopBreaker
 from gigaforge.core.router import ModelRouter
 from gigaforge.core.task_state import PlanStep, TaskState
 from gigaforge.core.trace import Tracer
 from gigaforge.firewall import compress
 from gigaforge.firewall.tokens import estimate_tokens
 from gigaforge.l0.index import L0Index
+from gigaforge.providers.messages import nudge
 
 log = logging.getLogger(__name__)
 
@@ -592,6 +594,13 @@ class ReActRunner:
         trajectory.append({"role": "user", "content": base_user})
         # ToolContract: tell the model which tools exist, exactly once.
         trajectory.extend(self.guards.opening_messages(trajectory))
+        # LoopBreaker (ported from deepagents-gigachat): the classic loop had
+        # ``max_steps`` and a compaction cap but no detector for the model
+        # repeating itself, so an episode that grepped the same pattern three
+        # times burned its whole step budget.  The breaker is pure and bounded
+        # (one nudge per signature per run), so it is safe to consult on every
+        # observation.
+        breaker = LoopBreaker()
 
         for step_idx in range(self._max_steps):
             # ContextWindowGuard: compact before the request, not after a 422.
@@ -613,12 +622,11 @@ class ReActRunner:
                         kind="decision",
                         detail={"step_idx": step_idx, "detail": str(exc)[:400]},
                     )
-                    return result
-                trajectory = compacted
+                    return self._carry_trajectory(result, trajectory)
 
-            # Pre-budget check. Phase = "plan" (L1 Lite caps).
+            # Pre-budget check. Phase = "react" (its own cap, not the planner's).
             est_in = sum(len(m["content"]) for m in trajectory) // 4
-            est_out = max(self._s.budget_plan_out // 3, 200)
+            est_out = max(self._react_out() // 3, 200)
             self._budgets.check(_REACT_PHASE, est_in, est_out, task_id=state.task_id)
 
             # Reason — one LLM call.
@@ -627,7 +635,7 @@ class ReActRunner:
                 self._router.route(_REACT_PHASE),
                 trajectory,
                 temperature=0.1,
-                max_tokens=int(self._s.budget_plan_out),
+                max_tokens=self._react_out(),
                 task_id=state.task_id,
                 phase=_REACT_PHASE,
             )
@@ -664,6 +672,9 @@ class ReActRunner:
                         "salvaged_plan_size": len(salvaged),
                     },
                 )
+                # The exception still propagates — the budget is a hard stop —
+                # but the trajectory goes with it, so the caller can salvage.
+                self._carry_trajectory(result, trajectory)
                 raise
             except Exception:  # noqa: BLE001 — accounting best-effort
                 pass
@@ -740,7 +751,7 @@ class ReActRunner:
                         "recovered_from_observations": bool(plan) and not self._parse_finish_plan(action_input),
                     },
                 )
-                return result
+                return self._carry_trajectory(result, trajectory)
 
             # Act — invoke the tool.
             tool = self._registry.get(action)
@@ -814,6 +825,19 @@ class ReActRunner:
             audit = self.guards.after_observation(trajectory)
             if audit is not None:
                 trajectory.append(audit)
+            # LoopBreaker: the same three-signature detector the LangGraph
+            # ``observe`` node runs.  Without it the classic loop — which is the
+            # engine the product actually drives — had no defence against a
+            # model repeating a broken call until the step budget ran out.
+            signal = breaker.inspect(trajectory)
+            if signal is not None:
+                trajectory.append(nudge(signal.text, marker=signal.marker))
+                self._tracer.trace(
+                    state.task_id,
+                    step=f"react_step_{step_idx}_loop_breaker",
+                    kind="decision",
+                    detail={"kind": signal.kind, **dict(signal.detail or {})},
+                )
 
         # Reached the step cap without finishing.
         #
@@ -839,7 +863,7 @@ class ReActRunner:
                     "note": "step cap reached; plan recovered from the trajectory",
                 },
             )
-            return result
+            return self._carry_trajectory(result, trajectory)
 
         result.finish_reason = "max_steps"
         self._tracer.trace(
@@ -848,8 +872,31 @@ class ReActRunner:
             kind="decision",
             detail={"max_steps": self._max_steps, "llm_calls": result.llm_calls},
         )
-        # Carry the trajectory out: a caller that finds the plan unusable can
-        # salvage one from what the episode actually observed.
+        return self._carry_trajectory(result, trajectory)
+
+    def _react_out(self) -> int:
+        """Output-token ceiling for one ReAct step.
+
+        This used to be ``budget_plan_out`` (1000), while ``gigaforge stack``
+        advertised ``budget_react_out`` (8000) — the phase had its own budget
+        that nothing read.  A finish payload carrying a 4–6 step plan does not
+        fit in 1000 tokens, which is part of why live runs came back with
+        ``parse_failed``.  The react phase now uses its own number, and the
+        stack command reads the same setting.
+        """
+        return int(getattr(self._s, "budget_react_out", 0) or self._s.budget_plan_out)
+
+    @staticmethod
+    def _carry_trajectory(result: ReActResult, trajectory: list[dict[str, str]]) -> ReActResult:
+        """Attach the episode's trajectory to *result* before it is returned.
+
+        Every return path goes through here.  The trajectory used to be carried
+        out only on the ``max_steps`` branch, so the salvage in
+        ``ReActPlan._guarded_steps`` — written for exactly the case where the
+        model finishes with an unusable plan — never saw a trajectory on the
+        ``finish_action`` path, which is the path that case takes.  A recovery
+        that only works on the branch it was not written for is not a recovery.
+        """
         result.trajectory = list(trajectory)
         return result
 
@@ -869,9 +916,11 @@ class ReActRunner:
                     "You are out of steps. Do NOT call any tool. Using only the "
                     "observations above, return the plan now as ONE JSON object:\n"
                     '{"thought": "...", "action": "finish", "action_input": '
-                    '"[{\\"tool\\": \\"edit_function\\", \\"args\\": {\\"name\\": \\"<symbol>\\"}}]"}\n'
-                    "If the observations are inconclusive, still return your best "
-                    "single most likely edit. Never return an empty list."
+                    '"[{\\"tool\\": \\"read_structure\\", \\"args\\": {\\"path\\": \\"<file>\\"}}]"}\n'
+                    "Prefer read steps: a read step is always true of what you "
+                    "observed, while an edit step is a claim you did not verify. "
+                    "If the observations are inconclusive, return an empty list "
+                    "\u2014 that is an honest result, not a failure."
                 ),
             }
         )
@@ -880,7 +929,7 @@ class ReActRunner:
                 self._router.route(_REACT_PHASE),
                 convo,
                 temperature=0.0,
-                max_tokens=int(self._s.budget_plan_out),
+                max_tokens=self._react_out(),
                 task_id=state.task_id,
                 phase=_REACT_PHASE,
             )

@@ -928,6 +928,12 @@ class TaskPipeline:
                 budget_remaining=budget_remaining,
             )
         ctx.state.set_plan(outcome.steps)
+        # The plan is not just a telemetry line: the coder reads it.  Keep the
+        # structured form and the localisation on the run context, because
+        # ``_node_act`` is where they are consumed and the DAG only passes
+        # declared inputs between nodes.
+        ctx.extras["plan_structured"] = list(getattr(outcome, "structured", None) or [])
+        ctx.extras["localization"] = dict(getattr(outcome, "localization", None) or {})
         plan = [s.description for s in ctx.state.plan]
         self._event(
             "pipeline.plan",
@@ -947,6 +953,44 @@ class TaskPipeline:
             except Exception as exc:  # noqa: BLE001 - reporting must not fail a run
                 log.debug("could not write the run ledger: %s", exc)
         return {"plan": plan, "plan_meta": outcome.to_dict()}
+
+    def _plan_block(self, ctx: RunContext, inputs: Mapping[str, Any]) -> str:
+        """Render the plan and its localisation for the coder's prompt.
+
+        Two things the coder needs and did not have:
+
+        * **The plan.**  A list of the steps the episode decided on.  Without it
+          the model re-derives the approach from the goal, which is exactly the
+          work the episode already did.
+        * **The localisation.**  ``target_function`` / ``target_file``.  This is
+          the difference between "change the code" and "change ``add`` in
+          ``math_utils.py``", and it is the part that stops the model guessing
+          a file.
+
+        Returns an empty string when there is nothing to say, so a linear plan
+        with no localisation produces byte-identical prompts to before.
+        """
+        lines: list[str] = []
+        plan = inputs.get("plan") or [s.description for s in ctx.state.plan]
+        plan = [str(line).strip() for line in plan if str(line).strip()]
+        if plan:
+            lines.append("## Plan (from the exploration phase)")
+            lines.extend(f"{i + 1}. {line}" for i, line in enumerate(plan))
+
+        loc = ctx.extras.get("localization") or {}
+        target_function = str(loc.get("target_function") or "").strip()
+        target_file = str(loc.get("target_file") or "").strip()
+        if target_function or target_file:
+            lines.append("## Localization")
+            if target_file:
+                lines.append(f"- file: {target_file}")
+            if target_function:
+                lines.append(f"- symbol: {target_function}")
+            lines.append(
+                "Change exactly this target; do not widen the edit to other "
+                "files or symbols unless the plan says so."
+            )
+        return "\n".join(lines)
 
     def _file_context(self, goal: str, *, limit: int = 4, max_chars: int = 12000) -> str:
         """The real text of the files a goal names — for the coder's prompt.
@@ -1207,6 +1251,13 @@ class TaskPipeline:
 
         slice_obj = inputs.get("slice")
         slice_text = slice_obj.render() if slice_obj is not None else ""
+        # The plan the episode paid for.  ``_node_act`` declared ``plan`` as a
+        # required input and then never read it, so every ReAct run — 4–6 model
+        # calls plus tool calls — was billed and thrown away while the coder
+        # re-derived the target from the goal.  Hand it over explicitly.
+        plan_block = self._plan_block(ctx, inputs)
+        if plan_block:
+            slice_text = f"{slice_text}\n\n{plan_block}" if slice_text else plan_block
         extra = self._file_context(ctx.state.goal)
         if extra:
             slice_text = f"{slice_text}\n{extra}" if slice_text else extra

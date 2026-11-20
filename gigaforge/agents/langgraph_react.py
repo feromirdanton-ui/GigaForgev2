@@ -405,7 +405,9 @@ def build_react_graph(
             "finished": True,
             "finish_reason": "finish_action",
             "plan": [
-                step.model_dump() if hasattr(step, "model_dump") else dict(step)
+                step.model_dump() if hasattr(step, "model_dump") else (
+                    step.to_dict() if hasattr(step, "to_dict") else dict(step)
+                )
                 for step in plan
             ],
             "localization": localization,
