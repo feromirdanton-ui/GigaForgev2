@@ -1728,10 +1728,21 @@ class TaskPipeline:
         # and the page in the diff would diverge, and the run would report the
         # model's version while the tree held the harness's.  Measured: the
         # assembled page had 1 <style> and the applied diff reintroduced a second.
+        #
+        # Only the *model's* contribution is dropped.  The first version dropped
+        # every hunk for an owned path, which also removed the harness's own
+        # ``initial_diff`` — measured live: the fix loop accepted the page, then
+        # settle reported ``diff_chars: 0, files: 0`` and the goal loop rejected
+        # three cycles running with the error "ok".  The harness's own hunks are
+        # put back, so the diff describes the page that exists.
         owned = set(ctx.extras.get("harness_owned_paths") or [])
         if owned and result.diff:
             before = len(result.diff)
             result.diff = _drop_hunks_for(result.diff, owned)
+            if prefetched:
+                result.diff = _merge_repaired_diff(
+                    result.diff, _keep_hunks_for(prefetched, owned)
+                )
             if len(result.diff) != before:
                 self._event("pipeline.harness_owned_hunks_dropped", run_id=ctx.run_id,
                             paths=sorted(owned))
@@ -2966,6 +2977,35 @@ def _drop_hunks_for(diff: str, paths: set[str]) -> str:
                 if token.startswith(("a/", "b/")):
                     if token[2:].lstrip("./") in wanted:
                         drop = True
+                        break
+        else:
+            current.append(line)
+    flush()
+    return "".join(kept)
+
+
+def _keep_hunks_for(diff: str, paths: set[str]) -> str:
+    """The complement of :func:`_drop_hunks_for`: only the hunks for *paths*."""
+    if not diff or not paths:
+        return ""
+    wanted = {p.replace("\\", "/").lstrip("./") for p in paths}
+    kept: list[str] = []
+    current: list[str] = []
+    keep = False
+
+    def flush() -> None:
+        if current and keep:
+            kept.extend(current)
+
+    for line in diff.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            flush()
+            current = [line]
+            keep = False
+            for token in line.split():
+                if token.startswith(("a/", "b/")):
+                    if token[2:].lstrip("./") in wanted:
+                        keep = True
                         break
         else:
             current.append(line)
