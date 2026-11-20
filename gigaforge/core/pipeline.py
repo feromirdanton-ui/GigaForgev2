@@ -256,11 +256,13 @@ class TaskPipeline:
         # Measured live: a "build a cyberpunk site" goal produced a single
         # 2.5 KB page in one model call, with ``react->linear`` in the trace.
         #
-        # Attaching the factory here is the one place that covers every
-        # construction path, and it is a no-op for a strategy that does not
-        # explore (linear, ToT) or one that already has a factory.
-        if getattr(self.plan_strategy, "_runner_factory", None) is None:
-            setattr(self.plan_strategy, "_runner_factory", self._build_react_runner)
+        # The factory is rebound *unconditionally*, not only when it is absent.
+        # A goal run builds a second, isolated pipeline and hands it the same
+        # strategy object; keeping the first pipeline's factory made the
+        # isolated run write into the *destination* instead of its workspace,
+        # and the publish then failed with "destination changed while the goal
+        # was running" — the run had changed it itself.
+        setattr(self.plan_strategy, "_runner_factory", self._build_react_runner)
         self.review_strategy: ReviewStrategy = review_strategy or build_review_strategy()
 
         self._owns_metrics = metrics is None
@@ -396,8 +398,7 @@ class TaskPipeline:
             # ``build_plan_strategy(name)`` with no factory, exactly like the
             # injected one in ``__init__``.  Without this the switch to ``react``
             # would look applied and still plan linearly.
-            if getattr(self.plan_strategy, "_runner_factory", None) is None:
-                setattr(self.plan_strategy, "_runner_factory", self._build_react_runner)
+            setattr(self.plan_strategy, "_runner_factory", self._build_react_runner)
         if "review_strategy" in changes:
             self.review_strategy = changes["review_strategy"]
 
