@@ -132,6 +132,60 @@ class WorktreeManager:
         except WorktreeError:
             return ""
 
+    def snapshot(self) -> str:
+        """A commit object for the CURRENT working tree, without touching it.
+
+        ``git stash create`` builds a commit from the index and the working tree
+        and prints its SHA, leaving the index, the working tree and the stash
+        list exactly as they were.  That is the primitive a worktree needs: a
+        checkout of *what is on disk right now*.
+
+        **Why this matters.**  ``create()`` based every worktree on ``HEAD``, and
+        the pipeline never commits — it applies a diff to the working tree and
+        moves on.  So a second cycle's sub-agents were handed the *original*
+        files, re-derived the original bug, and their diffs were applied on top
+        of the first cycle's accepted work.  Measured live: cycle 1 fixed both
+        files and was accepted; cycles 2 and 3 each rewrote one file back to its
+        broken state, and the run ended with the bug it started with.  The
+        harness undid its own accepted work.
+
+        Returns ``""`` when the tree is clean (nothing to snapshot) or when git
+        cannot produce one; the caller then falls back to ``HEAD``, which is
+        correct for a clean tree.
+        """
+        try:
+            return self._run("stash", "create").strip()
+        except WorktreeError:
+            return ""
+
+    def _sync_untracked(self, path: str) -> None:
+        """Copy untracked files from the repo into a fresh worktree.
+
+        ``git stash create`` covers tracked modifications only, so a file a
+        previous cycle *created* would be missing from the worktree and the
+        child would create it again from scratch.  Copying the untracked set is
+        the deterministic completion of the snapshot.
+        """
+        try:
+            listing = self._run("ls-files", "--others", "--exclude-standard")
+        except WorktreeError:
+            return
+        for rel in listing.splitlines():
+            rel = rel.strip()
+            if not rel:
+                continue
+            source = Path(self.repo_root) / rel
+            target = Path(path) / rel
+            if not source.is_file():
+                continue
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+            except OSError:
+                # A file that cannot be copied is reported by the child's own
+                # validation, not by a crash here.
+                continue
+
     # ── lifecycle ────────────────────────────────────────────────────────────
     def create(self, name: str, *, base: str = "", branch: Optional[str] = None) -> Worktree:
         """Create a worktree named ``name``.
@@ -156,9 +210,23 @@ class WorktreeManager:
             args = ["worktree", "add", "-b", branch_name, path]
             if base:
                 args.append(base)
-            elif self.head():
-                args.append(self.head())
+            else:
+                # Base the worktree on the CURRENT tree, not on HEAD.  The
+                # pipeline applies diffs to the working tree and never commits,
+                # so HEAD is the state before the run started: a second cycle's
+                # children were handed the original files, re-derived the
+                # original bug, and their diffs were applied on top of the first
+                # cycle's accepted work.  Measured live: cycle 1 fixed both
+                # files and was accepted, cycles 2 and 3 rewrote one file each
+                # back to its broken state, and the run ended with the bug it
+                # started with.
+                snapshot = self.snapshot()
+                args.append(snapshot or self.head())
             self._run(*args)
+            if not base:
+                # ``stash create`` covers tracked modifications only; a file a
+                # previous cycle created is untracked and would be missing.
+                self._sync_untracked(path)
             worktree = Worktree(name=name, path=path, branch=branch_name,
                                 base=base or self.head(), created=True)
             self._created[safe] = worktree
