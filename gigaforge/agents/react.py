@@ -785,7 +785,7 @@ class ReActRunner:
             if blocked is not None:
                 kind = _kind_for_tool(action)
                 compressed = compress(kind, blocked, limit_tokens=_OBS_TOKEN_BUDGET)
-                observation = json.dumps(compressed, ensure_ascii=False)
+                observation = compressed.text
                 trajectory.append({"role": "assistant", "content": text})
                 trajectory.append(
                     {"role": "user", "content": f"Observation ({kind}):\n{observation}"}
@@ -829,7 +829,7 @@ class ReActRunner:
             # model reads is already correct.
             raw_obs = self.guards.normalize_observation(action, raw_obs)
             compressed = compress(kind, raw_obs, limit_tokens=_OBS_TOKEN_BUDGET)
-            observation = json.dumps(compressed, ensure_ascii=False)
+            observation = compressed.text
             # Cap the observation text (belt-and-braces).
             if estimate_tokens(observation) > _OBS_TOKEN_BUDGET:
                 observation = observation[: _OBS_TOKEN_BUDGET * 4] + "\n[truncated]"

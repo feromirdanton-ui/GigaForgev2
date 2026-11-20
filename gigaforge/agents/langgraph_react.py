@@ -339,7 +339,7 @@ def build_react_graph(
         if blocked is not None:
             kind = _kind_for_tool(action)
             compressed = compress(kind, blocked, limit_tokens=_OBS_TOKEN_BUDGET)
-            observation = json.dumps(compressed, ensure_ascii=False)
+            observation = compressed.text
             _emit("react.shell_blocked", action=action, detail=blocked[:200])
             return {
                 "observation": observation,
@@ -355,7 +355,7 @@ def build_react_graph(
             raw = f"ERROR: tool {action!r} raised: {exc}"
         kind = _kind_for_tool(action)
         compressed = compress(kind, raw, limit_tokens=_OBS_TOKEN_BUDGET)
-        observation = json.dumps(compressed, ensure_ascii=False)
+        observation = compressed.text
         if estimate_tokens(observation) > _OBS_TOKEN_BUDGET:
             observation = observation[: _OBS_TOKEN_BUDGET * 4] + "\n[truncated]"
         _emit("react.observation", action=action, kind=kind, chars=len(observation))

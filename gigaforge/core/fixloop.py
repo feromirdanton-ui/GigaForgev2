@@ -179,7 +179,12 @@ class FixLoop:
         if self.firewall is not None:
             try:
                 result = self.firewall.compress(text, kind="auto", hint=hint)
-                payload = result.payload if hasattr(result, "payload") else None
+                # ``CompressionResult`` exposes the payload as ``.data``; the
+                # old code read ``.payload``, which never existed, so the
+                # compression branch silently fell through to the raw
+                # ``text[:2000]`` cut on every single call.  A best-effort
+                # branch that always fails is not best-effort, it is dead.
+                payload = getattr(result, "data", None)
                 if payload is not None:
                     import json as _json
                     return _json.dumps(payload, ensure_ascii=False)[:4000]

@@ -63,27 +63,52 @@ def compress(
     *,
     limit_tokens: int = 4000,
     **kwargs: Any,
-) -> Any:
-    """Dispatch raw output to compressor. Supports both (kind, raw) and (source, kind)."""
+) -> CompressionResult:
+    """Dispatch raw output to a compressor; **always** return a result envelope.
+
+    Two call shapes are accepted, because both are in use across the codebase:
+    ``compress(kind, raw)`` and ``compress(raw, kind)``.
+
+    **The return type is part of the contract.**  This function used to return
+    whatever the selected compressor produced: a ``CompressionResult`` from the
+    newer compressors and a bare ``dict`` from the legacy ones in
+    :mod:`gigaforge.firewall.compressors`.  Every caller then had to guess, and
+    the ones that did the documented thing —
+
+        packed = compress("grep", raw)
+        prompt += packed.text
+
+    — crashed with ``AttributeError: 'dict' object has no attribute 'text'``
+    whenever the legacy branch was taken.  A public function whose return type
+    depends on an internal branch is not a contract, so the branch is now
+    invisible: :func:`~gigaforge.firewall.compress.base.coerce_result` wraps a
+    legacy payload in the same envelope the new compressors already return.
+    """
+    from gigaforge.firewall.compress.base import coerce_result, shrink_or_passthrough
+
     if arg1 in COMPRESSORS:
-        compressor = COMPRESSORS[arg1]
+        kind, source = arg1, arg2
+        compressor = COMPRESSORS[kind]
         try:
-            return compressor.compress(arg2, limit_tokens=limit_tokens, **kwargs)
+            raw = compressor.compress(source, limit_tokens=limit_tokens, **kwargs)
         except TypeError:
-            return compressor.compress(arg2, limit_tokens=limit_tokens)
+            raw = compressor.compress(source, limit_tokens=limit_tokens)
         except Exception as exc:
             from gigaforge.firewall.base import fail_dict as _fail
-            return _fail(f"compressor {arg1!r} failed: {exc.__class__.__name__}: {exc}", arg2)
+            raw = _fail(f"compressor {kind!r} failed: {exc.__class__.__name__}: {exc}", source)
+        return shrink_or_passthrough(coerce_result(raw, kind=kind, source=source), source)
 
     if arg2 in COMPRESSORS:
-        compressor = COMPRESSORS[arg2]
+        kind, source = arg2, arg1
+        compressor = COMPRESSORS[kind]
         try:
-            return compressor.compress(arg1, limit_tokens=limit_tokens, **kwargs)
+            raw = compressor.compress(source, limit_tokens=limit_tokens, **kwargs)
         except TypeError:
-            return compressor.compress(arg1, limit_tokens=limit_tokens)
+            raw = compressor.compress(source, limit_tokens=limit_tokens)
         except Exception as exc:
             from gigaforge.firewall.base import fail_dict as _fail
-            return _fail(f"compressor {arg2!r} failed: {exc.__class__.__name__}: {exc}", arg1)
+            raw = _fail(f"compressor {kind!r} failed: {exc.__class__.__name__}: {exc}", source)
+        return shrink_or_passthrough(coerce_result(raw, kind=kind, source=source), source)
 
     return compress_m5(arg1, arg2 or "auto", config=config, **kwargs)
 

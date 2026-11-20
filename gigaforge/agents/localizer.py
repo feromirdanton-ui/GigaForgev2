@@ -371,7 +371,7 @@ class LocalizerAgent:
             user_parts.append(
                 "Сжатый вывод grep (Firewall, не более "
                 f"{_GREP_LLM_BUDGET_TOKENS} токенов):\n"
-                + json.dumps(grep_compressed, ensure_ascii=False)
+                + grep_compressed.text
             )
         user_parts.append("Карта репозитория (L0):\n" + repo_map_text)
         user_content = "\n\n".join(user_parts)

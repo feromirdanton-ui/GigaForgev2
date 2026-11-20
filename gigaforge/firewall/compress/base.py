@@ -247,10 +247,97 @@ def finalise(
     )
 
 
+def coerce_result(
+    value: Any,
+    *,
+    kind: str,
+    source: str = "",
+    chars_per_token: float = 4.0,
+) -> CompressionResult:
+    """Normalise whatever a compressor returned into a :class:`CompressionResult`.
+
+    **Why this exists.**  The project has two generations of compressors: the
+    newer ones in :mod:`gigaforge.firewall.compress` return a
+    ``CompressionResult``, and the older ones in
+    :mod:`gigaforge.firewall.compressors` return a bare ``dict``.  The public
+    dispatcher ``gigaforge.firewall.compress()`` routed to both and returned
+    whatever came back, so a caller that did the documented thing —
+
+        packed = compress("grep", raw)
+        prompt += packed.text
+
+    — got ``AttributeError: 'dict' object has no attribute 'text'`` on the
+    legacy path and a working object on the new one.  A public function whose
+    return type depends on which internal branch it took is not a contract.
+
+    A ``dict`` is wrapped, not re-parsed: its keys are already the payload, and
+    re-running a compressor over its own output would double-count the
+    truncation flags.  ``source`` is passed so the token accounting stays
+    honest — a wrapped legacy payload still reports what it saved.
+    """
+    if isinstance(value, CompressionResult):
+        return value
+    if isinstance(value, dict):
+        payload = dict(value)
+        # Legacy compressors signal truncation with a private ``_truncated``
+        # counter rather than the envelope's flag; lift it so a caller reading
+        # ``.truncated`` is not told a cut payload was complete.
+        truncated = bool(payload.pop("_truncated", 0))
+        rendered = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        return CompressionResult(
+            kind=kind,
+            data=payload,
+            source_chars=len(source),
+            compressed_chars=len(rendered),
+            truncated=truncated,
+            chars_per_token=chars_per_token,
+        )
+    # A compressor that returned a string (or anything else) is still usable:
+    # treat it as the payload body rather than raising inside a best-effort
+    # path that runs on every tool observation.
+    text = "" if value is None else str(value)
+    return CompressionResult(
+        kind=kind,
+        data={"text": text},
+        source_chars=len(source),
+        compressed_chars=len(text),
+        chars_per_token=chars_per_token,
+    )
+
+
+def shrink_or_passthrough(result: CompressionResult, source: str) -> CompressionResult:
+    """Never hand back a payload larger than the raw output it replaced.
+
+    **Measured, not assumed.**  A structured payload carries field names, so on
+    a *small* input it is bigger than the input: two grep lines (44 chars) become
+    a 142-char JSON object with ``file``/``line``/``symbol``/``content`` keys.
+    The firewall's whole purpose is to spend fewer tokens, and a compressor that
+    expands a short observation is doing the opposite of its job — the model
+    pays for the schema and gets no information it did not already have.
+
+    The fix is not to disable the structured form (it is what makes a *large*
+    payload cheap); it is to compare and take the smaller one.  The result says
+    which happened, so a report can tell "compressed 40x" from "passed through".
+    """
+    if not source or result.compressed_chars <= result.source_chars:
+        return result
+    return CompressionResult(
+        kind=result.kind,
+        data={"text": source},
+        source_chars=len(source),
+        compressed_chars=len(source),
+        truncated=False,
+        chars_per_token=result.chars_per_token,
+        meta={**result.meta, "passthrough": "structured payload was larger"},
+    )
+
+
 __all__ = [
     "MARKER",
     "Truncator",
     "CompressionResult",
+    "coerce_result",
+    "shrink_or_passthrough",
     "clip",
     "clip_multiline",
     "take",
