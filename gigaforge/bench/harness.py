@@ -153,7 +153,7 @@ TASK1 = TaskFixture(
     plan_response=_TASK1_PLAN,
     code_responses=[_TASK1_DIFF],
     review_responses=[_TASK1_REVIEW_OK],
-    test_command=["python3", "-m", "pytest", "-q", "tests/"],
+    test_command=[sys.executable, "-m", "pytest", "-q", "tests/"],
     expected_diff_substring="[a-z]+",
     test_args=["-q", "tests/"],
 )
@@ -211,7 +211,7 @@ TASK2 = TaskFixture(
     plan_response=_TASK2_PLAN,
     code_responses=[_TASK2_DIFF],
     review_responses=[_TASK1_REVIEW_OK],
-    test_command=["python3", "-m", "pytest", "-q", "tests/"],
+    test_command=[sys.executable, "-m", "pytest", "-q", "tests/"],
     expected_diff_substring="a + b",
     test_args=["-q", "tests/"],
 )
@@ -273,7 +273,7 @@ TASK3 = TaskFixture(
     plan_response=_TASK3_PLAN,
     code_responses=[_TASK3_DIFF],
     review_responses=[_TASK1_REVIEW_OK],
-    test_command=["python3", "-m", "pytest", "-q", "tests/"],
+    test_command=[sys.executable, "-m", "pytest", "-q", "tests/"],
     expected_diff_substring="total = price * qty",
     test_args=["-q", "tests/"],
 )
@@ -339,7 +339,7 @@ TASK4 = TaskFixture(
     plan_response=_TASK4_PLAN,
     code_responses=[_TASK4_DIFF],
     review_responses=[_TASK1_REVIEW_OK],
-    test_command=["python3", "-m", "pytest", "-q", "tests/"],
+    test_command=[sys.executable, "-m", "pytest", "-q", "tests/"],
     expected_diff_substring="[a-z]{3,}",
     test_args=["-q", "tests/"],
 )

@@ -245,7 +245,11 @@ class DiffValidator:
         for fp in applied_files:
             full = worktree / fp
             lint_result = lint(full)
-            if not lint_result.ok:
+            # A linter that could not run is not a defect in the diff.  The
+            # module contract is to degrade to syntax-check-only, and treating
+            # "ruff missing" as a lint error rejected every edit on a machine
+            # without ruff — including the HITL edit path.
+            if not lint_result.ok and not lint_result.skipped:
                 errs = ", ".join(
                     f"{e['code']}:{e['line']} {e['message']}"
                     for e in lint_result.errors[:_MAX_LINT_IN_REASON]

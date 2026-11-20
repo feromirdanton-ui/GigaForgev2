@@ -308,6 +308,10 @@ class Linter:
 class LintResult:
     ok: bool
     errors: list[dict] = field(default_factory=list)
+    # True when the linter could not run at all (binary missing, timeout).
+    # A missing tool is not a defect in the code under test, so it must not
+    # reject an edit: the module contract is "degrade to syntax-check-only".
+    skipped: bool = False
 
     @property
     def count(self) -> int:
@@ -335,6 +339,11 @@ def lint(path: Path | str) -> LintResult:
     rc, out, err = _run_ruff_check(path)
     if rc == 0:
         return LintResult(ok=True, errors=[])
+    if rc == -1:
+        # The linter itself is unavailable.  Reporting this as a lint error made
+        # every edit fail on a machine without ruff, which is the opposite of
+        # the documented degradation and blocked the HITL edit path entirely.
+        return LintResult(ok=True, errors=[], skipped=True)
     if not out.strip():
         return LintResult(
             ok=False,
