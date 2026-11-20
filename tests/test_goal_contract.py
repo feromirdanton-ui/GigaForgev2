@@ -73,6 +73,10 @@ def _page(style: str, body: str) -> str:
     filler = "<div class='feature-box'>harness capability</div>" * 40
     return (
         "<!DOCTYPE html><html><head><style>" + style + "</style></head><body>"
+        # A headline is part of what a landing page is; the contract now checks
+        # for it, so a fixture without one would fail for a reason unrelated to
+        # the test.
+        + "<h1>GigaForge</h1>"
         + body + filler + "</body></html>"
     )
 
@@ -148,3 +152,55 @@ def test_a_passing_verdict_has_no_observation(tmp_path: Path) -> None:
     verdict = check_artifacts(extract_requirements(GOAL), tmp_path)
     assert verdict.ok, verdict.unmet
     assert verdict.as_observation() == ""
+
+
+class TestHeadlineAndMetaCopy:
+    """Two things a live goal run shipped and the contract accepted.
+
+    The page had no <h1> at all — the hero was a <section> whose first child was
+    an <h2> — and a feature card read "This is where we showcase our
+    cutting-edge AI technology", a description of what the card would say
+    accepted as the card's content.
+    """
+
+    def test_a_page_without_a_headline_is_rejected(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            _page(
+                "body{color:#00ffff;background:#ff00ff}",
+                "<section class='hero'><h2>GigaForge</h2></section>"
+                "<div class='grid'><div class='feature-box'>x</div></div>"
+                "<footer>c</footer>",
+            ).replace("<h1>GigaForge</h1>", ""),
+        )
+        verdict = check_artifacts(extract_requirements(GOAL), tmp_path)
+        assert not verdict.ok
+        assert any("headline" in item for item in verdict.unmet), verdict.unmet
+
+    def test_an_empty_headline_is_rejected(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            _page(
+                "body{color:#00ffff;background:#ff00ff}",
+                "<section class='hero'><h1>   </h1></section>"
+                "<div class='grid'><div class='feature-box'>x</div></div>"
+                "<footer>c</footer>",
+            ).replace("<h1>GigaForge</h1>", ""),
+        )
+        verdict = check_artifacts(extract_requirements(GOAL), tmp_path)
+        assert not verdict.ok
+
+    def test_meta_copy_is_a_placeholder(self, tmp_path: Path) -> None:
+        _write(
+            tmp_path,
+            _page(
+                "body{color:#00ffff;background:#ff00ff}",
+                "<section class='hero'><h1>GigaForge</h1></section>"
+                "<div class='grid'><div class='feature-box'>"
+                "This is where we showcase our cutting-edge AI technology."
+                "</div></div><footer>c</footer>",
+            ),
+        )
+        verdict = check_artifacts(extract_requirements(GOAL), tmp_path)
+        assert not verdict.ok
+        assert any("this is where we" in item.lower() for item in verdict.unmet), verdict.unmet

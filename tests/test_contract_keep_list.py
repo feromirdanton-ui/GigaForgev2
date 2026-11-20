@@ -52,6 +52,7 @@ def test_the_correction_step_names_what_to_keep(tmp_path: Path) -> None:
 def test_a_satisfied_contract_produces_no_observation(tmp_path: Path) -> None:
     (tmp_path / "index.html").write_text(
         "<style>body{color:cyan;border-color:magenta}</style>\n"
+        "<h1>GigaForge</h1>\n"
         "<section class='hero'>h</section>\n<div class='grid'>g</div>\n"
         "<footer>f</footer>\n" + "x" * 1400
     )

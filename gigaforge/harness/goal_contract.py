@@ -139,6 +139,14 @@ _PLACEHOLDER_PATTERNS = (
     r"\bsample\s+text\b",
     r"\bexample\s+content\b",
     r"\binsert\s+.{0,20}\s+here\b",
+    # Meta-copy: a sentence that describes the page instead of being the page.
+    # Measured live: a feature card read "This is where we showcase our
+    # cutting-edge AI technology" — a description of what the card would say,
+    # accepted as the card's content.
+    r"\bthis\s+is\s+where\s+we\b",
+    r"\bthis\s+section\s+(?:will\s+)?(?:show|showcase|display|contain)\b",
+    r"\bhere\s+you\s+can\s+(?:see|find|learn)\b",
+    r"\badd\s+your\s+.{0,20}\s+here\b",
 )
 
 #: Deliberately NOT included: a bare run of ``x`` characters.  It looks like a
@@ -309,6 +317,12 @@ def extract_requirements(goal: str) -> list[Requirement]:
     if len(reqs) >= 3:
         reqs.append(
             Requirement(
+                "heading",
+                "a headline (<h1>)",
+            )
+        )
+        reqs.append(
+            Requirement(
                 "min_size",
                 f"artifact of at least {_MIN_ARTIFACT_BYTES} bytes",
             )
@@ -388,6 +402,22 @@ def check_artifacts(
                 verdict.unmet.append(
                     f"{req.label} (largest file is {biggest} bytes)"
                 )
+            continue
+        if req.kind == "heading":
+            # A landing page without an <h1> has no headline, which is the one
+            # thing a hero section exists to provide.  Measured live: a page
+            # passed every check with no <h1> at all — the hero was a <section>
+            # whose first child was an <h2>.
+            found = any(
+                # ``[^<\s]`` and not ``\S``: the closing ``</h1>`` starts with
+                # ``<``, which ``\S`` happily matches, so an empty headline
+                # passed the check.
+                re.search(r"<h1\b[^>]*>\s*[^<\s]", text, re.I) for text in texts.values()
+            )
+            if found:
+                verdict.met.append(req.label)
+            else:
+                verdict.unmet.append(f"{req.label} — no non-empty <h1> in the page")
             continue
         if req.kind == "substance":
             # Name the offending phrases: "add real content" is not actionable,
