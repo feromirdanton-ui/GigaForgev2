@@ -1,5 +1,5 @@
 {
-  "started_at": 1795164004.2463255,
+  "started_at": 1795164256.5455413,
   "credentials_present": true,
   "model": "GigaChat",
   "ok": true,
@@ -9,7 +9,7 @@
     {
       "name": "atokens_count",
       "ok": true,
-      "latency_ms": 986,
+      "latency_ms": 1204,
       "detail": {
         "short": 8,
         "long": 208
@@ -19,14 +19,15 @@
     {
       "name": "response_format",
       "ok": true,
-      "latency_ms": 358,
+      "latency_ms": 378,
       "detail": {
         "parsed": true,
         "head": "{\"steps\": [{\"tool\": \"grep\"}]}",
         "usage": {
-          "prompt_tokens": 145,
+          "prompt_tokens": 141,
           "completion_tokens": 26,
-          "total_tokens": 171
+          "total_tokens": 167,
+          "cached_tokens": 4
         }
       },
       "error": ""
@@ -34,7 +35,7 @@
     {
       "name": "context_overflow",
       "ok": true,
-      "latency_ms": 234,
+      "latency_ms": 138,
       "detail": {
         "recognised_as_overflow": true
       },
@@ -43,39 +44,35 @@
     {
       "name": "rate_limit",
       "ok": true,
-      "latency_ms": 1258,
+      "latency_ms": 1406,
       "detail": {
-        "errors": [
-          "RateLimitError"
-        ],
-        "saw_429": true,
+        "errors": [],
+        "saw_429": false,
         "retry_after": null,
-        "note": "429 observed: the Retry-After branch is confirmed live"
+        "note": "no 429 in this burst: the account had headroom, so the Retry-After branch is NOT confirmed live by this run"
       },
       "error": ""
     },
     {
       "name": "react_plan",
       "ok": true,
-      "latency_ms": 8475,
+      "latency_ms": 8553,
       "detail": {
         "strategy": "react",
         "steps": 3,
         "first_step": "read_structure: gigaforge/agents/harness_prompt.py",
         "llm_calls": 2,
-        "localization": {
-          "target_function_guess": "The"
-        }
+        "localization": {}
       },
       "error": ""
     },
     {
       "name": "checkpointer",
       "ok": true,
-      "latency_ms": 2599,
+      "latency_ms": 2116,
       "detail": {
         "checkpoints": 4,
-        "db_bytes": 65536,
+        "db_bytes": 61440,
         "llm_calls": 1,
         "finish_reason": "finish_action"
       },
@@ -84,13 +81,13 @@
     {
       "name": "goal_to_diff",
       "ok": true,
-      "latency_ms": 6943,
+      "latency_ms": 7769,
       "detail": {
         "diff_chars": 196,
         "diff_applied": true,
         "repo_tests_pass": true,
         "finish_reason": "",
-        "plan_used": false
+        "plan_used": true
       },
       "error": ""
     }
