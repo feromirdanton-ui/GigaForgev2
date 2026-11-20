@@ -1747,6 +1747,16 @@ class TaskPipeline:
                 self._event("pipeline.harness_owned_hunks_dropped", run_id=ctx.run_id,
                             paths=sorted(owned))
 
+        # Dropping the hunk from the diff does not undo what the fix loop already
+        # applied to the tree.  The harness's own content is authoritative, so it
+        # is written back — measured live, a 5452-byte assembled page was replaced
+        # by the model's 1139-byte hero-only answer and the contract then reported
+        # the sections the harness had built as missing.
+        restored = self._restore_harness_owned(ctx)
+        if restored:
+            self._event("pipeline.harness_owned_restored", run_id=ctx.run_id,
+                        paths=restored)
+
         route = self.router.last_route if self.router else None
         proposal = ProposeResult(
             diff=result.diff,
@@ -2175,6 +2185,36 @@ class TaskPipeline:
             llm=outcome.llm_used,
         )
         return {"review_verdict": outcome.to_dict()}
+
+    def _restore_harness_owned(self, ctx: RunContext) -> list[str]:
+        """Write the harness's own files back over whatever the model applied.
+
+        The fix loop applies the model's diff to the worktree.  For a path the
+        harness built itself, that application is a regression: the assembled
+        page is the plan's output, and the model's answer is a guess at the same
+        file.  Measured live: 5452 bytes assembled, 1139 bytes after the model's
+        diff, and the contract then reported the sections the harness had built
+        as missing — the run failed on work it had already done correctly.
+
+        Returns the paths that were actually rewritten, so the trace shows it.
+        """
+        content = ctx.extras.get("harness_owned_content") or {}
+        if not content:
+            return []
+        root = self._repo_root()
+        restored: list[str] = []
+        for rel, text in content.items():
+            target = Path(root) / rel
+            try:
+                current = target.read_text(encoding="utf-8") if target.is_file() else ""
+            except OSError:
+                current = ""
+            if current == text:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, encoding="utf-8")
+            restored.append(rel)
+        return restored
 
     def _node_repair(self, ctx: RunContext, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
         """Repair generated HTML structurally, before anything grades it.
@@ -2741,6 +2781,15 @@ class TaskPipeline:
         # The harness built this file, so it owns it: a model diff for the same
         # path is dropped rather than applied over the assembly (see ``_node_act``).
         ctx.extras["harness_owned_paths"] = [plan.path]
+        # The *content* is kept too, not just the path.  Dropping the model's
+        # hunk from the diff is not enough: the fix loop applies the diff it was
+        # given to the worktree, and the model's own diff for the same path was
+        # applied before the drop — measured live, a 5452-byte assembled page was
+        # on disk, the model returned a 1139-byte hero-only page, the fix loop
+        # applied it, and the run settled ``accepted: false`` with the contract
+        # reporting "section 'features' missing".  The harness had built the page
+        # and then let the model overwrite it.  ``_node_act`` restores this.
+        ctx.extras["harness_owned_content"] = {plan.path: page}
         return self._episode_diff(ctx)
 
     def _subagent_body(self, spec: SubAgentSpec, ctx: RunContext) -> Mapping[str, Any]:
