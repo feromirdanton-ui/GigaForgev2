@@ -25,6 +25,7 @@ from typing import Any
 
 import pytest
 
+
 # ── K1: provider selection ────────────────────────────────────────────────────
 def test_build_provider_selects_the_official_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
     """``GIGAFORGE_PROVIDER=gigachat-sdk`` must actually build the SDK provider.
@@ -32,6 +33,7 @@ def test_build_provider_selects_the_official_sdk(monkeypatch: pytest.MonkeyPatch
     Before the fix ``build_provider`` always returned the legacy
     ``GigaChatProvider``; the adapter existed but nothing constructed it.
     """
+    pytest.importorskip("gigachat", reason="the official SDK extra is not installed")
     from gigaforge import runtime
     from gigaforge.providers.gigachat_sdk_adapter import GigaChatSDKProvider
 
@@ -275,6 +277,7 @@ def test_react_runner_uses_the_guards(tmp_path: Path) -> None:
 # ── V1: no asyncio.run inside graph nodes ────────────────────────────────────
 def test_subagent_graph_runs_inside_a_live_event_loop(tmp_path: Path) -> None:
     """``asyncio.run`` in the child node raised under a running loop."""
+    pytest.importorskip("langgraph", reason="the LangGraph extra is not installed")
     from gigaforge.agents.langgraph_subagents import run_subagents_graph
     from gigaforge.agents.subagents import SubAgentRunner, SubAgentSpawn
 
@@ -320,6 +323,7 @@ def test_engine_dispatch_honours_an_explicit_classic(monkeypatch: pytest.MonkeyP
 
 
 def test_engine_dispatch_honours_the_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("langgraph", reason="the LangGraph extra is not installed")
     from gigaforge.agents.engine import react_engine, subagent_engine
 
     monkeypatch.setenv("GIGAFORGE_REACT_ENGINE", "langgraph")

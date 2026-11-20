@@ -210,6 +210,7 @@ def test_structured_output_and_tools_coexist_in_one_request() -> None:
 
 def test_build_chat_merges_functions(monkeypatch: pytest.MonkeyPatch) -> None:
     """The real ``_build_chat`` keeps both the schema and the tools."""
+    pytest.importorskip("gigachat", reason="the official SDK extra is not installed")
     from gigaforge.agents.schemas import json_schema_format
     from gigaforge.providers.gigachat_sdk_adapter import GigaChatSDKProvider
 
