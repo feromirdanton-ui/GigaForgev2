@@ -339,6 +339,22 @@ class Runtime:
             isolated_runtime.aclose()
             raise RuntimeError("the isolated goal runtime could not reuse the configured model provider")
         try:
+            engine = str(kwargs.pop("engine", "") or "").strip().lower()
+            if not engine:
+                engine = "langgraph" if _langgraph_goal_enabled() else "classic"
+            if engine == "langgraph":
+                from gigaforge.core.langgraph_goal import run_goal_graph
+
+                return run_goal_graph(
+                    isolated_runtime.pipeline,
+                    repo_root=workspace_root,
+                    goal=goal,
+                    verifier=verifier,
+                    store=goal_store,
+                    workspace=workspace,
+                    emit=_trace_emitter(isolated_runtime.pipeline),
+                    **kwargs,
+                )
             return GoalRunner(
                 isolated_runtime.pipeline,
                 repo_root=workspace_root,
@@ -587,6 +603,46 @@ class Runtime:
 
     def __exit__(self, *_: Any) -> None:
         self.aclose()
+
+
+def _langgraph_goal_enabled() -> bool:
+    """Whether goal mode should run on the LangGraph engine.
+
+    Default is on when the package is installed; ``GIGAFORGE_GOAL_ENGINE=classic``
+    pins the hand-rolled loop (useful for bisecting a regression), and
+    ``=langgraph`` forces the graph even if detection is ambiguous.
+    """
+    import os as _os
+
+    choice = (_os.environ.get("GIGAFORGE_GOAL_ENGINE") or "").strip().lower()
+    if choice in {"classic", "legacy", "loop"}:
+        return False
+    if choice in {"langgraph", "graph"}:
+        return True
+    try:
+        from gigaforge.core.langgraph_runtime import langgraph_available
+
+        return langgraph_available()
+    except Exception:  # noqa: BLE001 - a missing optional dep means classic
+        return False
+
+
+def _trace_emitter(pipeline: Any) -> Any:
+    """Bridge graph events into the shared JSONL trace.
+
+    The graph streams to the UI directly; this keeps the on-disk trace complete
+    so ``gigaforge report`` and the panel see the same history as before.
+    """
+
+    def emit(event: str, payload: dict[str, Any]) -> None:
+        trace = getattr(getattr(pipeline, "metrics", None), "trace", None)
+        fn = getattr(trace, "event", None)
+        if fn is None:
+            return
+        body = {key: value for key, value in payload.items() if key != "event"}
+        fn(event, **body)
+
+    return emit
 
 
 def build_runtime(

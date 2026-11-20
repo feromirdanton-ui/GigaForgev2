@@ -559,6 +559,7 @@ _STATUS_BY_EVENT = {
     "goal.verify_start": "running",
     "goal.verify_finish": "succeeded",
     "goal.cycle_finish": "succeeded",
+    "goal.publish": "succeeded",
     "goal.finish": "succeeded",
 }
 
@@ -593,6 +594,95 @@ def _as_mapping(value: Any) -> dict[str, Any]:
 
 
 # ── the chat engine ────────────────────────────────────────────────────────
+class LangGraphBackend(AgentBackend):
+    """Goal mode driven by the LangGraph runtime, streamed as it happens.
+
+    ``PipelineBackend`` polls the JSONL trace, which works for any run but adds
+    a poll interval of latency and cannot see an ``interrupt()``.  This backend
+    subscribes to the graph's own ``custom`` stream instead: every node writes
+    its progress with ``get_stream_writer()``, so the chat shows a step the
+    moment it happens, and an approval interrupt surfaces as a question rather
+    than as a stalled run.
+    """
+
+    name = "langgraph"
+
+    def __init__(
+        self,
+        store: UiStore,
+        *,
+        goal_runner_factory: Optional[Callable[..., Any]] = None,
+        run_kwargs: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self.store = store
+        self.goal_runner_factory = goal_runner_factory
+        self.run_kwargs = dict(run_kwargs or {})
+        self.approve: Optional[Any] = None
+        self.last_result: Mapping[str, Any] = {}
+
+    def stream(self, goal: str, session: ChatSession) -> Iterator[ChatEvent]:
+        if self.goal_runner_factory is None:
+            yield session.error("no goal runner is wired into this chat")
+            return
+        yield session.tool("goal", {"goal": goal, "engine": "langgraph"},
+                           text=f"starting long-lived goal: {goal}")
+        queue: list[dict[str, Any]] = []
+        box: dict[str, Any] = {}
+
+        def emit(event: str, payload: dict[str, Any]) -> None:
+            queue.append({**payload, "event": event})
+
+        def worker() -> None:
+            try:
+                kwargs = dict(self.run_kwargs)
+                kwargs.setdefault("max_cycles", 8)
+                kwargs.setdefault("max_fix_iterations", 2)
+                if self.approve is not None:
+                    kwargs.setdefault("approve", self.approve)
+                kwargs["emit"] = emit
+                box["result"] = self.goal_runner_factory(goal, **kwargs)
+            except Exception as exc:  # noqa: BLE001 - surfaced to the user
+                box["error"] = f"{type(exc).__name__}: {exc}"
+
+        thread = threading.Thread(target=worker, name="gigaforge-goal-graph", daemon=True)
+        thread.start()
+        while thread.is_alive() or queue:
+            while queue:
+                event = queue.pop(0)
+                yield session.step(
+                    str(event.get("node") or event.get("event") or "?"),
+                    str(event.get("status") or _status_for(str(event.get("event") or ""), event)),
+                    **{key: event[key] for key in (
+                        "event", "goal_id", "cycle_index", "cycle_limit", "passed",
+                        "accepted", "summary", "files",
+                    ) if key in event},
+                )
+            if thread.is_alive():
+                time.sleep(0.05)
+        thread.join(timeout=1.0)
+        if box.get("error"):
+            yield session.error(str(box["error"]))
+        result = box.get("result")
+        if result is not None:
+            self.last_result = _as_mapping(result)
+            status = str(self.last_result.get("status") or "unknown")
+            yield session.tool(
+                "goal",
+                {"goal_id": self.last_result.get("goal_id", ""), "status": status,
+                 "cycles": len(self.last_result.get("cycles") or [])},
+                text=f"goal finished with status {status}",
+            )
+        yield session.tool("snapshot", {}, text="run finished; refreshing snapshot")
+
+    def run_blocking(self, goal: str) -> Mapping[str, Any]:
+        if self.goal_runner_factory is None:
+            return {"error": "no goal runner is wired into this chat"}
+        kwargs = dict(self.run_kwargs)
+        if self.approve is not None:
+            kwargs.setdefault("approve", self.approve)
+        return _as_mapping(self.goal_runner_factory(goal, **kwargs))
+
+
 class ChatEngine:
     """Turns a user line into a stream of events.
 
@@ -878,6 +968,16 @@ def build_chat_handler(engine: ChatEngine) -> Callable[[str], str]:
     return handler
 
 
+def _langgraph_available() -> bool:
+    """True when the LangGraph goal engine can be used for chat."""
+    try:
+        from gigaforge.core.langgraph_runtime import langgraph_available
+
+        return langgraph_available()
+    except Exception:  # noqa: BLE001 - optional dependency
+        return False
+
+
 def default_engine(
     store: UiStore,
     *,
@@ -910,14 +1010,22 @@ def default_engine(
             ]
         )
     else:
-        backend = PipelineBackend(
-            store,
-            config=config,
-            pipeline_factory=pipeline_factory,
-            run_kwargs=run_kwargs,
-            goal_mode=goal_mode,
-            goal_runner_factory=goal_runner_factory,
-        )
+        use_graph = goal_mode and _langgraph_available()
+        if use_graph:
+            backend = LangGraphBackend(
+                store,
+                goal_runner_factory=goal_runner_factory,
+                run_kwargs=run_kwargs,
+            )
+        else:
+            backend = PipelineBackend(
+                store,
+                config=config,
+                pipeline_factory=pipeline_factory,
+                run_kwargs=run_kwargs,
+                goal_mode=goal_mode,
+                goal_runner_factory=goal_runner_factory,
+            )
     return ChatEngine(
         store, backend=backend, session=session, prices=prices, default_model=default_model
     )
@@ -931,6 +1039,7 @@ __all__ = [
     "ChatSession",
     "DirectChatBackend",
     "DEFAULT_CHAT_SYSTEM",
+    "LangGraphBackend",
     "PipelineBackend",
     "ScriptedBackend",
     "build_chat_handler",

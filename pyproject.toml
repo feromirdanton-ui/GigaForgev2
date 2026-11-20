@@ -7,7 +7,7 @@ name = "gigaforge"
 version = "6.0.0"
 description = "Agentic orchestration harness for GigaChat with a standalone desktop control room"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.27",
     "pydantic>=2.6",
@@ -41,6 +41,29 @@ languages = [
 # Official GigaChat SDK transport (GigaChatSDKProvider). Optional: the legacy
 # httpx client remains the default and needs no extra install.
 gigachat = ["gigachat>=0.3"]
+# Level-2 agent runtime: goal mode, chat, ReAct and sub-agents on LangGraph.
+# Optional so a bare install keeps the deterministic core working; the classic
+# GoalRunner/ReActRunner loops are used when it is absent.
+langgraph = [
+    "langgraph>=1.2,<2",
+    "langgraph-checkpoint-sqlite>=2.0",
+]
+# deepagents brings the harness middleware the merge plan borrows from
+# ai-forever/deepagents-gigachat. It pins langchain>=1.5 and langgraph>=1.2.24.
+# NOTE: the *harness profile* (deepagents-gigachat) requires Python 3.12+, which
+# is why this project's floor moved from 3.11 to 3.12; deepagents itself only
+# needs 3.11.
+deepagents = [
+    "deepagents>=0.7",
+    "langchain-gigachat>=0.5",
+]
+# Everything the level-2 runtime needs, in one extra.
+agent = [
+    "langgraph>=1.2,<2",
+    "langgraph-checkpoint-sqlite>=2.0",
+    "deepagents>=0.7",
+    "langchain-gigachat>=0.5",
+]
 # Backward-compatible extra; Playwright is now included in the core install.
 browser = []
 # Local lint/build tooling. Pytest is a core runtime dependency because Goal mode
@@ -59,7 +82,7 @@ gigaforge = ["assets/*.png", "assets/*.ico", "desktop/qml/*.qml"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]
