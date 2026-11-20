@@ -80,11 +80,22 @@ def test_a_missing_file_is_skipped_not_crashed(tmp_path: Path) -> None:
     assert _pipeline(root)._episode_diff(_Ctx(root, ["nope.html"])) == ""
 
 
-def test_a_non_git_worktree_yields_no_diff(tmp_path: Path) -> None:
+def test_a_non_git_worktree_still_yields_a_new_file_diff(tmp_path: Path) -> None:
+    """A bare directory must not make the run's work invisible.
+
+    This test used to assert ``== ""`` — that a worktree without ``.git``
+    produced no diff.  That is the defect, not the contract: the generation path
+    can run in a bare directory, and returning "" there meant the run wrote a
+    page and reported no change.  A new-file diff is the correct representation
+    of a file that did not exist before, and ``git apply`` accepts it.
+    """
     plain = tmp_path / "plain"
     plain.mkdir()
-    (plain / "a.html").write_text("x")
-    assert _pipeline(plain)._episode_diff(_Ctx(plain, ["a.html"])) == ""
+    (plain / "a.html").write_text("x\n")
+    diff = _pipeline(plain)._episode_diff(_Ctx(plain, ["a.html"]))
+    assert "--- /dev/null" in diff
+    assert "+++ b/a.html" in diff
+    assert "+x" in diff
 
 
 def test_the_diff_applies_cleanly(tmp_path: Path) -> None:

@@ -1344,7 +1344,11 @@ class TaskPipeline:
             return ""
         root = Path(str(getattr(self.config, "repo_root", ".") or ".")).resolve()
         if not (root / ".git").exists():
-            return ""
+            # No repository: ``git diff`` cannot run, and returning "" here made
+            # the work invisible — the run wrote a page and reported no change.
+            # A new-file diff is the correct representation of a file that did
+            # not exist before, and it is what the apply path already accepts.
+            return self._new_file_diff(root, written)
         import subprocess
 
         parts: list[str] = []
@@ -1386,6 +1390,33 @@ class TaskPipeline:
                         files=len(written), chars=sum(len(p) for p in parts))
         return "\n".join(parts)
 
+    def _new_file_diff(self, root: Path, written: Sequence[str]) -> str:
+        """Render files as ``new file`` diffs when there is no repository.
+
+        Used by the generation path, which may run in a bare directory.  The
+        shape is the one ``git apply`` accepts for a creation, so the rest of
+        the pipeline treats it exactly like a diff from a repository.
+        """
+        parts: list[str] = []
+        for rel in written:
+            path = root / str(rel)
+            if not path.is_file():
+                continue
+            try:
+                body = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            lines = body.splitlines()
+            parts.append(
+                f"diff --git a/{rel} b/{rel}\n"
+                f"new file mode 100644\n"
+                f"--- /dev/null\n"
+                f"+++ b/{rel}\n"
+                f"@@ -0,0 +1,{len(lines)} @@\n"
+                + "".join(f"+{line}\n" for line in lines)
+            )
+        return "\n".join(parts)
+
     def _subagent_diff(self, ctx: RunContext) -> str:
         """Delegate a multi-file goal to sub-agents with exclusive ownership.
 
@@ -1413,6 +1444,20 @@ class TaskPipeline:
             return ""
         if not bool(getattr(self.config.subagents, "use_worktrees", True)):
             return ""
+        # A generation goal names no existing file, so the code fan-out below
+        # could never fire for it: ``named`` was empty, the run logged
+        # ``subagents_skipped`` and fell back to one model call that wrote the
+        # whole page.  Measured live: ``--subagents`` on the site goal produced
+        # ``{"files": 1}`` and a 2564-byte page with no feature grid.  The unit
+        # of decomposition for an artifact is a section, not a file.
+        try:
+            from gigaforge.harness.generation import is_page_goal
+
+            if is_page_goal(ctx.state.goal):
+                return self._sectional_generation(ctx)
+        except Exception as exc:  # noqa: BLE001 - fall through to the code path
+            self._event("pipeline.generation_plan_error", run_id=ctx.run_id,
+                        error=str(exc)[:300])
         try:
             from gigaforge.firewall.slicer_keywords import Extractor
 
@@ -2414,6 +2459,82 @@ class TaskPipeline:
             parent_ctx=parent_ctx,
             parallel=parallel,
         )
+
+    def _sectional_generation(self, ctx: RunContext) -> str:
+        """Build a page by fanning out over its sections, then assembling.
+
+        The harness owns the plan and the skeleton; each child writes one
+        section.  Assembly is deterministic, so the page is structurally valid
+        by construction — one doctype, one ``<html>``, one ``<style>``, one
+        ``<body>``, each section once — instead of by luck.
+
+        A child that fails is not fatal: the section is retried once, and if it
+        still fails the page is assembled from the sections that succeeded and
+        the miss is reported, so a partial page beats no page.
+        """
+        from gigaforge.harness.generation import (
+            assemble_page,
+            plan_generation,
+            section_prompt,
+        )
+
+        plan = plan_generation(ctx.state.goal)
+        if not plan.ok:
+            return ""
+        self._event("pipeline.generation_plan", run_id=ctx.run_id,
+                    path=plan.path, sections=plan.kinds(), palette=list(plan.palette))
+
+        fragments: dict[str, str] = {}
+        failures: list[str] = []
+        for section in plan.sections:
+            prompt = section_prompt(plan, section, ctx.state.goal)
+            answer = ""
+            for attempt in (1, 2):
+                try:
+                    answer = self._ask("code", prompt, ctx)
+                except Exception as exc:  # noqa: BLE001 - one section must not kill the page
+                    self._event("pipeline.generation_section_error", run_id=ctx.run_id,
+                                section=section.kind, attempt=attempt,
+                                error=str(exc)[:200])
+                    answer = ""
+                if answer.strip():
+                    break
+            if not answer.strip():
+                failures.append(section.kind)
+                continue
+            fragments[section.kind] = answer
+            self._event("pipeline.generation_section", run_id=ctx.run_id,
+                        section=section.kind, chars=len(answer))
+
+        if not fragments:
+            self._event("pipeline.generation_empty", run_id=ctx.run_id,
+                        sections=plan.kinds())
+            return ""
+
+        page = assemble_page(plan, fragments)
+        root = self._repo_root()
+        target = (root / plan.path).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError:
+            self._event("pipeline.generation_path_rejected", run_id=ctx.run_id,
+                        path=plan.path)
+            return ""
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(page, encoding="utf-8")
+        ctx.extras["generation"] = {
+            "path": plan.path,
+            "sections": plan.kinds(),
+            "written": sorted(fragments),
+            "failed": failures,
+        }
+        self._event("pipeline.generation_assembled", run_id=ctx.run_id,
+                    path=plan.path, bytes=len(page),
+                    written=sorted(fragments), failed=failures)
+        # ``_episode_diff`` reads the files the run wrote from this list; the
+        # assembled page is one of them, so the rest of the pipeline sees it.
+        ctx.extras["episode_written_files"] = [plan.path]
+        return self._episode_diff(ctx)
 
     def _subagent_body(self, spec: SubAgentSpec, ctx: RunContext) -> Mapping[str, Any]:
         """Default sub-agent: the same task pipeline, scoped to its private copy.
