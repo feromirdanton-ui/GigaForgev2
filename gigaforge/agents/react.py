@@ -34,6 +34,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1640,7 +1641,21 @@ class ReActRunner:
         try:
             data = json.loads(repaired)
         except json.JSONDecodeError:
-            return None
+            # The model can produce a step whose *outer* JSON is broken by the
+            # content it is carrying.  Measured live, four times in a row: a
+            # ``write_file`` step whose ``action_input`` held 1.4 KB of HTML
+            # with quotes and newlines.  The outer object failed to parse, the
+            # episode counted a parse failure, and after three of them the
+            # fallback force-finished with nothing written.
+            #
+            # The shape is still recoverable: the action name and the path are
+            # short and unambiguous, and the content is "everything after the
+            # content key".  Recovering it is a computation, so the harness
+            # does it rather than asking the model to escape better.
+            recovered = self._recover_step(text)
+            if recovered is None:
+                return None
+            return recovered
         if not isinstance(data, dict):
             return None
         thought = str(data.get("thought", "")).strip()
@@ -1653,6 +1668,80 @@ class ReActRunner:
         else:
             ai = str(ai or "").strip()
         return thought, action, ai
+
+    #: Keys whose value is a long free-form body, in the order they are tried.
+    _BODY_KEYS = ("content", "body", "text", "code")
+
+    def _recover_step(self, text: str) -> tuple[str, str, str] | None:
+        """Recover a step whose outer JSON is broken by its own payload.
+
+        Only the shapes the harness itself asks for are recovered — a named
+        action plus a ``path``/``content`` pair.  Anything else stays a parse
+        failure, so this cannot turn arbitrary prose into a tool call.
+        """
+        action_match = re.search(r'"action"\s*:\s*"([A-Za-z_][A-Za-z0-9_]*)"', text)
+        if not action_match:
+            return None
+        action = action_match.group(1)
+        thought_match = re.search(r'"thought"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
+        thought = ""
+        if thought_match:
+            try:
+                thought = json.loads(f'"{thought_match.group(1)}"')
+            except json.JSONDecodeError:
+                thought = thought_match.group(1)
+
+        if action != "write_file":
+            return None
+
+        path_match = re.search(
+            r'"(?:path|file|location)"\s*:\s*"((?:[^"\\]|\\.)*)"', text
+        )
+        if not path_match:
+            return None
+        try:
+            path = json.loads(f'"{path_match.group(1)}"')
+        except json.JSONDecodeError:
+            path = path_match.group(1)
+
+        body_key = next(
+            (k for k in self._BODY_KEYS if f'"{k}"' in text[path_match.end():]),
+            None,
+        )
+        if body_key is None:
+            return None
+        body_start = text.index(f'"{body_key}"', path_match.end())
+        colon = text.index(":", body_start)
+        quote = text.index('"', colon)
+        raw_body = text[quote + 1:]
+        # The body ends at the last quote that is followed only by closing
+        # punctuation — the model's own trailing ``"}`` / ``"}]}``.  Everything
+        # before it is the body, *including* the unescaped quotes that broke the
+        # outer object.  Trying progressively shorter prefixes instead (the
+        # first version of this) stops at the first inner quote and silently
+        # truncates the file to its first line.
+        end = len(raw_body)
+        while end > 0:
+            tail = raw_body[end - 1:]
+            if tail.startswith('"') and not tail[1:].strip(" \t\r\n}]"):
+                break
+            end -= 1
+        if end == 0:
+            return None
+        body_raw = raw_body[: end - 1]
+        # The body is raw text, not a JSON string: it carries unescaped quotes
+        # *and* literal newlines, both of which are illegal inside a JSON string
+        # literal.  Escape both, then decode once.  (Escaping only the quotes
+        # still failed with "Invalid control character" on the first newline.)
+        escaped = re.sub(r'(?<!\\)"', r'\\"', body_raw)
+        escaped = escaped.replace("\r\n", "\\n").replace("\n", "\\n").replace("\r", "\\n")
+        escaped = escaped.replace("\t", "\\t")
+        try:
+            body = json.loads(f'"{escaped}"')
+        except json.JSONDecodeError:
+            return None
+        payload = json.dumps({"path": path, body_key: body}, ensure_ascii=False)
+        return thought, action, payload
 
     def _parse_finish_plan(self, action_input: str) -> list[PlanStep]:
         """Parse the finish action's plan payload. Empty list on parse failure.
