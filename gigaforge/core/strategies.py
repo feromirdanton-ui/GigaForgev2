@@ -761,29 +761,11 @@ class ReActPlan:
             log.warning("ReAct planning failed (%s); falling back to linear", exc)
             return self._linear(goal, slice_text, ask=ask, parse=parse)
 
-        steps = [_describe_plan_step(step) for step in (getattr(result, "plan", None) or [])]
-        steps = [step for step in steps if step]
+        steps, verdict = self._guarded_steps(result)
         if not steps:
             # The loop explored but never produced a plan: the slice-based plan
             # is still better than an empty one.
             return self._linear(goal, slice_text, ask=ask, parse=parse)
-        # Validate before the DAG executes it.  A live run produced
-        # ``edit_function: react.py`` \u2014 a step naming the file the episode had
-        # been reading, with no symbol and no verification \u2014 and the pipeline
-        # ran it.  The guard is deterministic and model-free, so it costs
-        # nothing and cannot drift.
-        from gigaforge.harness.plan_guard import validate_plan
-
-        verdict = validate_plan(
-            getattr(result, "plan", None) or [],
-            known_tools=self._known_tools(),
-        )
-        if verdict.changed:
-            log.info("plan guard adjusted the ReAct plan: %s", verdict.to_dict())
-            steps = [_describe_plan_step(step) for step in verdict.steps]
-            steps = [step for step in steps if step]
-            if not steps:
-                return self._linear(goal, slice_text, ask=ask, parse=parse)
         return PlanOutcome(
             steps=steps,
             strategy=self.name,
@@ -806,7 +788,7 @@ class ReActPlan:
         into anyway.
         """
         runner = getattr(self, "_last_runner", None)
-        registry = getattr(runner, "_registry", None) if runner is not None else None
+        registry = getattr(runner, "registry", None) if runner is not None else None
         names = getattr(registry, "names", None)
         if callable(names):
             try:
@@ -816,6 +798,30 @@ class ReActPlan:
             if found:
                 return found | {"tests", "lint", "reviewer", "coder", "edit_function"}
         return {"tests", "lint", "reviewer", "coder", "edit_function", "read_structure", "grep"}
+
+    def _guarded_steps(self, result: Any) -> tuple[list[str], Any]:
+        """Render the episode's plan into DAG steps, after the plan guard.
+
+        This is the single place the guard runs, and both planning entry points
+        (``plan`` and ``plan_under_harness``) go through it.  That matters: the
+        guard was originally called only from ``plan``, while the pipeline
+        prefers ``plan_under_harness`` — so the one path the product actually
+        used was the one path the guard did not cover, and a live run executed
+        ``edit_function: react.py`` with no symbol and no verification.
+
+        The guard is deterministic and model-free, so it costs nothing and
+        cannot drift.  Returns ``(steps, verdict)``; ``steps`` is empty when the
+        guard rejected every step, which the caller turns into the linear
+        fallback.
+        """
+        from gigaforge.harness.plan_guard import validate_plan
+
+        raw = getattr(result, "plan", None) or []
+        verdict = validate_plan(raw, known_tools=self._known_tools())
+        if verdict.changed:
+            log.info("plan guard adjusted the ReAct plan: %s", verdict.to_dict())
+        steps = [_describe_plan_step(step) for step in (verdict.steps or [])]
+        return [step for step in steps if step], verdict
 
     def plan_under_harness(
         self,
@@ -847,7 +853,10 @@ class ReActPlan:
         if runner is None:
             return self._linear(goal, slice_text, ask=ask, parse=parse), None
 
-        harness = Harness(policy=policy or HarnessPolicy(), budgets=getattr(runner, "_budgets", None))
+        harness = Harness(
+            policy=policy or HarnessPolicy(),
+            budgets=getattr(runner, "budgets", None),
+        )
         outcome = harness.run(
             runner,
             goal,
@@ -865,8 +874,7 @@ class ReActPlan:
             return self._linear(goal, slice_text, ask=ask, parse=parse), outcome.ledger
 
         result = outcome.result
-        steps = [_describe_plan_step(step) for step in (getattr(result, "plan", None) or [])]
-        steps = [step for step in steps if step]
+        steps, verdict = self._guarded_steps(result)
         if not steps:
             return self._linear(goal, slice_text, ask=ask, parse=parse), outcome.ledger
         return (
@@ -882,6 +890,7 @@ class ReActPlan:
                     "llm_calls": getattr(result, "llm_calls", 0),
                     "compactions": outcome.ledger.compactions if outcome.ledger else 0,
                     "retries": outcome.ledger.retries if outcome.ledger else 0,
+                    "plan_guard": verdict.to_dict(),
                 }],
             ),
             outcome.ledger,
@@ -916,11 +925,14 @@ def build_plan_strategy(
     passes a callable that builds a :class:`ReActRunner` from its own
     collaborators, so the strategy never reaches for globals.
     """
-    resolved = (name or os.environ.get("GIGAFORGE_PLAN_STRATEGY", "") or "linear").strip().lower()
+    # ``react`` is the default: the merged stack's whole point is that the
+    # planner explores before it commits.  A deployment that wants the old
+    # one-shot behaviour sets GIGAFORGE_PLAN_STRATEGY=linear explicitly.
+    resolved = (name or os.environ.get("GIGAFORGE_PLAN_STRATEGY", "") or "react").strip().lower()
     factory = PLAN_STRATEGIES.get(resolved)
     if factory is None:
-        log.warning("unknown plan strategy %r; falling back to linear", resolved)
-        factory = LinearPlan
+        log.warning("unknown plan strategy %r; falling back to react", resolved)
+        factory = ReActPlan
     if factory is TreeOfThoughtPlan:
         return TreeOfThoughtPlan(
             branches=_env_int("GIGAFORGE_TOT_MAX_BRANCHES", 3),
@@ -936,11 +948,13 @@ def build_plan_strategy(
 
 def build_review_strategy(name: str | None = None) -> ReviewStrategy:
     """Build a review strategy by name; env ``GIGAFORGE_REVIEW_STRATEGY`` wins."""
-    resolved = (name or os.environ.get("GIGAFORGE_REVIEW_STRATEGY", "") or "none").strip().lower()
+    # ``constitutional`` is the default: it is deterministic and costs no extra
+    # model call, so a review phase exists without a budget surprise.
+    resolved = (name or os.environ.get("GIGAFORGE_REVIEW_STRATEGY", "") or "constitutional").strip().lower()
     factory = REVIEW_STRATEGIES.get(resolved)
     if factory is None:
-        log.warning("unknown review strategy %r; falling back to none", resolved)
-        factory = NoReview
+        log.warning("unknown review strategy %r; falling back to constitutional", resolved)
+        factory = ConstitutionalReview
     if factory is ConstitutionalReview:
         return ConstitutionalReview(llm=_env_bool("GIGAFORGE_CONSTITUTION_LLM", True))
     return factory()

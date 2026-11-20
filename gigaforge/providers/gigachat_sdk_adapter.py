@@ -441,11 +441,20 @@ class GigaChatSDKProvider:
             kwargs["response_format"] = response_format
         if functions:
             allowed = set(Function.model_fields)
-            kwargs["functions"] = [
+            declared = [
                 Function(**{k: v for k, v in fn.items() if k in allowed})
                 for fn in functions
                 if isinstance(fn, Mapping)
             ]
+            # MERGE, do not overwrite.  The structured-output schema above is
+            # itself sent as a function, and ``function_call`` still points at
+            # it; replacing the list here would leave ``function_call`` naming
+            # a function the server cannot find, which is a hard 422.  The
+            # latent bug only fires once a ReAct step asks for structured
+            # output *and* declares tools — which is exactly what
+            # ``react_step_response_format()`` is for.
+            existing = list(kwargs.get("functions") or [])
+            kwargs["functions"] = existing + declared
         return Chat(**kwargs)
 
     async def list_models(self) -> list[dict[str, Any]]:

@@ -207,7 +207,7 @@ def build_react_graph(
     # identically: tool contract, shell safety, specification audit, think tool.
     guards = runner.guards
     guards.install(runner.registry)
-    settings = runner._s  # noqa: SLF001 - the runner owns these
+    settings = runner.settings
     task_state = state
 
     def _emit(event: str, **payload: Any) -> None:
@@ -220,7 +220,7 @@ def build_react_graph(
         if not trajectory:
             trajectory = [{
                 "role": "user",
-                "content": runner._compose_initial_prompt(  # noqa: SLF001
+                "content": runner.compose_initial_prompt(
                     str(gstate.get("task") or ""),
                     task_state,
                     gstate.get("bootstrap_hint") or None,
@@ -234,7 +234,7 @@ def build_react_graph(
 
         # ContextWindowGuard: compact before the request, not after a 422.
         try:
-            window_guard.check(trajectory, model=runner._router.route("plan"))  # noqa: SLF001
+            window_guard.check(trajectory, model=runner.router.route("plan"))
         except ContextOverflowError as exc:
             _emit("react.context_overflow", step_idx=step_idx, detail=str(exc)[:400])
             return {
@@ -245,11 +245,11 @@ def build_react_graph(
 
         est_in = sum(len(m.get("content") or "") for m in trajectory) // 4
         est_out = max(int(settings.budget_plan_out) // 3, 200)
-        runner._budgets.check("plan", est_in, est_out, task_id=task_state.task_id)  # noqa: SLF001
+        runner.budgets.check("plan", est_in, est_out, task_id=task_state.task_id)
 
         started = time.monotonic()
-        chat_result = await runner._client.chat(  # noqa: SLF001
-            runner._router.route("plan"),  # noqa: SLF001
+        chat_result = await runner.client.chat(
+            runner.router.route("plan"),
             trajectory,
             temperature=0.1,
             max_tokens=int(settings.budget_plan_out),
@@ -262,13 +262,13 @@ def build_react_graph(
         tokens_in = int(usage.get("prompt_tokens", 0) or 0)
         tokens_out = int(usage.get("completion_tokens", 0) or 0)
         try:
-            runner._budgets.commit_task(  # noqa: SLF001
+            runner.budgets.commit_task(
                 task_state.task_id, "plan", tokens_in, tokens_out
             )
-            runner._budgets.check_overshoot("plan", task_id=task_state.task_id)  # noqa: SLF001
+            runner.budgets.check_overshoot("plan", task_id=task_state.task_id)
         except Exception:  # noqa: BLE001 - accounting is best effort here
             pass
-        runner._tracer.trace(  # noqa: SLF001
+        runner.tracer.trace(
             task_state.task_id,
             step=f"react_step_{step_idx}",
             kind="llm",
@@ -282,7 +282,7 @@ def build_react_graph(
             latency_ms=latency_ms,
         )
 
-        parsed = runner._parse_step(text)  # noqa: SLF001
+        parsed = runner.parse_step(text)
         if parsed is None:
             _emit("react.parse_failed", step_idx=step_idx, raw=text[:300])
             return {
@@ -394,8 +394,8 @@ def build_react_graph(
 
     def finish(gstate: ReActState) -> dict[str, Any]:
         """Terminal node: parse the plan out of the finish payload."""
-        plan = runner._parse_finish_plan(str(gstate.get("action_input") or ""))  # noqa: SLF001
-        localization = runner._extract_localization(  # noqa: SLF001
+        plan = runner.parse_finish_plan(str(gstate.get("action_input") or ""))
+        localization = runner.extract_localization(
             plan, str(gstate.get("thought") or "")
         )
         _emit("react.finish", plan_size=len(plan), localization=localization)
@@ -441,7 +441,7 @@ def _initial_state(
         "task": task,
         "bootstrap_hint": bootstrap_hint or "",
         "step_idx": 0,
-        "max_steps": int(runner._max_steps),  # noqa: SLF001
+        "max_steps": int(runner.max_steps),
         "trajectory": [],
         "steps": [],
         "finished": False,

@@ -162,7 +162,19 @@ def build_provider(
 
     attach_giga_client(client)
     registry = default_registry()
-    selected = (os.environ.get("GIGAFORGE_PROVIDER") or "giga").strip().lower()
+    selected = (os.environ.get("GIGAFORGE_PROVIDER") or "auto").strip().lower()
+
+    # ``auto`` is the default: use the official SDK when it is actually usable
+    # (installed + credential present), otherwise the in-repo client.  The old
+    # default was ``giga``, which meant the SDK transport — the one §7.2 of the
+    # merge plan prescribes — was dead code in every default deployment, and
+    # structured output silently fell back to json_repair.
+    if selected in {"", "auto"}:
+        provider = _build_sdk_provider(settings, max_context=max_context)
+        if provider is not None:
+            registry.register_instance("giga", provider)
+            return provider
+        selected = "giga"
 
     if selected in {"gigachat-sdk", "gigachat_sdk", "sdk"}:
         provider = _build_sdk_provider(settings, max_context=max_context)

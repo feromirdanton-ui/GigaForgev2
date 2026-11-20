@@ -405,6 +405,59 @@ class ReActRunner:
     def registry(self) -> ToolRegistry:
         return self._registry
 
+    # -- public collaborators -------------------------------------------------
+    # The LangGraph engine drives this runner from outside, so it needs the
+    # runner's collaborators.  Reaching for ``_router`` / ``_budgets`` /
+    # ``_tracer`` / ``_client`` with ``# noqa: SLF001`` made every refactor of
+    # this class a silent breakage of the graph; these accessors are the
+    # supported seam.
+    @property
+    def client(self) -> GigaClient:
+        return self._client
+
+    @property
+    def router(self) -> ModelRouter:
+        return self._router
+
+    @property
+    def budgets(self) -> BudgetTracker:
+        return self._budgets
+
+    @property
+    def tracer(self) -> Tracer:
+        return self._tracer
+
+    @property
+    def settings(self) -> Settings:
+        return self._s
+
+    @property
+    def max_steps(self) -> int:
+        return self._max_steps
+
+    def parse_step(self, text: str) -> tuple[str, str, str] | None:
+        """Public wrapper over the step parser, for the graph engine."""
+        return self._parse_step(text)
+
+    def parse_finish_plan(self, action_input: str) -> list[Any]:
+        """Public wrapper over the finish-payload parser."""
+        return self._parse_finish_plan(action_input)
+
+    def extract_localization(
+        self, plan: list[Any], last_thought: str = ""
+    ) -> dict[str, str]:
+        """Public wrapper over the localization extractor."""
+        return self._extract_localization(plan, last_thought)
+
+    def compose_initial_prompt(
+        self,
+        task: str,
+        state: Any,
+        bootstrap_hint: str | None = None,
+    ) -> str:
+        """Public wrapper over the opening prompt builder."""
+        return self._compose_initial_prompt(task, state, bootstrap_hint)
+
     @property
     def guards(self) -> Any:
         """The wired middleware, created on first use."""

@@ -345,9 +345,26 @@ class GigaClient:
             payload["functions"] = functions
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
-        # Native structured output: the provider validates the answer against
-        # the schema instead of the harness repairing almost-JSON afterwards.
+        # Native structured output.  The live API (measured 2026-11-20) accepts
+        # ``response_format`` and then IGNORES it: a strict JSON Schema still
+        # came back as a fenced ```json block, and once as free-form prose.
+        # The mechanism the server actually enforces is ``functions`` +
+        # ``function_call`` — it validates the schema (422 with a precise field
+        # path when it cannot) and returns the answer in
+        # ``message.function_call.arguments`` with an EMPTY ``content``.
+        #
+        # Translating here rather than in the SDK adapter is what makes
+        # structured output real in the DEFAULT configuration: the default
+        # provider is the legacy one, so a translation that lived only in the
+        # SDK adapter was unreachable unless GIGAFORGE_PROVIDER was set.
         if response_format:
+            from gigaforge.agents.schemas import to_function_spec
+
+            spec, call = to_function_spec(response_format)
+            payload["functions"] = list(payload.get("functions") or []) + [spec]
+            payload["function_call"] = call
+            # Kept for forward compatibility: if the server starts honouring
+            # it, nothing here breaks.
             payload["response_format"] = response_format
 
         started = time.monotonic()
@@ -476,6 +493,19 @@ class GigaClient:
             content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
         function_call = _extract_message_function_call(msg) if msg else None
         usage = data.get("usage")
+        # Structured output arrives as a function call with an EMPTY content:
+        # the server puts the validated JSON in ``function_call.arguments``.
+        # Callers that asked for a schema read ``content``, so surface the
+        # arguments there — but ONLY for the synthetic structured-output
+        # function, never for a real tool call (the ReAct loop reads
+        # ``function_call`` itself and would otherwise see its own arguments
+        # echoed as prose).
+        if (
+            not content
+            and function_call
+            and function_call.get("name") == "structured_output"
+        ):
+            content = json.dumps(function_call.get("arguments") or {}, ensure_ascii=False)
         return ChatResult(
             content=content,
             function_call=function_call,

@@ -41,7 +41,7 @@ __all__ = [
 log = logging.getLogger(__name__)
 
 
-def _choice(env: str, default: str = "classic") -> str:
+def _choice(env: str, default: str = "langgraph") -> str:
     value = (os.environ.get(env) or "").strip().lower()
     if value in {"langgraph", "graph"}:
         return "langgraph"
@@ -60,7 +60,13 @@ def _langgraph_ok() -> bool:
 
 
 def react_engine() -> str:
-    """Which ReAct engine to use: ``"langgraph"`` or ``"classic"``."""
+    """Which ReAct engine to use: ``"langgraph"`` or ``"classic"``.
+
+    ``langgraph`` is the default when the package is installed: the graph adds
+    checkpointing, ``interrupt()`` and event streaming, and the classic loop is
+    kept only as the bare-install fallback.  A deployment that wants the old
+    loop sets ``GIGAFORGE_REACT_ENGINE=classic``.
+    """
     wanted = _choice("GIGAFORGE_REACT_ENGINE")
     if wanted == "langgraph" and not _langgraph_ok():
         log.warning("GIGAFORGE_REACT_ENGINE=langgraph but langgraph is not installed")

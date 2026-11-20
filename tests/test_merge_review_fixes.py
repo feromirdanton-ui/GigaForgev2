@@ -292,11 +292,29 @@ def test_subagent_graph_runs_inside_a_live_event_loop(tmp_path: Path) -> None:
 
 
 # ── V2: the graphs are reachable from the product ────────────────────────────
-def test_engine_dispatch_defaults_to_classic(monkeypatch: pytest.MonkeyPatch) -> None:
-    from gigaforge.agents.engine import react_engine, subagent_engine
+def test_engine_dispatch_defaults_to_langgraph(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The graph is the default engine; ``classic`` is the bare-install fallback.
+
+    The old default was ``classic``, which meant the LangGraph layer — the whole
+    point of level 2 of the merge — never ran in a default deployment.  The
+    review called that out as the systemic defect: features that exist, are
+    tested, and are unreachable.
+    """
+    from gigaforge.agents.engine import _langgraph_ok, react_engine, subagent_engine
 
     monkeypatch.delenv("GIGAFORGE_REACT_ENGINE", raising=False)
     monkeypatch.delenv("GIGAFORGE_SUBAGENT_ENGINE", raising=False)
+    expected = "langgraph" if _langgraph_ok() else "classic"
+    assert react_engine() == expected
+    assert subagent_engine() == expected
+
+
+def test_engine_dispatch_honours_an_explicit_classic(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A deployment can still pin the hand-written loop."""
+    from gigaforge.agents.engine import react_engine, subagent_engine
+
+    monkeypatch.setenv("GIGAFORGE_REACT_ENGINE", "classic")
+    monkeypatch.setenv("GIGAFORGE_SUBAGENT_ENGINE", "classic")
     assert react_engine() == "classic"
     assert subagent_engine() == "classic"
 
