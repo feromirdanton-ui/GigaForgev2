@@ -152,6 +152,15 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "Run the test suite. `action_input` is the pytest argument string, or "
         "empty for the whole suite. Use it to verify a change, not to explore."
     ),
+    "repl": (
+        "Run a short Python program in the sandbox and see its output. "
+        "`action_input` is the program text. Use it to CHECK a fact you would "
+        "otherwise guess — a value, an import, a regex, a file's real shape — "
+        "or to compute something the task asks for. It runs in the repository "
+        "root with no state carried between calls, so a step that needs an "
+        "earlier result must read it from a file. Print what you want to see: "
+        "only stdout/stderr comes back."
+    ),
     "think": (
         "Scratchpad for one reasoning step. Call it before a multi-rule change "
         "to enumerate the exact output fields and types, the ordering and "

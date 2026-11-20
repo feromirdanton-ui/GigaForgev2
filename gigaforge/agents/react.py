@@ -360,11 +360,17 @@ class ToolRegistry:
         return sorted(self._tools.keys())
 
     def install_defaults(self, *, sandbox: Any) -> None:
-        """Install the built-in grep/read_structure/run_tests tools."""
+        """Install the built-in grep/read_structure/run_tests/repl tools."""
         self._sandbox = sandbox
         self.register(GrepTool())
         self.register(ReadStructureTool())
         self.register(RunTestsTool())
+        # The REPL is the harness's own execution surface: it reuses the
+        # sandbox executor (allowlist, worktree cwd, timeout) and the Firewall,
+        # so a probe costs one bounded observation instead of a new dependency.
+        from gigaforge.agents.repl_tool import ReplTool
+
+        self.register(ReplTool())
         self.register(FinishTool())
 
 
@@ -1293,7 +1299,9 @@ def _kind_for_tool(action: str) -> str:
         return "pytest"
     if action == "grep":
         return "grep"
-    # read_structure + finish + unknown → builderr (general fallback).
+    # read_structure + repl + finish + unknown → builderr (general fallback).
+    # A REPL step's output is a traceback or a print, which is exactly what the
+    # builderr compressor is built to bound.
     return "builderr"
 
 
