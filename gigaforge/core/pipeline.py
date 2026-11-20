@@ -1012,6 +1012,12 @@ class TaskPipeline:
         # ``_node_act`` is where they are consumed and the DAG only passes
         # declared inputs between nodes.
         ctx.extras["plan_structured"] = list(getattr(outcome, "structured", None) or [])
+        # Files the exploration episode wrote itself.  The coder is asked for a
+        # diff, so a file that already exists on disk is invisible to it unless
+        # the harness turns it into one — see ``_episode_diff``.
+        ctx.extras["episode_written_files"] = list(
+            getattr(outcome, "written_files", None) or []
+        )
         ctx.extras["localization"] = dict(getattr(outcome, "localization", None) or {})
         # Record the plan's fate where the result assembly can read it.  A plan
         # that came from the ReAct episode is "used" only if it produced steps;
@@ -1242,6 +1248,68 @@ class TaskPipeline:
             newest = max(newest, stat.st_mtime_ns)
         return f"{len(files)}:{total}:{newest}"
 
+    def _episode_diff(self, ctx: RunContext) -> str:
+        """Compute the diff for files the exploration episode wrote itself.
+
+        The episode's ``write_file`` tool edits the worktree directly.  The
+        pipeline's coder, however, is asked to *produce a diff* — so a file the
+        episode already wrote is invisible to the rest of the run unless the
+        harness turns it into one.  Measured live: a 4 KB page was written, the
+        coder returned nothing, the fix loop rejected three times with "diff
+        could not be parsed", and the run settled ``accepted: false, files: 0``
+        with the file sitting on disk.
+
+        The diff is computed, not asked for: ``git diff`` against HEAD, plus the
+        untracked files the episode created.  Returns an empty string when the
+        episode wrote nothing, so a run that never used the tool is unaffected.
+        """
+        written = list(ctx.extras.get("episode_written_files") or [])
+        if not written:
+            return ""
+        root = Path(str(getattr(self.config, "repo_root", ".") or ".")).resolve()
+        if not (root / ".git").exists():
+            return ""
+        import subprocess
+
+        parts: list[str] = []
+        try:
+            tracked = subprocess.run(
+                ["git", "diff", "--no-color", "--", *written],
+                cwd=root, capture_output=True, text=True, timeout=30,
+            )
+            if tracked.returncode == 0 and tracked.stdout.strip():
+                parts.append(tracked.stdout)
+            # Untracked files produce no ``git diff`` output at all, so they are
+            # diffed against /dev/null explicitly.
+            for rel in written:
+                path = root / rel
+                if not path.is_file():
+                    continue
+                check = subprocess.run(
+                    ["git", "ls-files", "--error-unmatch", rel],
+                    cwd=root, capture_output=True, text=True, timeout=15,
+                )
+                if check.returncode == 0:
+                    continue
+                body = path.read_text(encoding="utf-8", errors="replace")
+                lines = body.splitlines()
+                parts.append(
+                    f"diff --git a/{rel} b/{rel}\n"
+                    f"new file mode 100644\n"
+                    f"--- /dev/null\n"
+                    f"+++ b/{rel}\n"
+                    f"@@ -0,0 +1,{len(lines)} @@\n"
+                    + "".join(f"+{line}\n" for line in lines)
+                )
+        except (OSError, subprocess.SubprocessError) as exc:  # noqa: BLE001
+            self._event("pipeline.episode_diff_error", run_id=ctx.run_id,
+                        error=str(exc)[:200])
+            return ""
+        if parts:
+            self._event("pipeline.episode_diff", run_id=ctx.run_id,
+                        files=len(written), chars=sum(len(p) for p in parts))
+        return "\n".join(parts)
+
     def _subagent_diff(self, ctx: RunContext) -> str:
         """Split a multi-file goal into per-file sub-agents in isolated workspaces.
 
@@ -1372,6 +1440,18 @@ class TaskPipeline:
                 self._event("pipeline.optimize_error", run_id=ctx.run_id,
                             error=str(exc)[:200])
         prefetched = self._subagent_diff(ctx)
+        # The exploration episode may have written files itself (its ``write_file``
+        # tool).  Those writes are real work the run already paid for, and the
+        # coder cannot see them: it is asked to express the change as a diff, and
+        # a model that has already produced the file has no reason to produce it
+        # again.  Measured live: the episode wrote a 4 KB page, the coder returned
+        # no diff, the fix loop rejected three times with "diff could not be
+        # parsed", and the run settled ``accepted: false, files: 0`` while the
+        # file sat on disk.  The harness computes the diff from the worktree —
+        # that is a computation, not a judgement call.
+        episode_diff = self._episode_diff(ctx)
+        if episode_diff:
+            prefetched = "\n".join(p for p in (prefetched, episode_diff) if p)
 
         def propose(phase: str, prompt_text: str, iteration: int, hint: str) -> ProposeResult:
             text = self._ask(phase, prompt_text, ctx)

@@ -201,6 +201,10 @@ class ReActResult:
     #: payload is unusable — the guard drops an untargeted edit, and without
     #: this the run reports zero steps despite having the answer in hand.
     trajectory: list[dict[str, Any]] = field(default_factory=list)
+    #: Files the episode wrote itself via ``write_file``.  The pipeline turns
+    #: these into a diff: the coder is asked for a diff, and a file the episode
+    #: already produced is invisible to it otherwise.
+    written_files: list[str] = field(default_factory=list)
 
 
 # --- Built-in tools ---------------------------------------------------------
@@ -949,7 +953,7 @@ class ReActRunner:
                 # was empty, and the run reported success.  Nothing had ever
                 # looked at the file.  "Does the page contain the colours the
                 # user named?" is a string search, so the harness does it.
-                contract = self._check_contract(ctx, state)
+                contract = self._check_contract(ctx, state, result)
                 if not contract.ok and contract_retries < _MAX_CONTRACT_RETRIES:
                     contract_retries += 1
                     trajectory.append({"role": "assistant", "content": text})
@@ -1154,6 +1158,20 @@ class ReActRunner:
                     observation = observation[: _OBS_TOKEN_BUDGET * 4] + "\n[truncated]"
 
             trajectory.append({"role": "assistant", "content": text})
+            # A successful write is the episode's real output.  Record the path
+            # so the pipeline can compute its diff: the coder is asked for a
+            # diff, and a file that already exists on disk is invisible to it.
+            if action == "write_file" and not str(raw_obs).startswith("ERROR"):
+                try:
+                    _payload = json.loads(action_input)
+                    _rel = str(
+                        _payload.get("path") or _payload.get("file")
+                        or _payload.get("location") or ""
+                    ).strip()
+                except (json.JSONDecodeError, AttributeError):
+                    _rel = ""
+                if _rel and _rel not in result.written_files:
+                    result.written_files.append(_rel)
             if cached is not None:
                 # A cache hit means this exact observation is ALREADY earlier in
                 # the trajectory.  Appending it again would pay for the same
@@ -1362,7 +1380,7 @@ class ReActRunner:
         rescued.localization = self._extract_localization(plan, thought)
         return rescued
 
-    def _check_contract(self, ctx: ReActContext, state: TaskState):
+    def _check_contract(self, ctx: ReActContext, state: TaskState, result: ReActResult):
         """Check the produced artifact against the goal's explicit requirements.
 
         Returns a :class:`~gigaforge.harness.goal_contract.ContractVerdict`.
@@ -1377,10 +1395,7 @@ class ReActRunner:
             from gigaforge.harness.goal_contract import ContractVerdict
 
             return ContractVerdict()
-        written = [
-            s.get("action_input", "")
-            for s in getattr(self, "_written_files", [])
-        ]
+        written = list(getattr(result, "written_files", None) or [])
         return check_artifacts(requirements, ctx.worktree, files=written or None)
 
     def _synthesize_plan(self, trajectory: list[dict[str, str]]) -> list[PlanStep]:

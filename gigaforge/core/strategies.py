@@ -94,6 +94,10 @@ class PlanOutcome:
     #: rendered form the DAG executes; this is the same plan before rendering,
     #: so a consumer can read ``tool``/``args`` instead of parsing a string.
     structured: list[Any] = field(default_factory=list)
+    #: Files the exploration episode wrote itself.  Carried out of planning so
+    #: the pipeline can compute their diff instead of asking the coder to
+    #: reproduce work that already exists on disk.
+    written_files: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -991,6 +995,7 @@ class ReActPlan:
                 score=score_steps(steps),
                 localization=dict(getattr(result, "localization", None) or {}),
                 structured=list(getattr(result, "plan", None) or []),
+                written_files=list(getattr(result, "written_files", None) or []),
                 candidates=[{
                     "branch": "react",
                     "steps": steps,
