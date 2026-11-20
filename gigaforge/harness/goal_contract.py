@@ -49,15 +49,18 @@ from pathlib import Path
 #: writes it, and the checker only knew the keyword.  A false negative is as
 #: damaging as a false positive: it rejects work that is correct.
 _COLOUR_WORDS: dict[str, tuple[str, ...]] = {
-    "cyan": ("cyan", "#0ff", "#00ffff", "aqua", "rgb(0, 255, 255", "rgb(0,255,255"),
-    "magenta": ("magenta", "#f0f", "#ff00ff", "fuchsia", "rgb(255, 0, 255", "rgb(255,0,255"),
-    "purple": ("purple", "#800080", "#a020f0", "#9d00ff", "rgb(128, 0, 128"),
+    "cyan": ("cyan", "#0ff", "#00ffff", "aqua", "rgb(0, 255, 255", "rgb(0,255,255",
+             "rgba(0, 255, 255", "rgba(0,255,255"),
+    "magenta": ("magenta", "#f0f", "#ff00ff", "fuchsia", "rgb(255, 0, 255",
+                "rgb(255,0,255", "rgba(255, 0, 255", "rgba(255,0,255"),
+    "purple": ("purple", "#800080", "#a020f0", "#9d00ff", "rgb(128, 0, 128",
+               "rgba(128, 0, 128"),
     "violet": ("violet", "#8a2be2", "#7f00ff"),
-    "orange": ("orange", "#ffa500", "#ff7f00", "rgb(255, 165, 0"),
-    "green": ("green", "#0f0", "#00ff00", "lime", "rgb(0, 255, 0"),
-    "red": ("red", "#f00", "#ff0000", "rgb(255, 0, 0"),
-    "blue": ("blue", "#00f", "#0000ff", "rgb(0, 0, 255"),
-    "yellow": ("yellow", "#ff0", "#ffff00", "rgb(255, 255, 0"),
+    "orange": ("orange", "#ffa500", "#ff7f00", "rgb(255, 165, 0", "rgba(255, 165, 0"),
+    "green": ("green", "#0f0", "#00ff00", "lime", "rgb(0, 255, 0", "rgba(0, 255, 0"),
+    "red": ("red", "#f00", "#ff0000", "rgb(255, 0, 0", "rgba(255, 0, 0"),
+    "blue": ("blue", "#00f", "#0000ff", "rgb(0, 0, 255", "rgba(0, 0, 255"),
+    "yellow": ("yellow", "#ff0", "#ffff00", "rgb(255, 255, 0", "rgba(255, 255, 0"),
     "pink": ("pink", "#ffc0cb", "#ff69b4"),
     "gold": ("gold", "#ffd700"),
 }

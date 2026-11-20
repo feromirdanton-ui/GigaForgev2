@@ -223,15 +223,37 @@ def check_no_network_without_error_handling(
 
 
 def check_preserve_public_apis(diff: str, slice: ContextSlice) -> PrincipleResult:  # noqa: A002
-    """Catches removal of public function defs (``def name(`` not prefixed with ``_``)."""
+    """Catches removal of public function defs (``def name(`` not prefixed with ``_``).
+
+    A def that is removed **and re-added** is not a removal.  Editing a
+    function's body rewrites its signature line too — a unified diff shows
+    ``-def mul(a, b):`` followed by ``+def mul(a, b):`` — and the check used to
+    fail on the removed line alone.  Measured live: a sub-agent that changed
+    ``return a + b`` to ``return a * b`` was rejected with
+
+        public_api_removed: def mul(...) removed by the diff
+
+    for a diff that kept ``mul`` exactly where it was.  The check now compares
+    the two sides: a name fails only when it is gone from the added lines.
+    """
+    added_names = {
+        m.group(1)
+        for line in _added_lines(diff)
+        if (m := re.match(r"\s*def\s+([A-Za-z][A-Za-z0-9_]*)\s*\(", line))
+    }
     for line in _removed_lines(diff):
         m = re.match(r"\s*def\s+([A-Za-z][A-Za-z0-9_]*)\s*\(", line)
         if m:
             name = m.group(1)
-            if not name.startswith("_"):
-                return PrincipleResult.fail(
-                    f"public_api_removed: def {name}(...) removed by the diff"
-                )
+            if name.startswith("_"):
+                continue
+            if name in added_names:
+                # Re-added: the signature moved or was reformatted, the API did
+                # not disappear.
+                continue
+            return PrincipleResult.fail(
+                f"public_api_removed: def {name}(...) removed by the diff"
+            )
     return PrincipleResult.ok()
 
 

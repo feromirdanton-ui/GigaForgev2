@@ -30,7 +30,7 @@ ledger and the report can show it instead of the caller guessing.
 """
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -121,12 +121,29 @@ class PlanVerdict:
 
 
 def _tool_of(step: Any) -> str:
+    if isinstance(step, Mapping):
+        return str(step.get("tool") or "").strip()
     return str(getattr(step, "tool", "") or "").strip()
 
 
 def _args_of(step: Any) -> dict[str, Any]:
+    """The step's arguments, whether it is an object or a plain dict.
+
+    Only ``getattr(step, "args")`` was read, so a step that arrived as a dict —
+    which is what a model's JSON produces before it is coerced, and what every
+    caller of this module in a test passes — looked like a step with no
+    arguments at all.  The guard then rejected it for having no target, which
+    is the right verdict for the wrong reason: the arguments were there.
+    """
+    if isinstance(step, Mapping):
+        args = step.get("args")
+        if isinstance(args, Mapping):
+            return dict(args)
+        # A flat dict (``{"tool": ..., "path": ...}``) carries its arguments
+        # alongside the tool name.
+        return {k: v for k, v in step.items() if k not in {"tool", "args", "thought"}}
     args = getattr(step, "args", None)
-    return args if isinstance(args, dict) else {}
+    return dict(args) if isinstance(args, Mapping) else {}
 
 
 def _signature(step: Any) -> tuple[str, str]:
