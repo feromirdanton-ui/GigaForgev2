@@ -1768,41 +1768,33 @@ class TaskPipeline:
         ctx.extras["fix_result"] = result
         result.diff = self._ensure_creations(ctx, result.diff, slice_text, ctx)
         result.diff = self._repair_creation_hunks(ctx, result.diff)
-        # A file the harness wrote itself is authoritative.  ``_sectional_generation``
-        # writes the assembled page to disk and hands its diff to the fix loop as
-        # ``initial_diff``; if the model then also returns a diff for that path,
-        # applying it would edit a file the harness just built — the page on disk
-        # and the page in the diff would diverge, and the run would report the
-        # model's version while the tree held the harness's.  Measured: the
-        # assembled page had 1 <style> and the applied diff reintroduced a second.
+        # Ownership is ONE invariant, applied once.  Three mechanisms used to
+        # approximate it — drop the model's hunks, put the harness's hunks back,
+        # write the harness's bytes over the tree — and the invariant lived only
+        # in comments.  The consequence: ``_restore_harness_owned`` overwrote the
+        # file AFTER the model's diff, so a model that fixed a real bug in that
+        # file had its fix silently discarded.  Ownership was absolute because
+        # nothing in the code could say it was not.
         #
-        # Only the *model's* contribution is dropped.  The first version dropped
-        # every hunk for an owned path, which also removed the harness's own
-        # ``initial_diff`` — measured live: the fix loop accepted the page, then
-        # settle reported ``diff_chars: 0, files: 0`` and the goal loop rejected
-        # three cycles running with the error "ok".  The harness's own hunks are
-        # put back, so the diff describes the page that exists.
-        owned = set(ctx.extras.get("harness_owned_paths") or [])
-        if owned and result.diff:
-            before = len(result.diff)
-            result.diff = _drop_hunks_for(result.diff, owned)
-            if prefetched:
-                result.diff = _merge_repaired_diff(
-                    result.diff, _keep_hunks_for(prefetched, owned)
-                )
-            if len(result.diff) != before:
+        # ``OwnedFiles.resolve`` applies the whole rule in one call, and the
+        # policy is a value: AUTHORITATIVE (the harness assembled this file from
+        # a plan — its bytes are the artifact) or SEED (the harness wrote a
+        # baseline — the model's edits are the work and are never overwritten).
+        owned = self._owned_files(ctx)
+        if owned:
+            result.diff, resolution = owned.resolve(
+                result.diff, self._repo_root(), harness_diff=prefetched or ""
+            )
+            if resolution.dropped:
                 self._event("pipeline.harness_owned_hunks_dropped", run_id=ctx.run_id,
-                            paths=sorted(owned))
-
-        # Dropping the hunk from the diff does not undo what the fix loop already
-        # applied to the tree.  The harness's own content is authoritative, so it
-        # is written back — measured live, a 5452-byte assembled page was replaced
-        # by the model's 1139-byte hero-only answer and the contract then reported
-        # the sections the harness had built as missing.
-        restored = self._restore_harness_owned(ctx)
-        if restored:
-            self._event("pipeline.harness_owned_restored", run_id=ctx.run_id,
-                        paths=restored)
+                            paths=resolution.dropped)
+            if resolution.restored:
+                self._event("pipeline.harness_owned_restored", run_id=ctx.run_id,
+                            paths=resolution.restored)
+            if resolution.model_kept:
+                self._event("pipeline.harness_seed_kept", run_id=ctx.run_id,
+                            paths=resolution.model_kept)
+            ctx.extras["ownership"] = resolution.to_dict()
 
         route = self.router.last_route if self.router else None
         proposal = ProposeResult(
@@ -2238,6 +2230,32 @@ class TaskPipeline:
             llm=outcome.llm_used,
         )
         return {"review_verdict": outcome.to_dict()}
+
+    def _owned_files(self, ctx: RunContext) -> Any:
+        """The files the harness wrote, with their ownership policy.
+
+        A page the harness **assembled** from a plan is ``AUTHORITATIVE``: its
+        bytes are the artifact, and a model edit to it is a regression.
+
+        A page the harness wrote as a **baseline** — an existing page being
+        edited, where the harness seeded the file so the model had something to
+        change — is ``SEED``: the model's edits are the work, and writing the
+        harness's bytes back over them would discard exactly the change the run
+        was asked to make.  This is the case the review found: an edit of an
+        existing page had its fix silently reverted.
+        """
+        from gigaforge.harness.ownership import OwnedFiles, Policy
+
+        content = ctx.extras.get("harness_owned_content") or {}
+        if not content:
+            return OwnedFiles()
+        generation = ctx.extras.get("generation") or {}
+        policies: dict[str, Policy] = {}
+        if generation.get("edit"):
+            # The page existed before this run: the harness seeded it.
+            for path in content:
+                policies[str(path)] = Policy.SEED
+        return OwnedFiles.from_mapping(content, policies=policies)
 
     def _restore_harness_owned(self, ctx: RunContext) -> list[str]:
         """Write the harness's own files back over whatever the model applied.

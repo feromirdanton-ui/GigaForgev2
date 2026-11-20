@@ -170,7 +170,57 @@ class TestHarnessOwnsThePage:
         source = inspect.getsource(TaskPipeline._sectional_generation)
         assert "harness_owned_paths" in source
 
-    def test_act_drops_owned_hunks(self) -> None:
+    def test_act_applies_the_ownership_invariant(self) -> None:
+        """The act node must resolve ownership, not re-implement it.
+
+        This used to assert that ``_drop_hunks_for`` appeared in the source of
+        ``_node_act`` — a test of the implementation, not of the behaviour, and
+        one that would pass for any code that merely mentioned the name.  The
+        invariant now lives in ``OwnedFiles.resolve``; what matters is that the
+        act node calls it.
+        """
         source = inspect.getsource(TaskPipeline._node_act)
-        assert "_drop_hunks_for" in source
-        assert "harness_owned_paths" in source
+        assert "_owned_files" in source
+        assert "resolve(" in source
+
+    def test_ownership_is_a_policy_not_a_comment(self) -> None:
+        """An assembled page is authoritative; a seeded page is not."""
+        from gigaforge.harness.ownership import OwnedFiles, Policy
+
+        owned = OwnedFiles.from_mapping(
+            {"index.html": "<html></html>", "about.html": "<html></html>"},
+            policies={"about.html": Policy.SEED},
+        )
+        assert owned.authoritative_paths == {"index.html"}
+        assert owned.seed_paths == {"about.html"}
+
+    def test_a_seed_file_is_never_overwritten(self, tmp_path) -> None:
+        """The review's defect: an edit's fix was silently reverted.
+
+        ``_restore_harness_owned`` wrote the harness's bytes over the file AFTER
+        the model's diff, so a model that fixed a real bug in a page the harness
+        had seeded had its fix discarded.  A SEED file must keep the model's
+        work.
+        """
+        from gigaforge.harness.ownership import OwnedFiles, Policy
+
+        page = tmp_path / "index.html"
+        page.write_text("<html>MODEL FIX</html>", encoding="utf-8")
+        owned = OwnedFiles.from_mapping(
+            {"index.html": "<html>HARNESS BASELINE</html>"},
+            policies={"index.html": Policy.SEED},
+        )
+        _diff, resolution = owned.resolve("", tmp_path)
+        assert page.read_text(encoding="utf-8") == "<html>MODEL FIX</html>"
+        assert resolution.model_kept == ["index.html"]
+        assert resolution.restored == []
+
+    def test_an_authoritative_file_is_restored(self, tmp_path) -> None:
+        from gigaforge.harness.ownership import OwnedFiles
+
+        page = tmp_path / "index.html"
+        page.write_text("<html>MODEL GUESS</html>", encoding="utf-8")
+        owned = OwnedFiles.from_mapping({"index.html": "<html>ASSEMBLED</html>"})
+        _diff, resolution = owned.resolve("", tmp_path)
+        assert page.read_text(encoding="utf-8") == "<html>ASSEMBLED</html>"
+        assert resolution.restored == ["index.html"]
