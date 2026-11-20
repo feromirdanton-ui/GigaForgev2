@@ -42,6 +42,11 @@ from gigaforge.agents.planner import json_repair
 from gigaforge.client.errors import BudgetExceeded
 from gigaforge.client.giga_client import ChatResult, GigaClient
 from gigaforge.config import Settings, get_settings
+from gigaforge.agents.fallback import (
+    EXPLORE,
+    FORCE_FINISH,
+    ParseFailureFallback,
+)
 from gigaforge.agents.observation_cache import ObservationCache
 from gigaforge.core.budgets import BudgetTracker
 from gigaforge.core.context_window_guard import ContextOverflowError
@@ -602,6 +607,13 @@ class ReActRunner:
         # (one nudge per signature per run), so it is safe to consult on every
         # observation.
         breaker = LoopBreaker()
+        # Deterministic fallback for a model that will not emit the JSON step
+        # envelope.  The nudge alone was the only response to a parse failure,
+        # so a model answering in prose burned the whole step budget on reformat
+        # requests.  After the first failure the harness takes over: a
+        # deterministic grep, then a forced finish.
+        fallback = ParseFailureFallback()
+        parse_failures = 0
         # Observation cache: a ReAct episode re-reads the same file constantly,
         # and each repeat costs a tool call plus a full observation in the
         # trajectory — which is what pushes a run into compaction.  Only
@@ -707,8 +719,67 @@ class ReActRunner:
 
             parsed = self._parse_step(text)
             if parsed is None:
-                # Repair nudge — keep going (still bounded by max_steps).
+                # Repair nudge — but bounded, and with a deterministic fallback.
+                #
+                # The nudge alone was the *only* response to a parse failure, so
+                # a model that kept answering in prose burned the whole step
+                # budget on reformat requests and the episode ended with
+                # nothing.  Measured live: the model located the files, then
+                # spent its remaining steps failing to wrap the answer in JSON.
+                # After the first failure the harness takes over the part the
+                # model is failing at (see agents/fallback.py).
+                parse_failures += 1
+                decision = fallback.next_action(task, parse_failures)
                 trajectory.append({"role": "assistant", "content": text})
+                result.steps.append(
+                    {
+                        "step_idx": step_idx,
+                        "raw": text,
+                        "ok": False,
+                        "error": "parse_failed",
+                        "fallback": decision.kind,
+                    }
+                )
+                self._tracer.trace(
+                    state.task_id,
+                    step=f"react_step_{step_idx}_parse_failed",
+                    kind="decision",
+                    detail={
+                        "step_idx": step_idx,
+                        "consecutive": parse_failures,
+                        "fallback": decision.kind,
+                        "note": decision.note,
+                    },
+                )
+                if decision.kind == FORCE_FINISH:
+                    # Three failures is not a formatting accident.  Stop
+                    # exploring and turn what was observed into a plan.
+                    break
+                if decision.kind == EXPLORE:
+                    # Run the deterministic search ourselves and feed the result
+                    # back as an observation, so the episode still produces
+                    # something a salvage can use.
+                    tool = self._registry.get(decision.action)
+                    if tool is not None:
+                        try:
+                            raw_obs = await tool.run(decision.action_input, ctx=ctx)
+                        except Exception as exc:  # noqa: BLE001 - best-effort
+                            raw_obs = f"ERROR: fallback {decision.action!r} raised: {exc}"
+                        kind = _kind_for_tool(decision.action)
+                        raw_obs = self.guards.normalize_observation(decision.action, raw_obs)
+                        observation = compress(
+                            kind, raw_obs, limit_tokens=_OBS_TOKEN_BUDGET
+                        ).text
+                        trajectory.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"[FALLBACK] {decision.note}\n"
+                                    f"Observation ({kind}):\n{observation}"
+                                ),
+                            }
+                        )
+                        continue
                 trajectory.append(
                     {
                         "role": "user",
@@ -718,12 +789,13 @@ class ReActRunner:
                         ),
                     }
                 )
-                result.steps.append(
-                    {"step_idx": step_idx, "raw": text, "ok": False, "error": "parse_failed"}
-                )
                 continue
 
             thought, action, action_input = parsed
+            # A good step resets the failure streak: the fallback is for a model
+            # that has stopped answering in this shape, not for one that
+            # stumbled once.
+            parse_failures = 0
             result.steps.append(
                 {
                     "step_idx": step_idx,
@@ -891,7 +963,16 @@ class ReActRunner:
             state.task_id,
             step="react_max_steps_reached",
             kind="decision",
-            detail={"max_steps": self._max_steps, "llm_calls": result.llm_calls},
+            detail={
+                "max_steps": self._max_steps,
+                "llm_calls": result.llm_calls,
+                # A run that degraded must say so: an episode that spent its
+                # steps failing to emit JSON is not the same as one that
+                # explored and ran out of room, and a report that cannot tell
+                # them apart cannot tell a model problem from a harness one.
+                "parse_failures": parse_failures,
+                "fallback": fallback.describe(),
+            },
         )
         return self._carry_trajectory(result, trajectory)
 
