@@ -160,7 +160,11 @@ class TestPipelineWiring:
         assert "_sectional_generation" in source, (
             "a page goal must reach the sectional path, not the file fan-out"
         )
-        assert "is_page_goal" in source
+        # Routing is by filesystem evidence now, not by a substring of the goal.
+        # The old assertion pinned ``is_page_goal``, which was the defect: it
+        # returned True for "Fix the composite index in db.py".
+        assert "classify_task" in source
+        assert "is_page_goal" not in source
 
     def test_sectional_generation_writes_the_page(self, tmp_path: Path) -> None:
         """Drive the real method with a stub model and check the file on disk."""
@@ -274,4 +278,4 @@ class TestEveryModeGetsTheSectionalPath:
         assert "_sectional_generation" in source, (
             "the plain run path must build a page section by section too"
         )
-        assert "is_page_goal" in source
+        assert "classify_task" in source

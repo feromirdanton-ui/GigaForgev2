@@ -1451,9 +1451,13 @@ class TaskPipeline:
         # ``{"files": 1}`` and a 2564-byte page with no feature grid.  The unit
         # of decomposition for an artifact is a section, not a file.
         try:
-            from gigaforge.harness.generation import is_page_goal
+            from gigaforge.harness.task_kind import classify_task
 
-            if is_page_goal(ctx.state.goal):
+            kind = classify_task(ctx.state.goal, self._repo_root())
+            ctx.extras["task_kind"] = kind.to_dict()
+            self._event("pipeline.task_kind", run_id=ctx.run_id,
+                        kind=kind.kind, evidence=kind.evidence[:300])
+            if kind.is_artifact:
                 return self._sectional_generation(ctx)
         except Exception as exc:  # noqa: BLE001 - fall through to the code path
             self._event("pipeline.generation_plan_error", run_id=ctx.run_id,
@@ -1651,9 +1655,13 @@ class TaskPipeline:
         # asked for sub-agents.
         if not prefetched:
             try:
-                from gigaforge.harness.generation import is_page_goal
+                from gigaforge.harness.task_kind import classify_task
 
-                if is_page_goal(_original_goal(ctx.state.goal)):
+                kind = classify_task(_original_goal(ctx.state.goal), self._repo_root())
+                ctx.extras["task_kind"] = kind.to_dict()
+                self._event("pipeline.task_kind", run_id=ctx.run_id,
+                            kind=kind.kind, evidence=kind.evidence[:300])
+                if kind.is_artifact:
                     prefetched = self._sectional_generation(ctx)
             except Exception as exc:  # noqa: BLE001 - fall back to the coder
                 self._event("pipeline.generation_plan_error", run_id=ctx.run_id,

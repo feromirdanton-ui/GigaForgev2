@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 
 #: Section kinds the harness can plan, in the order a landing page uses them.
 #: Each entry is ``(kind, trigger words, heading)``.  A kind is planned only
@@ -64,6 +65,13 @@ _SECTION_CATALOGUE: tuple[tuple[str, tuple[str, ...], str], ...] = (
 _DEFAULT_SHAPE = ("hero", "features", "footer")
 
 #: Words that mean "this goal produces a single self-contained page".
+#:
+#: ``site`` and ``html`` used to be in this tuple, and they are substrings of
+#: *composite*, *parasite*, *opposite* and *html parser* — so "Fix the composite
+#: index in db.py" was routed to landing-page generation and the model's correct
+#: diff was discarded.  Routing is now decided by :mod:`gigaforge.harness.task_kind`
+#: from the filesystem; this tuple survives only as the phrase list that module
+#: consults when a goal names no path at all.
 _PAGE_HINTS = (
     "landing page",
     "single-file",
@@ -72,8 +80,9 @@ _PAGE_HINTS = (
     "web page",
     "webpage",
     "website",
-    "site",
-    "html",
+    "web site",
+    "static page",
+    "home page",
 )
 
 
@@ -107,10 +116,22 @@ class GenerationPlan:
         return [section.kind for section in self.sections]
 
 
-def is_page_goal(goal: str) -> bool:
-    """True when the goal asks for a self-contained page rather than a code change."""
-    low = (goal or "").lower()
-    return any(hint in low for hint in _PAGE_HINTS)
+def is_page_goal(goal: str, repo_root: "Path | str | None" = None) -> bool:
+    """True when the goal asks for a self-contained page rather than a code change.
+
+    Delegates to :func:`gigaforge.harness.task_kind.classify_task`, which decides
+    from the filesystem instead of from a substring.  The old implementation was
+    ``any(hint in low for hint in _PAGE_HINTS)`` with ``"site"`` and ``"html"``
+    in the tuple, so "Fix the composite index in db.py" was a page goal and the
+    correct diff was thrown away.
+
+    ``repo_root`` is optional for callers that only have the text; without it
+    the decision falls back to explicit page phrases, which is the conservative
+    direction (no tree to check → do not invent an artifact).
+    """
+    from gigaforge.harness.task_kind import is_artifact_goal
+
+    return is_artifact_goal(goal, repo_root)
 
 
 def plan_generation(goal: str) -> GenerationPlan:
