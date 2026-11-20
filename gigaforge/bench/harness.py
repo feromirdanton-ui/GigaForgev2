@@ -24,6 +24,7 @@ Doctrine:
 from __future__ import annotations
 
 import json as _json
+import re
 import shutil
 import subprocess
 import sys
@@ -34,8 +35,13 @@ from typing import Any
 
 from gigaforge.bench.report import bench_report  # re-export
 from gigaforge.client.giga_client import ChatResult
+from gigaforge.harness.generation import _SECTION_CATALOGUE
 
 __all__ = ["BenchRunner", "BenchResult", "bench_report", "TASKS"]
+
+
+class _NoTestCommand(Exception):
+    """A fixture with no test command: its acceptance is the artifact check."""
 
 
 # --- Task fixtures ---------------------------------------------------------
@@ -71,6 +77,20 @@ class TaskFixture:
     test_command: list[str]
     expected_diff_substring: str
     test_args: list[str] = field(default_factory=list)
+    #: Canned answers for the sectional page path, keyed by section kind.
+    #:
+    #: A page task cannot use ``code_responses``: the sections are generated
+    #: CONCURRENTLY, so a positional list would hand the hero's answer to the
+    #: footer depending on which thread won.  Keying by kind makes the fixture
+    #: deterministic regardless of scheduling — which is the whole point of a
+    #: bench.
+    section_responses: dict[str, str] = field(default_factory=dict)
+    #: What the finished artifact must contain, checked on the file the run
+    #: wrote.  This is the HTML analogue of ``test_command``: a page has no
+    #: tests, so its acceptance is a set of structural facts.
+    artifact_must_contain: tuple[str, ...] = ()
+    #: Minimum size of the written artifact, in bytes.
+    artifact_min_bytes: int = 0
 
 
 # --- Task #1: classic validate_email fix (mirrors the toy repo) ------------
@@ -346,7 +366,102 @@ TASK4 = TaskFixture(
 
 
 # The default task set — the bench runner uses this if no explicit list is passed.
-TASKS: list[TaskFixture] = [TASK1, TASK2, TASK3, TASK4]
+# (Defined after TASK5, below.)
+
+
+# --- Task #5: a page, not a diff ------------------------------------------
+#
+# The bench had four tasks and every one of them was a Python bug fix.  So the
+# bench could not see the artifact path at all: the sectional generation, the
+# plan-derived contract, the HTML repair, the render check — none of it was
+# measured, and a regression that broke page generation outright would have
+# left the bench green.  A benchmark that only covers the path you already
+# trust is a regression test for the past, not a measurement of the product.
+#
+# This fixture is the HTML analogue of the others: the run is asked for a page,
+# the fake provider answers per section, and acceptance is a set of structural
+# facts about the file the run wrote.
+
+_TASK5_HERO = (
+    '<section class="hero">'
+    "<h1>GigaForge</h1>"
+    "<p>A harness that plans, acts and verifies its own work. It does not "
+    "answer in a chat window and call that a job done: it reads the repository, "
+    "writes the files, runs the tests and checks the artifact it produced "
+    "before it reports success.</p>"
+    "</section>"
+)
+
+_TASK5_FEATURES = (
+    '<section class="features">'
+    '<div class="feature-grid">'
+    '<div class="feature-card"><h3>Plan</h3><p>It turns a goal into an ordered '
+    "set of steps, and the plan is a checklist the harness can check rather "
+    "than a paragraph the model can drift away from.</p></div>"
+    '<div class="feature-card"><h3>Act</h3><p>It edits the working tree, not a '
+    "transcript. Every change is a diff that either applies or does not, and "
+    "the harness knows which before it claims anything.</p></div>"
+    '<div class="feature-card"><h3>Verify</h3><p>It checks the artifact it '
+    "built: structure, palette, landmarks and the tests that must pass after "
+    "the change. A run that cannot prove its work is a run that failed.</p></div>"
+    "</div></section>"
+)
+
+_TASK5_FOOTER = (
+    '<footer class="footer"><p>GigaForge — an agent harness that finishes the '
+    "job and shows its evidence.</p></footer>"
+)
+
+TASK5 = TaskFixture(
+    name="page-cyberpunk-landing",
+    repo_files={"README.md": "# demo repo\n"},
+    task=(
+        "Create a single-file index.html: a cyberpunk landing page about the "
+        "GigaForge agent harness, with a hero, a feature grid and a footer, "
+        "using cyan and magenta."
+    ),
+    target_function="",
+    target_file="",
+    plan_response=_json.dumps({"steps": []}),
+    code_responses=[],
+    review_responses=[_TASK1_REVIEW_OK],
+    test_command=[],
+    expected_diff_substring="index.html",
+    section_responses={
+        "hero": _TASK5_HERO,
+        "features": _TASK5_FEATURES,
+        "footer": _TASK5_FOOTER,
+    },
+    artifact_must_contain=(
+        "<!DOCTYPE html",
+        "<h1",
+        "feature-card",
+        "<footer",
+        "cyan",
+    ),
+    artifact_min_bytes=1200,
+)
+
+
+# The default task set — the bench runner uses this if no explicit list is passed.
+TASKS: list[TaskFixture] = [TASK1, TASK2, TASK3, TASK4, TASK5]
+
+
+def _section_kind_from_prompt(prompt: str) -> str:
+    """Which section a child prompt is asking for.
+
+    ``section_prompt`` writes ``(kind: hero)`` into the instruction, so the
+    fixture can answer by kind instead of by position.  Falls back to the first
+    catalogue kind the prompt names, so a prompt reworded later still resolves.
+    """
+    match = re.search(r"\(kind:\s*([a-z_]+)\)", prompt)
+    if match:
+        return match.group(1)
+    low = prompt.lower()
+    for kind, triggers, _heading in _SECTION_CATALOGUE:
+        if any(trigger in low for trigger in triggers):
+            return kind
+    return ""
 
 
 # --- BenchFakeClient + LooserBudgetTracker ---------------------------------
@@ -403,6 +518,13 @@ class BenchFakeGigaClient:
         tokens_in = sum(len(str(m.get("content", "") or "")) for m in messages) // 4 + 4
         if phase == "plan":
             content = self._fixture.plan_response
+        elif phase == "code" and self._fixture.section_responses:
+            # The sectional page path: the prompt names the section kind, so the
+            # answer is chosen by kind rather than by position.  Sections run
+            # concurrently, and a positional list would hand the hero's answer
+            # to the footer depending on which thread won.
+            kind = _section_kind_from_prompt(prompt)
+            content = self._fixture.section_responses.get(kind, "")
         elif phase == "code":
             content = (
                 self._code_responses.pop(0)
@@ -669,6 +791,12 @@ class BenchRunner:
             if applied_ok:
                 try:
                     cmd = list(fixture.test_command)
+                    if not cmd:
+                        # A page task has no test command: its acceptance is the
+                        # artifact check below.  Running ``[]`` raised
+                        # ``IndexError: list index out of range`` and the bench
+                        # reported a successful page as an error.
+                        raise _NoTestCommand
                     if sys.platform == "win32" and cmd and cmd[0] == "python3":
                         cmd[0] = sys.executable
                     proc = subprocess.run(cmd, cwd=verify_dir, capture_output=True,
@@ -676,6 +804,8 @@ class BenchRunner:
                     tests_passed = proc.returncode == 0
                     if not tests_passed:
                         verify_error = (proc.stdout or proc.stderr or "")[-400:]
+                except _NoTestCommand:
+                    tests_passed = False
                 except Exception as exc:  # noqa: BLE001 - best effort
                     verify_error = f"{type(exc).__name__}: {exc}"
                     tests_passed = False
@@ -684,10 +814,34 @@ class BenchRunner:
         pipeline.close()
         l0_store.close()
 
+        # A page task has no test command: its acceptance is a set of structural
+        # facts about the file the run wrote.  Without this the HTML fixture
+        # would report success on ``result.accepted`` alone, which is the very
+        # claim the bench exists to check independently.
+        artifact_ok = True
+        if fixture.artifact_must_contain or fixture.artifact_min_bytes:
+            written = repo / (fixture.expected_diff_substring or "index.html")
+            if not written.is_file():
+                artifact_ok = False
+                verify_error = f"artifact not written: {written.name}"
+            else:
+                body = written.read_text(encoding="utf-8", errors="replace")
+                missing = [needle for needle in fixture.artifact_must_contain
+                           if needle not in body]
+                if missing:
+                    artifact_ok = False
+                    verify_error = f"artifact missing: {', '.join(missing)}"
+                elif len(body.encode("utf-8")) < fixture.artifact_min_bytes:
+                    artifact_ok = False
+                    verify_error = (
+                        f"artifact is {len(body.encode('utf-8'))} bytes, "
+                        f"expected at least {fixture.artifact_min_bytes}"
+                    )
+
         return BenchResult(
             name=fixture.name,
             task=fixture.task,
-            success=bool(result.accepted),
+            success=bool(result.accepted) and artifact_ok,
             cache_hit=bool(result.cache_hit),
             llm_calls=llm_calls,
             tokens_in=provider.usage_in,
@@ -695,6 +849,8 @@ class BenchRunner:
             latency_s=latency,
             applied_files=list(result.changed_files),
             diff_substring_found=diff_substring_found,
-            tests_passed_after_apply=tests_passed,
+            tests_passed_after_apply=tests_passed or (
+                artifact_ok and bool(fixture.artifact_must_contain)
+            ),
             error=verify_error or str(getattr(result, "error", "") or ""),
         )

@@ -983,15 +983,45 @@ def mcp(
 @app.command()
 def bench(
     as_json: Annotated[bool, typer.Option("--json", help="Emit JSON report.")] = False,
+    out: Annotated[
+        str,
+        typer.Option("--out", help="Write the JSON report to this path (for CI)."),
+    ] = "",
     verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
 ) -> None:
-    """Run the offline benchmark suite across tasks."""
+    """Run the offline benchmark suite across tasks.
+
+    ``--out PATH`` writes the JSON report to a file and exits non-zero if any
+    task failed, so CI can gate on the bench instead of parsing stdout.  The
+    bench was not wired to CI at all, and it contained no HTML task, so a
+    regression that broke page generation outright left every check green.
+    """
     from gigaforge.bench import BenchRunner, bench_report, bench_report_json
 
     runner = BenchRunner()
     results = runner.run_all()
+    if out:
+        import json as _json
+        from pathlib import Path
+
+        # ``bench_report_json`` returns a LIST of rows, not a string.  Writing it
+        # directly raised ``TypeError: data must be str, not list`` — and the
+        # ``--json`` path printed a Python repr, which is not JSON.  Both are
+        # fixed here, in the one place that serialises.
+        Path(out).write_text(
+            _json.dumps(bench_report_json(results), indent=2), encoding="utf-8"
+        )
+        failed = [r for r in results if not r.success]
+        typer.echo(f"{len(results) - len(failed)}/{len(results)} bench tasks passed")
+        for row in failed:
+            typer.echo(f"  FAIL {row.name}: {row.error[:200]}")
+        if failed:
+            raise typer.Exit(code=1)
+        return
     if as_json:
-        typer.echo(bench_report_json(results))
+        import json as _json
+
+        typer.echo(_json.dumps(bench_report_json(results), indent=2))
     else:
         typer.echo(bench_report(results))
 

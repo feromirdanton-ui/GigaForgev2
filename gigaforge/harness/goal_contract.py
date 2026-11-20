@@ -582,15 +582,28 @@ def check_artifacts(
             # Count the role, not the content: ``<footer>`` and
             # ``<div class="footer">`` are the same landmark, and the two
             # footers a live run produced had different text.
+            #
+            # Count ELEMENTS, not matches.  The first version ran two regexes —
+            # one for the tag, one for the class — and added them, so the
+            # ordinary ``<footer class="footer">`` was counted twice and a page
+            # with exactly one footer failed with "found 2 footer landmarks".
+            # Measured by the new bench HTML fixture on its first run.  A single
+            # alternation with a dedupe by match position counts each element
+            # once however it is spelled.
             role = req.needles[0]
+            element = re.compile(
+                rf"<{role}\b"
+                rf"|<[a-z][a-z0-9]*\b[^>]*\bclass\s*=\s*[\"'][^\"']*\b{role}\b",
+                re.I,
+            )
             worst = 0
             for text in texts.values():
-                count = len(re.findall(rf"<{role}\b", text, re.I))
-                count += len(re.findall(
-                    rf'<[a-z][a-z0-9]*\b[^>]*\bclass\s*=\s*["\'][^"\']*\b{role}\b',
-                    text, re.I,
-                ))
-                worst = max(worst, count)
+                # ``texts`` includes the stylesheet; a CSS rule mentioning
+                # ``footer`` is not a landmark, so only the markup is counted.
+                markup = re.sub(r"<style\b[^>]*>.*?</style\s*>", "", text,
+                                flags=re.S | re.I)
+                positions = {match.start() for match in element.finditer(markup)}
+                worst = max(worst, len(positions))
             if worst <= 1:
                 verdict.met.append(req.label)
             else:
