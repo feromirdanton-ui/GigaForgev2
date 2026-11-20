@@ -57,30 +57,103 @@ def _normalise(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
-def looks_like_css(text: str) -> bool:
-    """True when *text* is a stylesheet that ended up outside ``<style>``.
+def _css_shaped(text: str) -> bool:
+    """True when *text* is shaped like a stylesheet and not like prose.
 
-    The test is deliberately strict, because the cost of a false positive is
-    deleting a paragraph of the user's copy.  A stylesheet has braces, at least
-    two declarations, and a declaration is ``property: value;``.  Prose that
-    happens to contain a brace does not.
+    This is the *second* line of defence, used only for CSS that is not already
+    present in a ``<style>`` block.  The first version of this check was
+    ``punctuation / len > 0.02``, and it classified this paragraph as CSS::
+
+        Our API returns {status: ok; latency: 12ms;} for every call, and
+        {retries: 3; timeout: 5s;} on failure.
+
+    The repair then deleted the paragraph from the body and pasted it into
+    ``<style>`` — the reader lost the sentence and the browser threw the rules
+    away.  A false positive here destroys the user's copy, so the test has to
+    be strict enough that prose cannot pass it.
+
+    Three conditions, all necessary:
+
+    1. every ``{...}`` block contains only ``property: value`` declarations
+       (nested blocks are checked recursively, so ``@media`` still passes);
+    2. outside the braces there is no run of three or more plain words — a
+       selector chain of three type selectors is vanishingly rare, prose always
+       has one;
+    3. outside the braces every character is in the CSS alphabet.
     """
     body = (text or "").strip()
-    # 30, not 40: a minimal but real rule set — ``body { color: #fff;
-    # background: #000; }`` — is 39 characters, and a threshold above it
-    # rejected the smallest genuine stylesheet.
+    if len(body) < 30 or "{" not in body or "}" not in body:
+        return False
+
+    # 1. Every block is declarations (or nested rules).
+    depth = 0
+    block_start = -1
+    blocks: list[str] = []
+    for index, char in enumerate(body):
+        if char == "{":
+            if depth == 0:
+                block_start = index + 1
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0 and block_start >= 0:
+                blocks.append(body[block_start:index])
+                block_start = -1
+            elif depth < 0:
+                return False
+    if depth != 0 or not blocks:
+        return False
+    for block in blocks:
+        if "{" in block:
+            if not _css_shaped(block):
+                return False
+            continue
+        for part in block.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            if not re.match(r"^[a-zA-Z-]+\s*:\s*\S", part):
+                return False
+
+    # 2. No prose outside the braces.
+    outside = re.sub(r"\{[^{}]*\}", " ", body)
+    outside = re.sub(r"\{.*\}", " ", outside, flags=re.S)
+    if re.search(r"\b[a-zA-Z]{2,}\s+[a-zA-Z]{2,}\s+[a-zA-Z]{2,}\b", outside):
+        return False
+
+    # 3. CSS alphabet outside the braces.
+    if re.search(r"[^A-Za-z0-9\s\-_.#>+~*:\[\]=\"'(),%@/&!|^$]", outside):
+        return False
+    return True
+
+
+def looks_like_css(text: str, *, known_css: str = "") -> bool:
+    """True when *text* is a stylesheet that ended up outside ``<style>``.
+
+    Two ways to qualify, and the order matters:
+
+    * **It is already in a ``<style>`` block.**  This is the case the live
+      defect actually was: the model emitted the sheet twice, once inside
+      ``<style>`` and once as raw text in ``<body>``.  A byte-for-byte
+      (whitespace-normalised) match against the existing sheet is proof, not a
+      guess, and it is the only case the repair will *delete*.
+    * **It is shaped like CSS and not like prose** — see :func:`_css_shaped`.
+      Used for rules that are genuinely new; the repair moves those into
+      ``<style>`` instead of dropping them.
+
+    ``known_css`` is the concatenated content of the page's existing ``<style>``
+    blocks.  When it is empty only the strict shape test applies.
+    """
+    body = (text or "").strip()
     if len(body) < 30:
         return False
     if "{" not in body or "}" not in body:
         return False
-    declarations = re.findall(r"[a-zA-Z-]+\s*:\s*[^;{}]{1,120};", body)
-    if len(declarations) < 2:
-        return False
-    # A stylesheet is mostly punctuation and property names; prose is mostly
-    # words.  Requiring a high punctuation density keeps a sentence that
-    # mentions "color: red;" from being mistaken for a stylesheet.
-    punctuation = sum(body.count(ch) for ch in "{};:")
-    return punctuation / max(1, len(body)) > 0.02
+    if known_css:
+        needle = _normalise(body)
+        if needle and needle in _normalise(known_css):
+            return True
+    return _css_shaped(body)
 
 
 def _strip_opaque(html: str) -> str:
@@ -119,14 +192,20 @@ def _text_nodes(html: str) -> list[tuple[int, int, str]]:
     return nodes
 
 
+def _known_css(html: str) -> str:
+    """The concatenated content of every ``<style>`` block on the page."""
+    return "\n".join(match.group(1) for match in _STYLE_BLOCK_RE.finditer(html))
+
+
 def leaked_css_text(html: str) -> list[str]:
     """CSS runs that are sitting in the body as text instead of in ``<style>``."""
     body_match = _BODY_RE.search(html)
     body = body_match.group(1) if body_match else html
     body = _STRAY_STYLE_TAG_RE.sub(" ", body)
+    known = _known_css(html)
     leaked: list[str] = []
     for _start, _end, candidate in _text_nodes(body):
-        if looks_like_css(candidate):
+        if looks_like_css(candidate, known_css=known):
             leaked.append(candidate.strip())
     return leaked
 
@@ -170,13 +249,34 @@ def _block_spans(html: str, tag: str) -> list[tuple[int, int, str]]:
     return spans
 
 
+def _block_key(block: str) -> str:
+    """The identity of a block: its whole markup, attributes included.
+
+    The first version compared ``_TAG_RE.sub(" ", block)`` — the text with every
+    tag and every attribute stripped.  That made ``<nav class="mobile">`` and
+    ``<nav class="desktop">`` identical, so a page with a mobile and a desktop
+    menu (the ordinary responsive pattern) had one of them deleted.  Measured:
+    ``removed 1 duplicate <nav> block(s)``, and the surviving menu was whichever
+    came first.
+
+    A duplicate is a block that is the same *markup*, not the same words.  Two
+    menus with different classes are two menus.
+
+    Whitespace *between tags* is insignificant in HTML, so it is removed before
+    comparing: a block re-emitted with different indentation is still the same
+    block, and treating it as different would let the real duplicate through.
+    """
+    text = _normalise(block)
+    return re.sub(r">\s+<", "><", text)
+
+
 def duplicate_blocks(html: str) -> list[tuple[str, int]]:
     """``(tag, count)`` for block elements emitted more than once identically."""
     found: list[tuple[str, int]] = []
     for tag in _BLOCK_TAGS:
         seen: dict[str, int] = {}
         for _start, _end, block in _block_spans(html, tag):
-            key = _normalise(_TAG_RE.sub(" ", block))
+            key = _block_key(block)
             if len(key) < 20:
                 continue
             seen[key] = seen.get(key, 0) + 1
@@ -298,7 +398,7 @@ def repair_html_structure(html: str) -> tuple[str, list[str]]:
         spans: list[tuple[int, int]] = []
         novel: list[str] = []
         for start, end, candidate in _text_nodes(body):
-            if not looks_like_css(candidate):
+            if not looks_like_css(candidate, known_css=existing):
                 continue
             spans.append((start, end))
             if _normalise(candidate) not in existing:
@@ -351,7 +451,7 @@ def repair_html_structure(html: str) -> tuple[str, list[str]]:
         seen_blocks: set[str] = set()
         spans: list[tuple[int, int]] = []
         for start, end, block in _block_spans(out, tag):
-            key = _normalise(_TAG_RE.sub(" ", block))
+            key = _block_key(block)
             if len(key) < 20:
                 continue
             if key in seen_blocks:
