@@ -367,6 +367,16 @@ class BenchFakeGigaClient:
         self.metrics_sink = metrics_sink or (lambda r: None)
         self._code_responses = list(fixture.code_responses)
         self._review_responses = list(fixture.review_responses)
+        #: Real token accounting for the fake transport.
+        #:
+        #: The bench used to report ``tokens_in = 100 * llm_calls`` \u2014 a
+        #: constant multiplied by a count.  That number could not move when the
+        #: prompt grew, so a regression that doubled the context per call was
+        #: invisible in the one report the bench exists to produce.  The fake
+        #: client now measures the messages it was actually handed, which is the
+        #: same 4-chars-per-token estimate the context guard uses.
+        self.usage_in = 0
+        self.usage_out = 0
 
     def capabilities(self) -> Any:
         from gigaforge.providers.base import ProviderCapabilities
@@ -387,6 +397,10 @@ class BenchFakeGigaClient:
         if phase == "unknown":
             phase = _phase_from_prompt(prompt)
         self.chat_calls.append({"model": model, "phase": phase, **kwargs})
+        # Measure the whole request, not just the last message: the growth the
+        # bench must catch is the trajectory, and the trajectory is every
+        # message before the last one.
+        tokens_in = sum(len(str(m.get("content", "") or "")) for m in messages) // 4 + 4
         if phase == "plan":
             content = self._fixture.plan_response
         elif phase == "code":
@@ -404,15 +418,18 @@ class BenchFakeGigaClient:
             )
         else:
             content = ""
+        tokens_out = max(1, len(content) // 4)
+        self.usage_in += tokens_in
+        self.usage_out += tokens_out
         self.metrics_sink(
             {
                 "ts": time.time(),
                 "task_id": task_id,
                 "phase": phase,
                 "model": model,
-                "tokens_in": 100,
-                "tokens_out": 50,
-                "estimated": False,
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+                "estimated": True,
                 "latency_ms": 1,
                 "retries": 0,
                 "ok": True,
@@ -421,9 +438,13 @@ class BenchFakeGigaClient:
         )
         return ChatResult(
             content=content,
-            usage={"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+            usage={
+                "prompt_tokens": tokens_in,
+                "completion_tokens": tokens_out,
+                "total_tokens": tokens_in + tokens_out,
+            },
             finish_reason="stop",
-            estimated=False,
+            estimated=True,
         )
 
     async def list_models(self) -> list[dict[str, Any]]:
@@ -669,8 +690,8 @@ class BenchRunner:
             success=bool(result.accepted),
             cache_hit=bool(result.cache_hit),
             llm_calls=llm_calls,
-            tokens_in=100 * llm_calls,
-            tokens_out=50 * llm_calls,
+            tokens_in=provider.usage_in,
+            tokens_out=provider.usage_out,
             latency_s=latency,
             applied_files=list(result.changed_files),
             diff_substring_found=diff_substring_found,
