@@ -128,6 +128,10 @@ _REACT_PROMPT = (
     '- "grep"      — поиск по репозиторию; action_input — регулярное выражение.\n'
     '- "read_structure" — скелет файла; action_input — относительный путь.\n'
     '- "run_tests" — запустить pytest; action_input — аргументы (или пустая строка).\n'
+    '- "write_file" — записать файл. action_input = JSON-строка вида\n'
+    '  \'{"path":"index.html","content":"<!DOCTYPE html>..."}\'.\n'
+    '  ЭТО ЕДИНСТВЕННЫЙ правильный способ создать файл: тело экранируется ОДИН раз.\n'
+    '  Не вкладывай содержимое файла в план finish — там оно экранируется трижды и ломается.\n'
     '- "finish"    — завершить, подготовить план редактирования.\n'
     '  Для finish: action_input = JSON-строка вида\n'
     '  \'[{"tool":"edit_function","args":{"name":"<symbol>"}}]\'.\n'
@@ -352,6 +356,61 @@ class RunTestsTool:
         return exec.raw_output or "(no output)"
 
 
+class WriteFileTool:
+    """Write a file into the worktree.
+
+    **Why this tool exists.**  Without it the only way to produce a file was to
+    put its whole body inside a plan step inside the ``finish`` payload — a JSON
+    string inside a JSON string inside a JSON string.  A live run asking for a
+    cyberpunk page produced 1.4 KB of HTML that had to survive three levels of
+    escaping; it did not, the payload failed to parse four times in a row, the
+    episode hit ``max_steps`` with an empty plan, and the run fell back to a
+    one-shot linear answer.  The model was not wrong — the protocol was.
+
+    With this tool the body is escaped exactly once, and the harness does the
+    writing.  ``action_input`` is ``{"path": "...", "content": "..."}``; a bare
+    string is accepted as the content with a path the model must supply, which
+    is reported as an error rather than guessed.
+    """
+
+    name = "write_file"
+
+    async def run(self, action_input: str, *, ctx: ReActContext) -> str:
+        try:
+            data = json.loads(action_input)
+        except json.JSONDecodeError:
+            try:
+                data = json.loads(json_repair(action_input))
+            except json.JSONDecodeError:
+                return (
+                    "ERROR: write_file needs JSON {\"path\": \"...\", \"content\": \"...\"}. "
+                    "Escape the content once, as a normal JSON string."
+                )
+        if not isinstance(data, dict):
+            return "ERROR: write_file needs a JSON object with 'path' and 'content'"
+        rel = str(data.get("path") or data.get("file") or data.get("location") or "").strip()
+        if not rel:
+            return "ERROR: write_file needs a 'path'"
+        content = data.get("content")
+        if content is None:
+            return "ERROR: write_file needs 'content'"
+        if not isinstance(content, str):
+            content = json.dumps(content, ensure_ascii=False, indent=2)
+        target = (ctx.worktree / rel).resolve()
+        root = ctx.worktree.resolve()
+        # A path that escapes the worktree is a bug or an attack, never a task.
+        if root not in target.parents and target != root:
+            return f"ERROR: refusing to write outside the worktree: {rel}"
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            existed = target.exists()
+            target.write_text(content, encoding="utf-8")
+        except OSError as exc:
+            return f"ERROR: write_file failed: {exc}"
+        verb = "updated" if existed else "created"
+        return f"{verb} {rel} ({len(content)} bytes, {content.count(chr(10)) + 1} lines)"
+
+
 class FinishTool:
     """Sentinel 'finish' tool — never actually called; the runner intercepts
     ``action == "finish"`` before invoking the registry."""
@@ -390,6 +449,9 @@ class ToolRegistry:
         self.register(GrepTool())
         self.register(ReadStructureTool())
         self.register(RunTestsTool())
+        # Writing is a first-class harness operation, not something the model
+        # smuggles through a plan payload.  See WriteFileTool's docstring.
+        self.register(WriteFileTool())
         # The REPL is the harness's own execution surface: it reuses the
         # sandbox executor (allowlist, worktree cwd, timeout) and the Firewall,
         # so a probe costs one bounded observation instead of a new dependency.
