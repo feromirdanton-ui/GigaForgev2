@@ -183,6 +183,17 @@ def from_sdk_completion(completion: Any) -> ChatResult:
                     "arguments": dict(getattr(raw_call, "arguments", None) or {}),
                 }
         finish_reason = getattr(choice, "finish_reason", None)
+    # A structured-output answer arrives as ``function_call.arguments`` with an
+    # empty ``content``.  Every consumer in the harness reads ``result.content``
+    # and parses it as JSON, so leaving it empty made a perfectly good answer
+    # look like a failed generation.  Serialise the arguments back into
+    # ``content`` \u2014 the shape the caller already knows how to parse \u2014 and keep
+    # ``function_call`` for callers that want the structured form.
+    if function_call and not content:
+        try:
+            content = json.dumps(function_call.get("arguments") or {}, ensure_ascii=False)
+        except (TypeError, ValueError):  # pragma: no cover - arguments are JSON already
+            content = ""
     return ChatResult(
         content=content,
         function_call=function_call,
@@ -369,10 +380,23 @@ class GigaChatSDKProvider:
         }
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
-        # Native structured output: ``Chat.response_format`` is a real SDK field
-        # (verified against gigachat 0.3.0a1), so the provider validates the
-        # answer against the schema instead of the harness repairing almost-JSON.
+        # Structured output.  ``Chat.response_format`` is a real SDK field, but
+        # the live API (measured 2026-11-20) accepts it and then IGNORES it: a
+        # strict JSON Schema still came back as a fenced ```json block, and once
+        # as free-form prose.  The mechanism the server actually enforces is
+        # ``functions`` + ``function_call``: it validates the schema (422 with a
+        # precise field path when it cannot) and returns the answer in
+        # ``message.function_call.arguments`` with an EMPTY ``content``.
+        #
+        # So a schema is sent as a function.  ``response_format`` is still
+        # included for forward compatibility \u2014 if the server starts honouring
+        # it, nothing here breaks.
         if response_format:
+            from gigaforge.agents.schemas import to_function_spec
+
+            spec, call = to_function_spec(response_format)
+            kwargs["functions"] = [Function(**spec)]
+            kwargs["function_call"] = call
             kwargs["response_format"] = response_format
         if functions:
             allowed = set(Function.model_fields)

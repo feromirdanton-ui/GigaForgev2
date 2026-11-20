@@ -34,7 +34,64 @@ __all__ = [
     "plan_response_format",
     "review_response_format",
     "react_step_response_format",
+    "normalize_schema",
+    "to_function_spec",
 ]
+
+
+def normalize_schema(schema: Any) -> Any:
+    """Make *schema* acceptable to GigaChat's function validator.
+
+    Measured against the live API (2026-11-20): a bare ``{"type": "object"}``
+    is rejected with
+
+        422 Field 'properties.steps.items.properties.args.properties' is missing
+
+    The server requires every object node to carry a ``properties`` key, even
+    when it is empty.  JSON Schema itself allows omitting it, so this is a
+    GigaChat-specific quirk that has to be normalised before sending \u2014
+    otherwise the whole structured-output path fails with a 422 that looks
+    like a schema bug in our code.
+    """
+    if isinstance(schema, Mapping):
+        out: dict[str, Any] = {}
+        for key, value in schema.items():
+            out[key] = normalize_schema(value)
+        if out.get("type") == "object" and "properties" not in out:
+            out["properties"] = {}
+        return out
+    if isinstance(schema, list):
+        return [normalize_schema(item) for item in schema]
+    return schema
+
+
+def to_function_spec(
+    response_format: Mapping[str, Any],
+    *,
+    name: str = "structured_output",
+    description: str = "Return the answer as a single JSON object.",
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Translate a ``response_format`` envelope into GigaChat's function pair.
+
+    **Why this exists.**  The live API accepts ``response_format`` and then
+    ignores it: a request carrying a strict JSON Schema still came back as a
+    fenced ```` ```json ```` block, and once as free-form prose.  The one
+    mechanism the server actually enforces is ``functions`` +
+    ``function_call`` \u2014 it validates the schema (returning a precise 422 when
+    it cannot) and returns the answer in ``message.function_call.arguments``
+    with an **empty** ``content``.
+
+    So a caller that wants real structured output has to send the schema as a
+    function.  Returns ``(function_spec, function_call)`` ready to drop into
+    the request payload.
+    """
+    schema = response_format.get("schema") or response_format.get("schema_") or {}
+    spec = {
+        "name": name,
+        "description": description,
+        "parameters": normalize_schema(dict(schema)),
+    }
+    return spec, {"name": name}
 
 
 def json_schema_format(schema: Mapping[str, Any], *, name: str, strict: bool = True) -> dict[str, Any]:

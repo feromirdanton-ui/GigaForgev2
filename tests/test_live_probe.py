@@ -13,6 +13,12 @@ from typing import Any
 import pytest
 
 
+class _NoKey:
+    """A settings object with no credential, whatever the real ``.env`` says."""
+
+    auth_key = ""
+
+
 def test_probe_reports_no_credentials_instead_of_failing(monkeypatch: Any) -> None:
     """Without a key the probe must say so, not raise and not fake a pass."""
     from gigaforge.harness.live_probe import run_probes
@@ -20,7 +26,10 @@ def test_probe_reports_no_credentials_instead_of_failing(monkeypatch: Any) -> No
     for name in ("GIGACHAT_CREDENTIALS", "GIGACHAT_AUTH_KEY", "GF_CLIENT__AUTH_KEY"):
         monkeypatch.delenv(name, raising=False)
 
-    report = asyncio.run(run_probes())
+    # ``settings`` is injected: ``get_settings()`` is lru_cached and reads
+    # ``.env``, so on a machine with a real key the fallback would report
+    # credentials and this test would fail for the wrong reason.
+    report = asyncio.run(run_probes(settings=_NoKey()))
     assert report.credentials_present is False
     assert report.probes == []
     assert report.ok is False, "an empty report is not a pass"
@@ -32,7 +41,7 @@ def test_probe_exit_code_is_two_without_credentials(monkeypatch: Any, tmp_path: 
     for name in ("GIGACHAT_CREDENTIALS", "GIGACHAT_AUTH_KEY", "GF_CLIENT__AUTH_KEY"):
         monkeypatch.delenv(name, raising=False)
 
-    code = main(["--out", str(tmp_path / "live.json")])
+    code = main(["--out", str(tmp_path / "live.json")], settings=_NoKey())
     assert code == 2
 
 
@@ -87,4 +96,4 @@ def test_credentials_present_detects_each_variable(monkeypatch: Any, name: str) 
     for other in ("GIGACHAT_CREDENTIALS", "GIGACHAT_AUTH_KEY", "GF_CLIENT__AUTH_KEY"):
         monkeypatch.delenv(other, raising=False)
     monkeypatch.setenv(name, "value")
-    assert _credentials_present() is True
+    assert _credentials_present(_NoKey()) is True

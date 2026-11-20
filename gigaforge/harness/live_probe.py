@@ -110,12 +110,21 @@ class LiveProbeReport:
         return target
 
 
-def _credentials_present() -> bool:
-    """True when the environment carries something the provider can use."""
+def _credentials_present(settings: Any = None) -> bool:
+    """True when the environment carries something the provider can use.
+
+    *settings* is injectable so a test can assert the no-credential path on a
+    machine whose ``.env`` is filled in.  Without it the check fell through to
+    ``get_settings()``, which is ``lru_cache``d and reads ``.env`` \u2014 so the
+    "no credentials" tests passed only on a bare checkout and failed the moment
+    a developer had a real key, which is exactly backwards.
+    """
     if os.environ.get("GIGACHAT_CREDENTIALS"):
         return True
     if os.environ.get("GIGACHAT_AUTH_KEY") or os.environ.get("GF_CLIENT__AUTH_KEY"):
         return True
+    if settings is not None:
+        return bool(getattr(settings, "auth_key", ""))
     try:
         from gigaforge.config import get_settings
 
@@ -285,20 +294,25 @@ async def _probe_rate_limit(provider: Any, report: LiveProbeReport) -> None:
     )
 
 
-async def run_probes(*, model: str = "") -> LiveProbeReport:
-    """Run every probe and return the report."""
+async def run_probes(*, model: str = "", settings: Any = None) -> LiveProbeReport:
+    """Run every probe and return the report.
+
+    *settings* is injectable for the same reason as in
+    :func:`_credentials_present`: a test must be able to exercise the
+    no-credential path on a machine that has a real ``.env``.
+    """
     report = LiveProbeReport(model=model)
-    report.credentials_present = _credentials_present()
+    report.credentials_present = _credentials_present(settings)
     if not report.credentials_present:
         return report
 
-    from gigaforge.client.giga_client import GigaClient
-    from gigaforge.runtime import build_provider
+    from gigaforge.runtime import build_client
 
-    # ``build_provider`` takes the client it should wrap: the registry caches
-    # instances, so a provider built around a stale client fails every call
-    # with "the client has been closed".
-    provider = build_provider(GigaClient())
+    # ``build_client`` is the only correct factory: ``GigaClient`` needs a
+    # token provider and a rate limiter, and the registry caches instances, so
+    # a provider built around a hand-made client fails every call with
+    # "the client has been closed".
+    _client, _raw, _tokens, provider = build_client()
     if not report.model:
         report.model = getattr(provider, "model", "") or "GigaChat"
 
@@ -309,13 +323,13 @@ async def run_probes(*, model: str = "") -> LiveProbeReport:
     return report
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, settings: Any = None) -> int:
     parser = argparse.ArgumentParser(description="Live GigaChat API probe")
     parser.add_argument("--out", default="reports/live_probe.json")
     parser.add_argument("--model", default="")
     args = parser.parse_args(argv)
 
-    report = asyncio.run(run_probes(model=args.model))
+    report = asyncio.run(run_probes(model=args.model, settings=settings))
     path = report.write(args.out)
     print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
     print(f"\nreport written to {path}", file=sys.stderr)

@@ -88,6 +88,19 @@ class Settings:
     auth_key: str = ""  # base64(client_id:client_secret) — SECRET, never log
 
     @property
+    def default_model(self) -> str:
+        """The model a transport uses when the caller names none.
+
+        ``_build_sdk_provider`` read ``settings.default_model`` and the field
+        never existed, so every attempt to construct the official-SDK provider
+        raised ``AttributeError``, was swallowed by the ``except`` there, and
+        the process silently fell back to the legacy transport.  The whole SDK
+        path was therefore dead code in production while its unit tests passed
+        (they built the provider directly, never through the runtime).
+        """
+        return self.models.get("code") or self.models.get("explain") or "GigaChat-2-Pro"
+
+    @property
     def verify(self) -> bool | str:
         """Value to pass to httpx `verify`."""
         if self.ca_cert:
