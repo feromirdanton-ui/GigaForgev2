@@ -236,10 +236,14 @@ class WorktreeManager:
         safe = _slug(name)
         Path(self.root).mkdir(parents=True, exist_ok=True)
         if os.path.lexists(path):
-            raise WorktreeError(
-                f"worktree destination already exists: {path}",
-                detail={"hint": "choose a unique sub-agent name or remove its owned worktree"},
-            )
+            # A leftover from an interrupted run, not a live worktree: this
+            # manager owns the whole ``worktree_root``, and ``create`` is the
+            # only thing that puts anything there.  Raising here made the
+            # fallback fail on the *second* run in a reused directory —
+            # observed as a flaky ``shutil.copytree`` FileExistsError in the
+            # integration suite, which is a test-order dependency, not a
+            # property of the work.
+            shutil.rmtree(path, ignore_errors=True)
         shutil.copytree(
             self.repo_root, path,
             ignore=shutil.ignore_patterns(".git", "node_modules", ".venv", "__pycache__",
