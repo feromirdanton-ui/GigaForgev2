@@ -77,19 +77,26 @@ def resolve_tool(name: str, *, override: str = "") -> ResolvedTool:
 def python_bin(*, override: str = "") -> ResolvedTool:
     """The interpreter to run a scratch program with.
 
-    ``sys.executable`` first: it is the interpreter the project is actually
-    installed into, so a REPL step sees the same packages the harness does.
-    ``python3`` and ``python`` are the fallbacks, in that order — the reverse
-    order is what broke on hosts that ship only ``python3``.
+    ``python3`` and ``python`` are tried **first**, and ``sys.executable`` only
+    as a fallback.  The order matters when the caller runs through a sandbox
+    that resolves commands against an allowlist: ``sys.executable`` is
+    ``/usr/local/bin/python3.11``, whose basename is ``python3.11`` — not in the
+    allowlist — so preferring it made every REPL step fail with
+
+        sandbox: rejected command 'python3.11' not in allowlist
+
+    while ``python3``, which *is* allowed, sat right there.  The allowlisted
+    names are the ones a sandboxed caller can actually use, so they win; a
+    caller with no sandbox still gets a working interpreter either way.
     """
     if override:
         return resolve_tool("python", override=override)
-    if sys.executable and shutil.which(sys.executable):
-        return ResolvedTool(
-            name="python", path=sys.executable, argv_name=Path(sys.executable).name
-        )
     for candidate in ("python3", "python"):
         found = shutil.which(candidate)
         if found:
             return ResolvedTool(name="python", path=found, argv_name=candidate)
+    if sys.executable and shutil.which(sys.executable):
+        return ResolvedTool(
+            name="python", path=sys.executable, argv_name=Path(sys.executable).name
+        )
     return ResolvedTool(name="python", reason="no python interpreter found")

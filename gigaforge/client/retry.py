@@ -54,6 +54,9 @@ class RetryPolicy:
     jitter_ratio: float = 0.5
     max_retry_after: float = 30.0
     respect_retry_after: bool = True
+    #: Floor for any retry delay.  A retry is never instantaneous: a zero delay
+    #: is a busy loop against a provider that has just asked us to slow down.
+    min_delay: float = 0.5
 
     @classmethod
     def from_config(cls, config) -> "RetryPolicy":
@@ -81,17 +84,35 @@ class RetryPolicy:
         A provider ``Retry-After`` is a floor *and* a ceiling for us: waiting less
         would just be throttled again, waiting more is pointless. Our own backoff is
         jittered so a fleet of clients does not resynchronise after an outage.
+
+        A **non-positive** ``Retry-After`` is treated as no hint at all.  Measured
+        live: GigaChat answers 429 with ``Retry-After: 0``, and honouring it
+        literally made every retry instantaneous —
+
+            provider call failed (GF-RATE-429, attempt 1/4); retrying in 0.00s
+            provider call failed (GF-RATE-429, attempt 2/4); retrying in 0.00s
+            provider call failed (GF-RATE-429, attempt 3/4); retrying in 0.00s
+            provider call failed (GF-RATE-429, attempt 4/4); retrying in 0.00s
+
+        — so the whole retry budget was spent inside the same throttled instant
+        and the run failed on a limit that a one-second wait would have cleared.
+        A server saying "retry now" while refusing the request is not giving a
+        hint; it is declining to give one.
         """
         server_hint: Optional[float] = None
         if self.respect_retry_after and retry_after is not None:
-            server_hint = max(0.0, min(float(retry_after), self.max_retry_after))
+            hint = float(retry_after)
+            if hint > 0:
+                server_hint = min(hint, self.max_retry_after)
         if server_hint is not None:
             return server_hint
         delay = self.backoff(attempt)
         if self.jitter and delay > 0:
             spread = delay * max(0.0, min(1.0, self.jitter_ratio))
             delay = delay - spread + (rng() * spread)
-        return max(0.0, min(delay, self.cap))
+        # A retry is never instantaneous: a zero delay is a busy loop against a
+        # provider that has just told us to slow down.
+        return max(self.min_delay, min(delay, self.cap))
 
 
 def retry_call(
