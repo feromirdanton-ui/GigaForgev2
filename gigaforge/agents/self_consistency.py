@@ -349,17 +349,23 @@ class SelfConsistencyCoder:
         # Pre-budget check (same discipline as the Coder).
         est_in = sum(len(str(m.get("content", ""))) for m in messages) // 4
         est_out = min(max_tokens, max(max_tokens // 2, 400))
-        self._budgets.check("code", est_in, est_out, task_id=task_id)
+        # Self-consistency samples the SAME prompt N times concurrently: this is
+        # exactly the shape check-then-commit cannot police.
+        claim = self._budgets.reserve("code", est_in, est_out, task_id=task_id)
 
         started = time.monotonic()
-        chat_result: ChatResult = await self._client.chat(
-            model,
-            messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            task_id=task_id,
-            phase="code",
-        )
+        try:
+            chat_result: ChatResult = await self._client.chat(
+                model,
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                task_id=task_id,
+                phase="code",
+            )
+        except BaseException:
+            claim.cancel()
+            raise
         latency_ms = int((time.monotonic() - started) * 1000)
         text = chat_result.content or ""
         usage = chat_result.usage or {}
@@ -367,7 +373,7 @@ class SelfConsistencyCoder:
         tokens_out = int(usage.get("completion_tokens", 0) or 0)
 
         try:
-            self._budgets.commit_task(task_id, "code", tokens_in, tokens_out)
+            claim.settle(tokens_in, tokens_out)
             self._budgets.check_overshoot("code", task_id=task_id)
         except BudgetExceeded:
             raise

@@ -171,17 +171,28 @@ class CoderAgent:
             # reserving the full max_tokens ceiling on every retry would
             # prematurely exhaust the phase budget.
             est_out = min(max_tokens, max(max_tokens // 2, 400))
-            self._budgets.check("code", est_in, est_out, task_id=task_id)
+            # Atomic claim, not check-then-commit.  ``check`` validates and
+            # ``commit`` records under two separate lock acquisitions, so two
+            # concurrent coders (a sub-agent fan-out) both see the same
+            # remaining balance and both are told there is room.  ``reserve``
+            # records the claim under the same lock that validates it.
+            claim = self._budgets.reserve("code", est_in, est_out, task_id=task_id)
 
             started = time.monotonic()
-            result: ChatResult = await self._client.chat(
-                model,
-                round_messages,
-                temperature=0.2,
-                max_tokens=max_tokens,
-                task_id=task_id,
-                phase="code",
-            )
+            try:
+                result: ChatResult = await self._client.chat(
+                    model,
+                    round_messages,
+                    temperature=0.2,
+                    max_tokens=max_tokens,
+                    task_id=task_id,
+                    phase="code",
+                )
+            except BaseException:
+                # The call never completed: give the claim back so it does not
+                # starve the next attempt.
+                claim.cancel()
+                raise
             latency_ms = int((time.monotonic() - started) * 1000)
 
             text = result.content or ""
@@ -190,7 +201,7 @@ class CoderAgent:
             tokens_out = int(usage.get("completion_tokens", 0) or 0)
 
             try:
-                self._budgets.commit_task(task_id, "code", tokens_in, tokens_out)
+                claim.settle(tokens_in, tokens_out)
                 # HIGH-07: post-commit soft-overshoot guard.
                 self._budgets.check_overshoot("code", task_id=task_id)
             except BudgetExceeded:

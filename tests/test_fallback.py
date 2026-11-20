@@ -141,6 +141,11 @@ def test_the_react_loop_stops_asking_after_three_parse_failures() -> None:
         def check_overshoot(self, *a, **k):
             return None
 
+        def reserve(self, *a, **k):
+            from tests.budget_stubs import NullClaim
+
+            return NullClaim()
+
     class _Router:
         def route(self, phase):
             return "GigaChat-2-Lite"

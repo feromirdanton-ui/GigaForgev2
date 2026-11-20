@@ -257,6 +257,11 @@ def test_react_runner_uses_the_guards(tmp_path: Path) -> None:
         def check(self, *a: Any, **k: Any) -> None:
             return None
 
+        def reserve(self, *a: Any, **k: Any) -> Any:
+            from tests.budget_stubs import NullClaim
+
+            return NullClaim()
+
     class _Tracer:
         def trace(self, *a: Any, **k: Any) -> None:
             return None

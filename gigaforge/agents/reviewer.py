@@ -124,18 +124,22 @@ class ReviewerAgent:
             # Estimate realistically (a verdict JSON is small); reserving the
             # full max_tokens ceiling on every retry prematurely exhausts budget.
             est_out = min(max_tokens, max(max_tokens // 3, 200))
-            self._budgets.check("review", est_in, est_out, task_id=task_id)
+            claim = self._budgets.reserve("review", est_in, est_out, task_id=task_id)
 
             started = time.monotonic()
-            result = await self._client.chat(
-                model,
-                round_messages,
-                temperature=0.1,
-                max_tokens=max_tokens,
-                task_id=task_id,
-                phase="review",
-                response_format=review_response_format(),
-            )
+            try:
+                result = await self._client.chat(
+                    model,
+                    round_messages,
+                    temperature=0.1,
+                    max_tokens=max_tokens,
+                    task_id=task_id,
+                    phase="review",
+                    response_format=review_response_format(),
+                )
+            except BaseException:
+                claim.cancel()
+                raise
             latency_ms = int((time.monotonic() - started) * 1000)
 
             text = result.content or ""
@@ -144,7 +148,7 @@ class ReviewerAgent:
             tokens_out = int(usage.get("completion_tokens", 0) or 0)
 
             try:
-                self._budgets.commit_task(task_id, "review", tokens_in, tokens_out)
+                claim.settle(tokens_in, tokens_out)
                 # HIGH-07: post-commit soft-overshoot guard.
                 self._budgets.check_overshoot("review", task_id=task_id)
             except BudgetExceeded:

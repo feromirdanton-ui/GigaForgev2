@@ -568,17 +568,23 @@ class ConstitutionalReviewer:
                 len(str(m.get("content", ""))) for m in round_messages
             ) // 4
             est_out = min(max_tokens, max(max_tokens // 3, 200))
-            self._budgets.check("review", est_in, est_out, task_id=task_id)
+            # Atomic claim (see BudgetTracker.reserve): check-then-commit let
+            # concurrent reviewers pass the same remaining balance.
+            claim = self._budgets.reserve("review", est_in, est_out, task_id=task_id)
 
             started = time.monotonic()
-            chat_result: ChatResult = await self._client.chat(
-                model,
-                round_messages,
-                temperature=0.1,
-                max_tokens=max_tokens,
-                task_id=task_id,
-                phase="review",
-            )
+            try:
+                chat_result: ChatResult = await self._client.chat(
+                    model,
+                    round_messages,
+                    temperature=0.1,
+                    max_tokens=max_tokens,
+                    task_id=task_id,
+                    phase="review",
+                )
+            except BaseException:
+                claim.cancel()
+                raise
             latency_ms = int((time.monotonic() - started) * 1000)
             text = chat_result.content or ""
             usage = chat_result.usage or {}
@@ -586,7 +592,7 @@ class ConstitutionalReviewer:
             tokens_out = int(usage.get("completion_tokens", 0) or 0)
 
             try:
-                self._budgets.commit_task(task_id, "review", tokens_in, tokens_out)
+                claim.settle(tokens_in, tokens_out)
                 self._budgets.check_overshoot("review", task_id=task_id)
             except BudgetExceeded:
                 raise

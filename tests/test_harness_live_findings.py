@@ -156,7 +156,19 @@ def test_budget_exhaustion_salvages_the_plan_before_raising() -> None:
 
     class _Budgets:
         def check(self, *a: object, **k: object) -> None:
-            """The pre-call check passes; the post-call commit is what fails."""
+            """The pre-call claim passes; settling it is what fails."""
+
+        def reserve(self, *a: object, **k: object) -> object:
+            from gigaforge.client.errors import BudgetExceeded
+
+            class _Claim:
+                def settle(self, *a: object, **k: object) -> None:
+                    raise BudgetExceeded("out of tokens")
+
+                def cancel(self) -> None:
+                    pass
+
+            return _Claim()
 
         def commit_task(self, *a: object, **k: object) -> None:
             raise BudgetExceeded("out of tokens")

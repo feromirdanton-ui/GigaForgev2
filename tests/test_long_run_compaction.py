@@ -48,6 +48,11 @@ class _Budgets:
     def check_overshoot(self, *a, **k):
         return None
 
+    def reserve(self, *a, **k):
+        from tests.budget_stubs import NullClaim
+
+        return NullClaim()
+
 
 class _Router:
     def route(self, phase):

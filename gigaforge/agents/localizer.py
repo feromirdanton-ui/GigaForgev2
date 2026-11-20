@@ -387,17 +387,21 @@ class LocalizerAgent:
         # Budget estimate: prompt + a small completion.
         est_in = sum(len(str(m.get("content", ""))) for m in messages) // 4
         est_out = min(max_tokens, max(max_tokens // 3, 200))
-        self._budgets.check("classify", est_in, est_out, task_id=state.task_id)
+        claim = self._budgets.reserve("classify", est_in, est_out, task_id=state.task_id)
 
         started = time.monotonic()
-        result: ChatResult = await self._client.chat(
-            model,
-            messages,
-            temperature=0.0,  # L1, deterministic
-            max_tokens=max_tokens,
-            task_id=state.task_id,
-            phase="classify",
-        )
+        try:
+            result: ChatResult = await self._client.chat(
+                model,
+                messages,
+                temperature=0.0,  # L1, deterministic
+                max_tokens=max_tokens,
+                task_id=state.task_id,
+                phase="classify",
+            )
+        except BaseException:
+            claim.cancel()
+            raise
         latency_ms = int((time.monotonic() - started) * 1000)
         text = result.content or ""
         usage = result.usage or {}
@@ -405,7 +409,7 @@ class LocalizerAgent:
         tokens_out = int(usage.get("completion_tokens", 0) or 0)
 
         try:
-            self._budgets.commit_task(state.task_id, "classify", tokens_in, tokens_out)
+            claim.settle(tokens_in, tokens_out)
             self._budgets.check_overshoot("classify", task_id=state.task_id)
         except BudgetExceeded:
             raise

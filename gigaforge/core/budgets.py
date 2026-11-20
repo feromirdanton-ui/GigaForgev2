@@ -19,12 +19,13 @@ to open the circuit breaker. We just count.
 from __future__ import annotations
 
 import threading
+from dataclasses import dataclass, field
 from typing import Any
 
 from gigaforge.client.errors import BudgetExceeded
 from gigaforge.config import Settings, get_settings
 
-__all__ = ["BudgetTracker", "PHASE_CAP_ATTRS"]
+__all__ = ["BudgetTracker", "PHASE_CAP_ATTRS", "Reservation"]
 
 
 # Map of phase -> (settings_in_attr, settings_out_attr) used to resolve caps.
@@ -55,6 +56,12 @@ class BudgetTracker:
         self._task_used: dict[str, dict[str, int]] = {}
         # task_id -> fix-loop iteration count
         self._fixloop_count: dict[str, int] = {}
+        # Outstanding reservations, keyed by reservation id.  A reservation is
+        # budget that has been *promised* to an in-flight call but not yet
+        # spent; it counts against the cap exactly like committed usage, so two
+        # concurrent callers cannot both be told "there is room".
+        self._reserved: dict[int, dict[str, Any]] = {}
+        self._reservation_seq = 0
 
     # --- internal helpers ------------------------------------------------
 
@@ -81,6 +88,116 @@ class BudgetTracker:
         return d
 
     # --- public API ------------------------------------------------------
+
+    def reserve(
+        self,
+        phase: str,
+        tokens_in: int,
+        tokens_out: int,
+        *,
+        task_id: str = "",
+    ) -> "Reservation":
+        """Atomically claim budget for one in-flight call.
+
+        **Why this exists.**  :meth:`check` validates and :meth:`commit` records,
+        and they take the lock separately.  That is correct for a retry (an
+        estimate must not inflate the budget) and wrong for concurrency: with
+        four section children in a ``ThreadPoolExecutor``, all four call
+        ``check`` against the same remaining balance, all four are told there is
+        room, and the phase overshoots by up to 4x.  Measured on the sectional
+        path: ``budget_react_in`` was configured for 4 sections and the run
+        spent 3.7x it.
+
+        ``reserve`` closes the window: the claim is recorded under the same lock
+        that validates it, and outstanding claims count against the cap exactly
+        like committed usage.  The caller then either :meth:`release`\\ s the
+        claim with the actual usage (normal path) or releases it with zeros (the
+        call failed before spending anything).
+
+        Returns a :class:`Reservation`; use it as a context manager and call
+        ``settle()`` with the real numbers, or let it release itself on exit.
+        """
+        tokens_in = max(0, int(tokens_in))
+        tokens_out = max(0, int(tokens_out))
+        cap_in, cap_out = self._caps_for(phase)
+        with self._lock:
+            ph = self._phase_used_in(phase)
+            res_in, res_out = self._reserved_totals(phase)
+            new_ph_in = ph["in"] + res_in + tokens_in
+            new_ph_out = ph["out"] + res_out + tokens_out
+            if new_ph_in > cap_in:
+                raise BudgetExceeded(
+                    f"phase {phase!r} input budget exceeded: "
+                    f"{ph['in']} used + {res_in} reserved + {tokens_in} > {cap_in}"
+                )
+            if new_ph_out > cap_out:
+                raise BudgetExceeded(
+                    f"phase {phase!r} output budget exceeded: "
+                    f"{ph['out']} used + {res_out} reserved + {tokens_out} > {cap_out}"
+                )
+            tg = self._task_used_in(task_id)
+            task_reserved = self._reserved_totals_for_task(task_id)
+            task_used = tg["in"] + tg["out"] + task_reserved
+            if task_used + tokens_in + tokens_out > int(self._s.budget_task_cap):
+                raise BudgetExceeded(
+                    f"per-task cap exceeded for task {task_id!r}: "
+                    f"{task_used} + {tokens_in + tokens_out} > {self._s.budget_task_cap}"
+                )
+            self._reservation_seq += 1
+            res_id = self._reservation_seq
+            self._reserved[res_id] = {
+                "phase": phase,
+                "task_id": task_id,
+                "in": tokens_in,
+                "out": tokens_out,
+            }
+        return Reservation(self, res_id, phase, task_id, tokens_in, tokens_out)
+
+    def release(
+        self,
+        reservation: "Reservation | int",
+        *,
+        tokens_in: int | None = None,
+        tokens_out: int | None = None,
+    ) -> None:
+        """Drop a reservation and record the ACTUAL usage in one atomic step.
+
+        ``tokens_in``/``tokens_out`` default to the reserved amounts (the call
+        spent what it claimed).  Pass ``0, 0`` when the call failed before
+        spending anything, so the claim does not leak and starve later calls.
+        """
+        res_id = reservation.id if isinstance(reservation, Reservation) else int(reservation)
+        with self._lock:
+            claim = self._reserved.pop(res_id, None)
+            if claim is None:
+                # Already released (a double release is a bug in the caller, not
+                # a reason to corrupt the accounting): ignore it.
+                return
+            actual_in = claim["in"] if tokens_in is None else max(0, int(tokens_in))
+            actual_out = claim["out"] if tokens_out is None else max(0, int(tokens_out))
+            ph = self._phase_used_in(claim["phase"])
+            ph["in"] += actual_in
+            ph["out"] += actual_out
+            tg = self._task_used_in(claim["task_id"])
+            tg["in"] += actual_in
+            tg["out"] += actual_out
+
+    def _reserved_totals(self, phase: str) -> tuple[int, int]:
+        """Outstanding reserved (in, out) for *phase*.  Caller holds the lock."""
+        total_in = total_out = 0
+        for claim in self._reserved.values():
+            if claim["phase"] == phase:
+                total_in += claim["in"]
+                total_out += claim["out"]
+        return total_in, total_out
+
+    def _reserved_totals_for_task(self, task_id: str) -> int:
+        """Outstanding reserved tokens (in+out) for *task_id*.  Caller holds the lock."""
+        return sum(
+            claim["in"] + claim["out"]
+            for claim in self._reserved.values()
+            if claim["task_id"] == task_id
+        )
 
     def check(
         self,
@@ -252,6 +369,7 @@ class BudgetTracker:
             return {
                 "phase_used": {k: dict(v) for k, v in self._phase_used.items()},
                 "task_used": {k: dict(v) for k, v in self._task_used.items()},
+                "reserved": {k: dict(v) for k, v in self._reserved.items()},
                 "fixloop": dict(self._fixloop_count),
                 "caps": {
                     phase: {
@@ -263,3 +381,52 @@ class BudgetTracker:
                 "task_cap": int(self._s.budget_task_cap),
                 "fixloop_iters_cap": int(self._s.budget_fixloop_iters),
             }
+
+
+@dataclass
+class Reservation:
+    """A claim on budget held for one in-flight call.
+
+    Created by :meth:`BudgetTracker.reserve`.  It is a context manager so the
+    common shape is one line::
+
+        with budgets.reserve("code", est_in, est_out, task_id=tid) as claim:
+            result = client.chat(...)
+            claim.settle(actual_in, actual_out)
+
+    Leaving the block without calling :meth:`settle` releases the claim with
+    **zero** usage \u2014 the call did not report what it spent, and inventing a
+    number would be worse than recording none.  A claim that is never released
+    would starve later calls, so the context manager guarantees it is dropped.
+    """
+
+    tracker: "BudgetTracker"
+    id: int
+    phase: str
+    task_id: str
+    tokens_in: int
+    tokens_out: int
+    _settled: bool = field(default=False, repr=False)
+
+    def settle(self, tokens_in: int | None = None, tokens_out: int | None = None) -> None:
+        """Record actual usage and drop the claim (idempotent)."""
+        if self._settled:
+            return
+        self._settled = True
+        self.tracker.release(self, tokens_in=tokens_in, tokens_out=tokens_out)
+
+    def cancel(self) -> None:
+        """Drop the claim without recording usage (the call spent nothing)."""
+        if self._settled:
+            return
+        self._settled = True
+        self.tracker.release(self, tokens_in=0, tokens_out=0)
+
+    def __enter__(self) -> "Reservation":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if not self._settled:
+            # An exception means the call did not complete: release the claim
+            # with no usage rather than leaving it outstanding.
+            self.cancel()

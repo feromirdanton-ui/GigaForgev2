@@ -75,6 +75,11 @@ def test_the_runner_passes_the_context_root_to_the_cache(tmp_path: Path) -> None
         def check_overshoot(self, *a, **k):
             return None
 
+        def reserve(self, *a, **k):
+            from tests.budget_stubs import NullClaim
+
+            return NullClaim()
+
     class _Router:
         def route(self, phase):
             return "m"
@@ -142,6 +147,11 @@ def test_a_cache_hit_does_not_repeat_the_observation_text(tmp_path: Path) -> Non
 
         def check_overshoot(self, *a, **k):
             return None
+
+        def reserve(self, *a, **k):
+            from tests.budget_stubs import NullClaim
+
+            return NullClaim()
 
     class _Router:
         def route(self, phase):

@@ -440,17 +440,21 @@ class ToTPlanner:
         # Estimate: a JSON plan is small; reserve a third of the cap.
         est_in = sum(len(str(m.get("content", ""))) for m in messages_template) // 4
         est_out = min(max_tokens, max(max_tokens // 3, 200))
-        self._budgets.check("plan", est_in, est_out, task_id=task_id)
+        claim = self._budgets.reserve("plan", est_in, est_out, task_id=task_id)
 
         started = time.monotonic()
-        result: ChatResult = await self._client.chat(
-            model,
-            messages_template,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            task_id=task_id,
-            phase="plan",
-        )
+        try:
+            result: ChatResult = await self._client.chat(
+                model,
+                messages_template,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                task_id=task_id,
+                phase="plan",
+            )
+        except BaseException:
+            claim.cancel()
+            raise
         latency_ms = int((time.monotonic() - started) * 1000)
 
         text = result.content or ""
@@ -459,7 +463,7 @@ class ToTPlanner:
         tokens_out = int(usage.get("completion_tokens", 0) or 0)
 
         try:
-            self._budgets.commit_task(task_id, "plan", tokens_in, tokens_out)
+            claim.settle(tokens_in, tokens_out)
             self._budgets.check_overshoot("plan", task_id=task_id)
         except BudgetExceeded:
             raise
@@ -542,27 +546,31 @@ class ToTPlanner:
         est_in = sum(len(str(m.get("content", ""))) for m in messages) // 4
         est_out = min(max_tokens, max(max_tokens // 3, 200))
         try:
-            self._budgets.check("plan", est_in, est_out, task_id=task_id)
+            claim = self._budgets.reserve("plan", est_in, est_out, task_id=task_id)
         except BudgetExceeded:
             # Can't afford the judge — fail-safe to deterministic winner.
             return {"winner": "best", "reason": "judge skipped: budget exceeded"}
 
         started = time.monotonic()
-        result = await self._client.chat(
-            model,
-            messages,
-            temperature=0.0,
-            max_tokens=max_tokens,
-            task_id=task_id,
-            phase="plan",
-        )
+        try:
+            result = await self._client.chat(
+                model,
+                messages,
+                temperature=0.0,
+                max_tokens=max_tokens,
+                task_id=task_id,
+                phase="plan",
+            )
+        except BaseException:
+            claim.cancel()
+            raise
         latency_ms = int((time.monotonic() - started) * 1000)
         text = result.content or ""
         usage = result.usage or {}
         tokens_in = int(usage.get("prompt_tokens", 0) or 0)
         tokens_out = int(usage.get("completion_tokens", 0) or 0)
         try:
-            self._budgets.commit_task(task_id, "plan", tokens_in, tokens_out)
+            claim.settle(tokens_in, tokens_out)
             self._budgets.check_overshoot("plan", task_id=task_id)
         except BudgetExceeded:
             raise

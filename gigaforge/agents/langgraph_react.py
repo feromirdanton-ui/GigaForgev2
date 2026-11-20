@@ -276,26 +276,29 @@ def build_react_graph(
 
         est_in = sum(len(m.get("content") or "") for m in trajectory) // 4
         est_out = max(int(settings.budget_plan_out) // 3, 200)
-        runner.budgets.check(_REACT_PHASE, est_in, est_out, task_id=task_state.task_id)
+        claim = runner.budgets.reserve(_REACT_PHASE, est_in, est_out,
+                                       task_id=task_state.task_id)
 
         started = time.monotonic()
-        chat_result = await runner.client.chat(
-            runner.router.route(_REACT_PHASE),
-            trajectory,
-            temperature=0.1,
-            max_tokens=int(settings.budget_plan_out),
-            task_id=task_state.task_id,
-            phase=_REACT_PHASE,
-        )
+        try:
+            chat_result = await runner.client.chat(
+                runner.router.route(_REACT_PHASE),
+                trajectory,
+                temperature=0.1,
+                max_tokens=int(settings.budget_plan_out),
+                task_id=task_state.task_id,
+                phase=_REACT_PHASE,
+            )
+        except BaseException:
+            claim.cancel()
+            raise
         latency_ms = int((time.monotonic() - started) * 1000)
         text = chat_result.content or ""
         usage = chat_result.usage or {}
         tokens_in = int(usage.get("prompt_tokens", 0) or 0)
         tokens_out = int(usage.get("completion_tokens", 0) or 0)
         try:
-            runner.budgets.commit_task(
-                task_state.task_id, _REACT_PHASE, tokens_in, tokens_out
-            )
+            claim.settle(tokens_in, tokens_out)
             runner.budgets.check_overshoot(_REACT_PHASE, task_id=task_state.task_id)
         except Exception:  # noqa: BLE001 - accounting is best effort here
             pass

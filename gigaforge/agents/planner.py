@@ -228,22 +228,27 @@ class PlannerAgent:
             ) // 4
             est_out = min(max_tokens, max(max_tokens // 3, 200))
             try:
-                self._budgets.check("plan", est_in, est_out, task_id=state.task_id)
+                claim = self._budgets.reserve("plan", est_in, est_out,
+                                              task_id=state.task_id)
             except BudgetExceeded as exc:
                 # Budget exhausted during planning -> graceful escalation,
                 # not a hard pipeline crash (spec: "затем эскалация").
                 raise PlanEscalation(f"plan budget exhausted: {exc}") from exc
 
             started = time.monotonic()
-            result = await self._client.chat(
-                model,
-                round_messages,
-                temperature=0.1,
-                max_tokens=max_tokens,
-                task_id=state.task_id,
-                phase="plan",
-                response_format=plan_response_format(),
-            )
+            try:
+                result = await self._client.chat(
+                    model,
+                    round_messages,
+                    temperature=0.1,
+                    max_tokens=max_tokens,
+                    task_id=state.task_id,
+                    phase="plan",
+                    response_format=plan_response_format(),
+                )
+            except BaseException:
+                claim.cancel()
+                raise
             latency_ms = int((time.monotonic() - started) * 1000)
 
             text = result.content or ""
@@ -254,7 +259,7 @@ class PlannerAgent:
             # Per-task accounting (best-effort; budgets.check already committed
             # to the global "" bucket per the BudgetTracker design).
             try:
-                self._budgets.commit_task(state.task_id, "plan", tokens_in, tokens_out)
+                claim.settle(tokens_in, tokens_out)
                 # HIGH-07: post-commit soft-overshoot guard. If actuals
                 # exceeded the phase cap (estimates too low), escalate now
                 # rather than letting the next check silently pass.

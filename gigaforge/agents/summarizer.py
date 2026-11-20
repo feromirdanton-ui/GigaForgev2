@@ -153,17 +153,21 @@ class SummarizerAgent:
 
             est_in = sum(len(str(m.get("content", ""))) for m in round_messages) // 4
             est_out = max(self._s.budget_plan_out // 2, 300)
-            self._budgets.check("summarize", est_in, est_out, task_id=task_id)
+            claim = self._budgets.reserve("summarize", est_in, est_out, task_id=task_id)
 
             started = time.monotonic()
-            chat_result: ChatResult = await self._client.chat(
-                self._router.route("summarize"),
-                round_messages,
-                temperature=0.1,
-                max_tokens=int(self._s.budget_plan_out),
-                task_id=task_id,
-                phase="summarize",
-            )
+            try:
+                chat_result: ChatResult = await self._client.chat(
+                    self._router.route("summarize"),
+                    round_messages,
+                    temperature=0.1,
+                    max_tokens=int(self._s.budget_plan_out),
+                    task_id=task_id,
+                    phase="summarize",
+                )
+            except BaseException:
+                claim.cancel()
+                raise
             latency_ms = int((time.monotonic() - started) * 1000)
             text = chat_result.content or ""
             usage = chat_result.usage or {}
@@ -171,7 +175,7 @@ class SummarizerAgent:
             tokens_out = int(usage.get("completion_tokens", 0) or 0)
 
             try:
-                self._budgets.commit_task(task_id, "summarize", tokens_in, tokens_out)
+                claim.settle(tokens_in, tokens_out)
                 self._budgets.check_overshoot("summarize", task_id=task_id)
             except BudgetExceeded:
                 raise  # STOP — propagate

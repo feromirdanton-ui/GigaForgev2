@@ -802,18 +802,26 @@ class ReActRunner:
             # Pre-budget check. Phase = "react" (its own cap, not the planner's).
             est_in = sum(len(m["content"]) for m in trajectory) // 4
             est_out = max(self._react_out() // 3, 200)
-            self._budgets.check(_REACT_PHASE, est_in, est_out, task_id=state.task_id)
+            # Atomic claim: the sectional path runs several episodes in a
+            # ThreadPoolExecutor, and check-then-commit let all of them pass the
+            # same remaining balance (measured: 3.7x the configured cap).
+            claim = self._budgets.reserve(_REACT_PHASE, est_in, est_out,
+                                          task_id=state.task_id)
 
             # Reason — one LLM call.
             started = time.monotonic()
-            chat_result: ChatResult = await self._client.chat(
-                self._router.route(_REACT_PHASE),
-                trajectory,
-                temperature=0.1,
-                max_tokens=self._react_out(),
-                task_id=state.task_id,
-                phase=_REACT_PHASE,
-            )
+            try:
+                chat_result: ChatResult = await self._client.chat(
+                    self._router.route(_REACT_PHASE),
+                    trajectory,
+                    temperature=0.1,
+                    max_tokens=self._react_out(),
+                    task_id=state.task_id,
+                    phase=_REACT_PHASE,
+                )
+            except BaseException:
+                claim.cancel()
+                raise
             latency_ms = int((time.monotonic() - started) * 1000)
             text = chat_result.content or ""
             usage = chat_result.usage or {}
@@ -821,7 +829,7 @@ class ReActRunner:
             tokens_out = int(usage.get("completion_tokens", 0) or 0)
 
             try:
-                self._budgets.commit_task(state.task_id, _REACT_PHASE, tokens_in, tokens_out)
+                claim.settle(tokens_in, tokens_out)
                 self._budgets.check_overshoot(_REACT_PHASE, task_id=state.task_id)
             except BudgetExceeded:
                 result.finish_reason = "budget_exceeded"
