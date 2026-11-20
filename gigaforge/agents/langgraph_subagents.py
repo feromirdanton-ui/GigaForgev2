@@ -216,7 +216,7 @@ def build_subagent_graph(
             result = runner.spawn_one(
                 _spec_from(flat), parent_ctx=parent_ctx, index=index
             )
-            entry = result.to_dict() if hasattr(result, "to_dict") else dict(result)
+            entry = _carry(result)
         else:
             result = await_blocking(runner.run_one(_spawn_from(flat), agent_factory))
             entry = dict(result)
@@ -241,6 +241,31 @@ def build_subagent_graph(
 
         checkpointer = InMemorySaver()
     return graph.compile(checkpointer=checkpointer)
+
+
+def _carry(result: Any) -> dict[str, Any]:
+    """Flatten a result for graph state **without dropping the diff**.
+
+    ``SubAgentResult.to_dict()`` is a telemetry view: it reports ``diff_chars``
+    and omits the diff itself, which is right for a ledger and wrong for a
+    graph whose whole job is to hand the diff to the merge.  Measured: the
+    fan-out ran, both children returned ``ok: True``, and the merge reported
+    "child produced no diff" for both — the diff had been dropped at the
+    serialisation boundary, and the run silently fell back to a single agent.
+
+    The graph carries the payload it is responsible for.  ``to_dict()`` is
+    still used for everything else, so the ledger stays small.
+    """
+    if isinstance(result, Mapping):
+        return dict(result)
+    data: dict[str, Any] = {}
+    for field in (
+        "name", "spawn_index", "ok", "diff", "summary", "usage", "worktree",
+        "branch", "validate", "error", "metrics",
+    ):
+        if hasattr(result, field):
+            data[field] = getattr(result, field)
+    return data
 
 
 def _to_result(entry: Mapping[str, Any], *, as_object: bool) -> Any:
