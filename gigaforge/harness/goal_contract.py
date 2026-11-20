@@ -124,6 +124,12 @@ class ContractVerdict:
     checked: list[str] = field(default_factory=list)
     unmet: list[str] = field(default_factory=list)
     files: list[str] = field(default_factory=list)
+    #: Requirements the artifact already satisfies.  Carried into the
+    #: correction step so a rewrite keeps them: measured live, the model
+    #: rewrote index.html to add `hero` and dropped `cyan`/`magenta`, then
+    #: rewrote again to add the colours and dropped `hero`, for the whole step
+    #: budget.  Telling the model only what is missing invites exactly that.
+    met: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -138,6 +144,15 @@ class ContractVerdict:
             "Fix these before finishing:",
         ]
         lines.extend(f"- {u}" for u in self.unmet)
+        if self.met:
+            lines.append("")
+            lines.append(
+                "These are ALREADY satisfied. Keep them — when you rewrite the "
+                "file, copy the current content and add what is missing instead "
+                "of starting a new page:"
+            )
+            lines.extend(f"- {m}" for m in self.met)
+        lines.append("")
         lines.append(
             "Use write_file to rewrite the file with the missing pieces, "
             "then finish."
@@ -215,6 +230,8 @@ def check_artifacts(
     text = "\n".join(p.read_text(encoding="utf-8", errors="replace") for p in targets)
     for req in requirements:
         verdict.checked.append(req.label)
-        if not req.satisfied_by(text):
+        if req.satisfied_by(text):
+            verdict.met.append(req.label)
+        else:
             verdict.unmet.append(req.label)
     return verdict
