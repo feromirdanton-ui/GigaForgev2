@@ -43,6 +43,7 @@ from gigaforge.client.errors import BudgetExceeded
 from gigaforge.client.giga_client import ChatResult, GigaClient
 from gigaforge.config import Settings, get_settings
 from gigaforge.core.budgets import BudgetTracker
+from gigaforge.core.context_window_guard import ContextOverflowError
 from gigaforge.core.router import ModelRouter
 from gigaforge.core.task_state import PlanStep, TaskState
 from gigaforge.core.trace import Tracer
@@ -304,6 +305,11 @@ class ReActRunner:
         # audit, think tool).  Built lazily so a caller that does not pass one
         # still gets the guards rather than silently running without them.
         self._guards = guards
+        #: ContextWindowGuard.  The LangGraph engine had one; the classic loop
+        #: — which is the *default* engine — did not, so the server token count
+        #: was unreachable in the configuration most deployments run.  Built
+        #: lazily so the guard can pick up the client's counter.
+        self._window_guard: Any = None
 
     @property
     def registry(self) -> ToolRegistry:
@@ -317,6 +323,28 @@ class ReActRunner:
 
             self._guards = ReActGuards(tool_names=self._registry.names())
         return self._guards
+
+    @property
+    def window_guard(self) -> Any:
+        """The context guard, wired to the client's server-side counter.
+
+        Both engines must behave identically: the LangGraph graph already
+        compacted before a request, the classic loop did not.  The counter is
+        cached per trajectory prefix (see :mod:`gigaforge.core.token_cache`),
+        because a ReAct trajectory grows monotonically and re-counting the same
+        prefix on every step doubles the number of HTTP round trips.
+        """
+        if self._window_guard is None:
+            from gigaforge.core.context_window_guard import ContextWindowGuard
+            from gigaforge.core.token_cache import CachedTokenCounter
+
+            counter = getattr(self._client, "count_tokens", None)
+            self._window_guard = ContextWindowGuard(
+                token_counter=(
+                    CachedTokenCounter(counter) if callable(counter) else None
+                )
+            )
+        return self._window_guard
 
     async def run(
         self,
@@ -347,6 +375,23 @@ class ReActRunner:
         trajectory.extend(self.guards.opening_messages(trajectory))
 
         for step_idx in range(self._max_steps):
+            # ContextWindowGuard: compact before the request, not after a 422.
+            # The guard is advisory — it raises and the loop stops with a
+            # typed reason, so the caller can compact and retry.
+            try:
+                self.window_guard.check(trajectory, model=self._router.route("plan"))
+            except ContextOverflowError as exc:
+                result.finished = True
+                result.finish_reason = "context_overflow"
+                result.llm_calls = step_idx
+                self._tracer.trace(
+                    state.task_id,
+                    step=f"react_step_{step_idx}_context_overflow",
+                    kind="decision",
+                    detail={"step_idx": step_idx, "detail": str(exc)[:400]},
+                )
+                return result
+
             # Pre-budget check. Phase = "plan" (L1 Lite caps).
             est_in = sum(len(m["content"]) for m in trajectory) // 4
             est_out = max(self._s.budget_plan_out // 3, 200)

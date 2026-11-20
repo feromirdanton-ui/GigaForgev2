@@ -141,20 +141,20 @@ class GigaChatProvider:
         messages: list[dict[str, Any]],
         *,
         model: str = "",
+        functions: list[dict[str, Any]] | None = None,
     ) -> int | None:
-        """Server-side token count, when the transport can provide one.
+        """Always ``None``: the legacy transport cannot count tokens.
 
-        The legacy client has no ``tokens_count`` endpoint, so this returns
-        ``None`` and the caller keeps its char/4 estimate.  The official-SDK
-        provider overrides it with the real server count.
+        ``GigaClient`` exposes ``chat``, ``stream_chat`` and ``list_models`` —
+        there is no token-counting endpoint, and there will not be one.  The
+        previous implementation probed ``getattr(self._client, "count_tokens")``,
+        which suggested a path that could never fire; the honest answer is a
+        constant ``None`` so the context guard keeps its char/4 estimate.
+
+        ``functions`` is accepted for signature parity with the SDK provider and
+        is deliberately ignored.
         """
-        counter = getattr(self._client, "count_tokens", None)
-        if counter is None:
-            return None
-        try:
-            return await counter(normalize_messages(messages), model=model)
-        except Exception:  # noqa: BLE001 - counting is an optimisation
-            return None
+        return None
 
     # --- capabilities --------------------------------------------------------
 

@@ -108,8 +108,39 @@ def test_sdk_adapter_count_tokens_uses_the_server_endpoint() -> None:
             model="GigaChat-2-Pro",
         )
     )
-    assert total == 8 + 4  # (4*2) + (2*2)
+    # Content: (4*2) + (2*2) = 12.  Plus the template overhead the endpoint
+    # cannot see: 3 per request + 4 per message = 11.  The guard must never
+    # under-count, so the overhead is added rather than ignored.
+    assert total == 12 + 11
     assert stub.calls and stub.calls[0][1] == "GigaChat-2-Pro"
+
+
+def test_sdk_adapter_count_tokens_includes_function_definitions() -> None:
+    """``functions`` are billed by the server but invisible to ``atokens_count``.
+
+    A ReAct step sends tool definitions on every call; ignoring them would let
+    the guard pass a request the server rejects.
+    """
+    from gigaforge.providers.gigachat_sdk_adapter import GigaChatSDKProvider
+
+    class _Item:
+        def __init__(self, tokens: int) -> None:
+            self.tokens = tokens
+
+    class _StubClient:
+        async def atokens_count(self, texts: list[str], *, model: str) -> list[_Item]:
+            return [_Item(1) for _ in texts]
+
+    provider = GigaChatSDKProvider(client=_StubClient(), model="GigaChat-2-Pro")
+    messages = [{"role": "user", "content": "x"}]
+    without = asyncio.run(provider.count_tokens(messages))
+    with_fns = asyncio.run(
+        provider.count_tokens(
+            messages,
+            functions=[{"name": "grep", "description": "search the repository", "parameters": {}}],
+        )
+    )
+    assert with_fns > without, "function definitions must add to the count"
 
 
 def test_sdk_adapter_count_tokens_degrades_to_none() -> None:

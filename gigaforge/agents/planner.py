@@ -23,6 +23,7 @@ import re
 import time
 from typing import Any
 
+from gigaforge.agents.schemas import plan_response_format
 from gigaforge.client.errors import BudgetExceeded, GigaForgeError
 from gigaforge.client.giga_client import GigaClient
 from gigaforge.config import Settings, get_settings
@@ -241,6 +242,7 @@ class PlannerAgent:
                 max_tokens=max_tokens,
                 task_id=state.task_id,
                 phase="plan",
+                response_format=plan_response_format(),
             )
             latency_ms = int((time.monotonic() - started) * 1000)
 

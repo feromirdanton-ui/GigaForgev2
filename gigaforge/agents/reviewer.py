@@ -19,6 +19,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from gigaforge.agents.planner import json_repair
+from gigaforge.agents.schemas import review_response_format
 from gigaforge.client.errors import BudgetExceeded
 from gigaforge.client.giga_client import GigaClient
 from gigaforge.config import Settings, get_settings
@@ -133,6 +134,7 @@ class ReviewerAgent:
                 max_tokens=max_tokens,
                 task_id=task_id,
                 phase="review",
+                response_format=review_response_format(),
             )
             latency_ms = int((time.monotonic() - started) * 1000)
 

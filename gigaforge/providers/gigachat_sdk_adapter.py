@@ -40,6 +40,7 @@ machine that only uses the legacy client.  The SDK is imported inside
 """
 from __future__ import annotations
 
+import json
 import time
 from typing import Any, AsyncIterator, Iterable, Mapping, Optional, Sequence
 
@@ -68,6 +69,46 @@ except Exception:  # noqa: BLE001 - any import failure means "not installed"
 def sdk_available() -> bool:
     """True when the official ``gigachat`` package can be imported."""
     return SDK_AVAILABLE
+
+
+#: Tokens the chat template adds per message on top of its content: the role
+#: token, the separators, and the turn marker.  Measured conservatively — the
+#: real figure is model-dependent, and rounding up is the safe direction for a
+#: guard that must not let an oversized request through.
+MESSAGE_OVERHEAD_TOKENS = 4
+
+#: Tokens the template adds once per request (the leading system marker and the
+#: assistant priming suffix).
+REQUEST_OVERHEAD_TOKENS = 3
+
+
+def _message_overhead(messages: Sequence[Mapping[str, Any]]) -> int:
+    """Per-message template cost the ``atokens_count`` endpoint does not bill.
+
+    ``atokens_count`` counts content strings only.  A real chat request also
+    pays for each message's role token and separators, plus a fixed per-request
+    envelope.  Without this the guard under-counts by roughly
+    ``4 * len(messages) + 3`` tokens — small per request, but a ReAct loop with
+    a long trajectory accumulates it, and under-counting is exactly the failure
+    mode that produces a 422 CONTEXT_TOO_LONG.
+    """
+    return REQUEST_OVERHEAD_TOKENS + MESSAGE_OVERHEAD_TOKENS * len(messages)
+
+
+def _functions_overhead(functions: Sequence[Mapping[str, Any]] | None) -> int:
+    """Tokens the ``functions`` definitions add to the request.
+
+    The endpoint cannot see them (it takes strings), but the server bills them
+    on every call.  A JSON-serialised function definition costs roughly one
+    token per four characters; the estimate rounds up.
+    """
+    if not functions:
+        return 0
+    try:
+        serialized = json.dumps(list(functions), ensure_ascii=False, default=str)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return 0
+    return (len(serialized) + 3) // 4
 
 
 # -- message / response mapping ---------------------------------------------
@@ -427,22 +468,40 @@ class GigaChatSDKProvider:
         messages: list[dict[str, Any]],
         *,
         model: str = "",
+        functions: list[dict[str, Any]] | None = None,
     ) -> int | None:
         """Server-side token count for a message list.
 
         This is the real count from ``atokens_count``, not the char/4 estimate
         the context guard falls back to.  Returns ``None`` when the endpoint is
         unavailable so the caller keeps its estimate instead of failing.
+
+        **What the endpoint does and does not count.**  ``atokens_count`` takes
+        plain strings, so it counts the *content* of each message and nothing
+        else.  A chat request also pays for the role tokens, the per-message
+        template overhead, and — in the ReAct loop — the ``functions``
+        definitions.  Counting only content therefore *under*-counts, and for a
+        guard whose job is to prevent a 422 CONTEXT_TOO_LONG, under-counting is
+        the dangerous direction: it lets through a request the server rejects.
+
+        The overhead is added explicitly here: a fixed per-message cost for the
+        role/template envelope, plus the serialised size of the function
+        definitions.  The constants are deliberately conservative (they round
+        up), because a guard that compacts slightly early costs one summariser
+        call, while a guard that compacts too late costs a failed request and a
+        whole step of the budget.
         """
         client = self._ensure_client()
-        texts = [str(m.get("content", "") or "") for m in normalize_messages(messages)]
-        if not texts:
+        normalized = normalize_messages(messages)
+        texts = [str(m.get("content", "") or "") for m in normalized]
+        if not texts and not functions:
             return 0
         try:
             result = await client.atokens_count(texts, model=model or self._model)
         except Exception:  # noqa: BLE001 - counting is an optimisation
             return None
-        return sum(int(getattr(item, "tokens", 0) or 0) for item in result)
+        content_tokens = sum(int(getattr(item, "tokens", 0) or 0) for item in result)
+        return content_tokens + _message_overhead(normalized) + _functions_overhead(functions)
 
     async def tokens_count(self, texts: Sequence[str], *, model: str | None = None) -> list[int]:
         """Server-side token counting — replaces the char/4 estimate."""
