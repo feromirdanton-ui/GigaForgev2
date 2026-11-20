@@ -42,6 +42,7 @@ from gigaforge.providers.messages import normalize_messages
 
 __all__ = [
     "COMPACTION_MARKER",
+    "OBSERVATION_MARKER",
     "compact_trajectory",
     "compaction_fits",
     "trim_stale_file_outputs",
@@ -67,6 +68,10 @@ LARGE_OBSERVATION_CHARS = 4000
 #: How much of a large observation survives when it is trimmed.
 TRIM_HEAD_CHARS = 600
 
+#: The harness's own marker for a tool observation.  Only a message carrying it
+#: is a candidate for trimming.
+OBSERVATION_MARKER = "Observation ("
+
 
 def trim_stale_file_outputs(
     messages: Sequence[Any],
@@ -86,6 +91,15 @@ def trim_stale_file_outputs(
     "Stale" means outside the last ``keep_tail`` messages.  The tail is what the
     model is actively reasoning about, so it is never touched.
 
+    **Only observations are trimmed.**  The first version of this pass trimmed
+    any message over :data:`LARGE_OBSERVATION_CHARS`, which included the
+    opening message — the harness prompt plus the task statement, ~4 400
+    characters.  On a long run the goal was therefore cut down to its first 600
+    characters and the model was asked to continue solving a task whose
+    statement it could no longer read.  Measured: a 10-step run compacted, and
+    the very next request no longer contained the task text.  A compactor that
+    drops the objective is not saving context, it is destroying the run.
+
     Idempotent: a message already carrying :data:`TRIM_MARKER` is skipped, so a
     retry loop cannot keep shrinking the same message.
     """
@@ -99,6 +113,11 @@ def trim_stale_file_outputs(
         content = str(message.get("content", "") or "")
         if (
             index < cutoff
+            # The goal is never a file body, whatever its size.
+            and index > 0
+            # And a message is only a file body if the harness labelled it as
+            # an observation.  Anything else is prompt or reasoning.
+            and OBSERVATION_MARKER in content
             and len(content) > LARGE_OBSERVATION_CHARS
             and TRIM_MARKER not in content
         ):

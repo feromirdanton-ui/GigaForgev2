@@ -407,6 +407,7 @@ class ReActRunner:
         max_steps: int | None = None,
         settings: Settings | None = None,
         guards: Any | None = None,
+        window_guard: Any | None = None,
     ) -> None:
         self._client = client
         self._router = router
@@ -423,11 +424,21 @@ class ReActRunner:
         #: — which is the *default* engine — did not, so the server token count
         #: was unreachable in the configuration most deployments run.  Built
         #: lazily so the guard can pick up the client's counter.
-        self._window_guard: Any = None
+        #:
+        #: Injectable because the compaction path is otherwise unreachable in a
+        #: test: the real window is 261 120 tokens, so forcing a compaction
+        #: would need a trajectory of a quarter of a million tokens.  A caller
+        #: that passes a guard with a small ``context_window`` exercises the
+        #: exact same code with a trajectory it can afford to build.
+        self._window_guard: Any = window_guard
         #: Compactions performed in the current episode.  Bounded so a
         #: pathological trajectory cannot oscillate between compact and
         #: overflow; reset at the start of every ``run``.
         self._compactions = 0
+        #: Consecutive compactions with no productive step in between.  This is
+        #: the number the bound applies to: a long run may compact many times as
+        #: long as it keeps making progress between compactions.
+        self._compaction_streak = 0
 
     @property
     def registry(self) -> ToolRegistry:
@@ -535,14 +546,26 @@ class ReActRunner:
         ``finish_reason="context_overflow"``, which is the old behaviour and
         still the right answer when the goal itself is too large.
 
-        The compaction is bounded: at most ``_MAX_COMPACTIONS`` per episode, so
-        a pathological trajectory cannot spin between "compact" and "overflow"
-        forever.  Each compaction is traced, because a run that silently
-        rewrote its own history is a run whose token accounting needs a note.
+        The compaction is bounded: at most ``_MAX_COMPACTIONS`` *consecutive*
+        compactions that fail to buy room, so a pathological trajectory cannot
+        spin between "compact" and "overflow" forever.  Each compaction is
+        traced, because a run that silently rewrote its own history is a run
+        whose token accounting needs a note.
+
+        The bound used to be on the *total* number of compactions per episode,
+        which is a different and wrong claim.  A long run legitimately needs
+        many compactions: it grows, compacts, grows again, compacts again.  A
+        total cap of two therefore killed every genuinely long episode at its
+        third compaction — measured: a 10-step run compacted twice (3 635 →
+        1 623 tokens, then 4 086 → 1 653) and then died with
+        ``context_overflow`` while it was still making progress.  What must be
+        bounded is the *streak*: compaction after compaction with no productive
+        step in between means the goal itself does not fit, and that is the
+        case worth stopping.
         """
         from gigaforge.harness.compaction import compact_trajectory, trim_stale_file_outputs
 
-        if self._compactions >= _MAX_COMPACTIONS:
+        if self._compaction_streak >= _MAX_COMPACTIONS:
             return None
         before = sum(len(str(m.get("content", ""))) for m in trajectory) // 4
         window = self.window_guard.window_for(self._router.route(_REACT_PHASE))
@@ -564,6 +587,7 @@ class ReActRunner:
             # Nothing was dropped: the goal alone is over the limit.
             return None
         self._compactions += 1
+        self._compaction_streak += 1
         self._tracer.trace(
             state.task_id,
             step=f"react_step_{step_idx}_compaction",
@@ -573,6 +597,8 @@ class ReActRunner:
                 "before_tokens": before,
                 "after_tokens": after,
                 "dropped_messages": len(trajectory) - len(compacted),
+                "compactions_total": self._compactions,
+                "compaction_streak": self._compaction_streak,
                 "trigger": str(exc)[:200],
             },
         )
@@ -596,6 +622,7 @@ class ReActRunner:
         if not self._registry.names():
             self._registry.install_defaults(sandbox=ctx.sandbox)
         self._compactions = 0
+        self._compaction_streak = 0
         # The think tool is a real tool, not a prompt trick: registering it is
         # what lets the model externalise a reasoning step.
         self.guards.install(self._registry)
@@ -637,6 +664,7 @@ class ReActRunner:
         )
 
         for step_idx in range(self._max_steps):
+            compacted_this_step = False
             # ContextWindowGuard: compact before the request, not after a 422.
             # Detection alone used to *end* the run; a long episode died at 80%
             # of the window with most of its trajectory being stale observation
@@ -657,6 +685,8 @@ class ReActRunner:
                         detail={"step_idx": step_idx, "detail": str(exc)[:400]},
                     )
                     return self._carry_trajectory(result, trajectory)
+                trajectory = compacted
+                compacted_this_step = True
 
             # Pre-budget check. Phase = "react" (its own cap, not the planner's).
             est_in = sum(len(m["content"]) for m in trajectory) // 4
@@ -972,6 +1002,19 @@ class ReActRunner:
                     "cached": cached is not None,
                 }
             )
+            # A productive step resets the compaction streak: the bound is on
+            # compaction-after-compaction with no progress, not on the total.
+            # Without this reset the streak would only ever grow, and the bound
+            # would be the old total cap under a new name.
+            #
+            # The reset is conditional on the step NOT having compacted.  A
+            # step that had to compact and then immediately overflowed again is
+            # not progress in the sense that matters: the trajectory is still
+            # over the window, and resetting here would let a tiny window
+            # compact on every single step forever (measured: 17 compactions in
+            # a 20-step run).  Progress means a step that fit without help.
+            if not compacted_this_step:
+                self._compaction_streak = 0
             # LoopBreaker: the same three-signature detector the LangGraph
             # ``observe`` node runs.  Without it the classic loop — which is the
             # engine the product actually drives — had no defence against a
