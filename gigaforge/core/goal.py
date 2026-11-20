@@ -1052,6 +1052,30 @@ class GoalRunner:
             elif not error:
                 error = self._pipeline_feedback(result)
 
+            # A rejected cycle used to carry only the pipeline's own reason, and
+            # the verifier was never consulted — so the next cycle was told
+            # "rejected" and not what was wrong with the artifact.  Measured: a
+            # page with a duplicated stylesheet and a stray </style> in the body
+            # was rejected three cycles running, each cycle re-deriving the same
+            # mistake, because nothing ever said "the body contains CSS text".
+            #
+            # The cheap subset runs here: syntax and the HTML audit, no test
+            # suite and no browser.  It is the part that is a pure function of
+            # the file, so it costs milliseconds and cannot itself fail for
+            # environmental reasons.  Its findings are appended to the error,
+            # which is what the next cycle reads.
+            if not accepted and changed:
+                cheap = self._cheap_verification(changed, goal)
+                if cheap:
+                    error = (error + "\n" if error else "") + cheap
+                    self._emit_goal_event(
+                        "goal.verify_on_reject",
+                        node=f"Цикл {cycle_index} из {max_cycles}",
+                        status="Проверяю отклонённый результат",
+                        goal_id=goal_id, cycle_index=cycle_index,
+                        summary=_safe_excerpt(cheap, limit=700),
+                    )
+
             # A provider that is throttling us has not judged the work.  Measured
             # live: two runs in parallel exhausted the quota, every cycle failed
             # with GF-RATE-429, and the goal burned all three cycles in under a
@@ -1279,6 +1303,45 @@ class GoalRunner:
                 f"{feedback[:3500]}"
             )
         return prompt
+
+    def _cheap_verification(self, changed: Sequence[str], goal: str) -> str:
+        """The deterministic part of verification, for a cycle that was rejected.
+
+        Only checks that are a pure function of the file: Python syntax and the
+        HTML structure audit.  No test suite (slow, and a red suite is the
+        pipeline's own gate) and no browser (needs a binary that may be absent).
+
+        Returns a short, actionable block, or ``""`` when there is nothing to
+        say — an empty string is the honest answer for a rejected cycle whose
+        files are structurally fine, and inventing a complaint would send the
+        next cycle chasing a phantom.
+        """
+        try:
+            from gigaforge.core.goal import WorkspaceVerifier
+
+            verifier = WorkspaceVerifier(require_browser=False)
+            root = Path(self.repo_root).resolve()
+            paths = verifier._changed_paths(root, changed)
+            lines: list[str] = []
+            for path in paths:
+                suffix = path.suffix.lower()
+                if suffix == ".py" and path.is_file():
+                    check = verifier._command_check(
+                        "Python syntax",
+                        [sys.executable, "-m", "py_compile", str(path)],
+                        root,
+                    )
+                    if check.status == "failed":
+                        lines.append(f"- {path.name}: {check.summary}")
+                elif suffix in {".html", ".htm"} and path.is_file():
+                    check = verifier._audit_html(root, path)
+                    if check.status == "failed":
+                        lines.append(f"- {path.name}: {check.summary}")
+            if not lines:
+                return ""
+            return "Structural problems found in the rejected result:\n" + "\n".join(lines)
+        except Exception as exc:  # noqa: BLE001 - a diagnostic must not break the loop
+            return f"(cheap verification unavailable: {str(exc)[:160]})"
 
     @staticmethod
     def _pipeline_feedback(result: Any) -> str:

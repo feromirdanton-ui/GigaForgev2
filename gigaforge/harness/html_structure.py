@@ -145,14 +145,17 @@ def looks_like_css(text: str, *, known_css: str = "") -> bool:
     blocks.  When it is empty only the strict shape test applies.
     """
     body = (text or "").strip()
-    if len(body) < 30:
+    if not body or "{" not in body or "}" not in body:
         return False
-    if "{" not in body or "}" not in body:
-        return False
+    # An exact duplicate of the page's own sheet is proof, whatever its length:
+    # a short rule set (``body{color:#fff}``) is still a rule set, and the
+    # length gate below exists only to keep *prose* out of the shape test.
     if known_css:
         needle = _normalise(body)
         if needle and needle in _normalise(known_css):
             return True
+    if len(body) < 30:
+        return False
     return _css_shaped(body)
 
 
