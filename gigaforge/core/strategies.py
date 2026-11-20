@@ -974,6 +974,16 @@ class ReActPlan:
         steps, verdict = self._guarded_steps(result)
         if not steps:
             return self._linear(goal, slice_text, ask=ask, parse=parse), outcome.ledger
+        if outcome.ledger is not None:
+            # Make the plan's fate visible in the run record.  Without this a run
+            # that paid for exploration and discarded it is indistinguishable
+            # from a successful one in every other column of the ledger.
+            outcome.ledger.note_plan(
+                used=True,
+                steps=len(steps),
+                salvaged=bool(getattr(result, "trajectory", None))
+                and not bool(getattr(result, "plan", None)),
+            )
         return (
             PlanOutcome(
                 steps=steps,

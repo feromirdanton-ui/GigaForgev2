@@ -66,6 +66,22 @@ class RunLedger:
     #: the runner commits real usage there after every call.
     tokens_in_override: int | None = None
     tokens_out_override: int | None = None
+    #: Did the plan the episode produced actually reach the executor?  This is
+    #: the field that makes N1 visible in a report instead of only in a review:
+    #: a run that pays for exploration and discards it looks identical to a
+    #: successful one in every other column.
+    plan_used: bool = False
+    #: How many of the plan's steps the executor actually ran.
+    plan_steps_executed: int = 0
+    #: True when the plan had to be rebuilt from the episode's observations
+    #: because the model's own finish payload was unusable.
+    salvaged: bool = False
+
+    def note_plan(self, *, used: bool, steps: int = 0, salvaged: bool = False) -> None:
+        """Record what happened to the plan, for the report and the benchmark."""
+        self.plan_used = bool(used)
+        self.plan_steps_executed = int(steps)
+        self.salvaged = bool(salvaged)
 
     # -- recording -----------------------------------------------------------
     def add(self, record: StepRecord) -> StepRecord:
@@ -169,6 +185,9 @@ class RunLedger:
             "retries": self.retries,
             "rate_limit_waits": round(self.rate_limit_waits, 3),
             "error": self.error,
+            "plan_used": self.plan_used,
+            "plan_steps_executed": self.plan_steps_executed,
+            "salvaged": self.salvaged,
             "steps": [step.to_dict() for step in self.steps],
         }
 
@@ -188,5 +207,8 @@ class RunLedger:
             f"{self.run_id}: {self.finish_reason or 'running'} | "
             f"{self.llm_calls} llm / {self.tool_calls} tool | "
             f"{self.tokens_in}+{self.tokens_out} tok | "
-            f"{self.compactions} compact | {self.duration_s:.1f}s"
+            f"{self.compactions} compact | "
+            f"plan {'used' if self.plan_used else 'unused'}"
+            f"{f' (salvaged)' if self.salvaged else ''} | "
+            f"{self.duration_s:.1f}s"
         )

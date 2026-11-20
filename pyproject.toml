@@ -54,21 +54,25 @@ langgraph = [
     "langgraph>=1.2,<2",
     "langgraph-checkpoint-sqlite>=2.0",
 ]
-# deepagents brings the harness middleware the merge plan borrows from
-# ai-forever/deepagents-gigachat. It pins langchain>=1.5 and langgraph>=1.2.24.
-# deepagents itself supports Python 3.11, so the project floor stays at 3.11;
-# only the *harness profile* (deepagents-gigachat) wants 3.12+, and that is a
-# separate, optional install.
-deepagents = [
-    "deepagents>=0.7",
-    "langchain-gigachat>=0.5",
-]
 # Everything the level-2 runtime needs, in one extra.
+#
+# ``deepagents`` and ``langchain-gigachat`` used to be listed here and were
+# never imported anywhere in the package.  They are not needed:
+#
+# * the four middleware worth having (harness prompt, path normaliser,
+#   deterministic-output guard, stale-output trimming) are ported into
+#   ``gigaforge/agents`` and ``gigaforge/harness`` in ~500 lines with no
+#   dependency;
+# * ``langchain-gigachat`` is an adapter, and ``gigachat_sdk_adapter.py``
+#   already talks to the official SDK directly;
+# * ``deepagents`` pins ``langchain>=1.5``, which is dozens of transitive
+#   dependencies and a second abstraction layer over the same HTTP call.
+#
+# An extra that installs nothing the code imports is a false statement in the
+# package metadata, and it already cost one review round.
 agent = [
     "langgraph>=1.2,<2",
     "langgraph-checkpoint-sqlite>=2.0",
-    "deepagents>=0.7",
-    "langchain-gigachat>=0.5",
 ]
 # Backward-compatible extra; Playwright is now included in the core install.
 browser = []
