@@ -2281,24 +2281,43 @@ class TaskPipeline:
         diff, and the contract then reported the sections the harness had built
         as missing — the run failed on work it had already done correctly.
 
+        **This used to be the third of three mechanisms solving one problem, and
+        it was the one that did the damage.**  It wrote the harness's bytes over
+        the file unconditionally, *after* the model's diff, so a model that fixed
+        a real bug in that file had its fix silently discarded.  Ownership was
+        absolute because nothing in the code could say it was not.
+
+        It now asks the ownership type, which is the one place the invariant
+        lives: an ``AUTHORITATIVE`` file is restored, a ``SEED`` file is left
+        exactly as the model left it.  The three mechanisms are one call
+        (:meth:`OwnedFiles.resolve`); this method is kept as the tree-side half
+        of it and no longer decides anything on its own.
+
         Returns the paths that were actually rewritten, so the trace shows it.
         """
-        content = ctx.extras.get("harness_owned_content") or {}
-        if not content:
+        owned = self._owned_files(ctx)
+        if not owned:
             return []
+        from gigaforge.harness.ownership import Policy
+
         root = self._repo_root()
         restored: list[str] = []
-        for rel, text in content.items():
-            target = Path(root) / rel
+        for entry in owned.files.values():
+            if entry.policy is not Policy.AUTHORITATIVE:
+                # A seeded file is the model's to change.  Writing the harness's
+                # baseline back over it would discard exactly the edit the run
+                # was asked to make.
+                continue
+            target = Path(root) / entry.path
             try:
                 current = target.read_text(encoding="utf-8") if target.is_file() else ""
             except OSError:
                 current = ""
-            if current == text:
+            if current == entry.content:
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(text, encoding="utf-8")
-            restored.append(rel)
+            target.write_text(entry.content, encoding="utf-8")
+            restored.append(entry.path)
         return restored
 
     def _node_repair(self, ctx: RunContext, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
