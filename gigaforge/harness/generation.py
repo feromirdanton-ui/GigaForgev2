@@ -56,6 +56,7 @@ _SECTION_CATALOGUE: tuple[tuple[str, tuple[str, ...], str], ...] = (
     ("pricing", ("pricing", "plans", "tiers"), "Pricing"),
     ("testimonials", ("testimonial", "quote", "review"), "Testimonials"),
     ("faq", ("faq", "questions"), "FAQ"),
+    ("contact", ("contact", "get in touch", "reach us"), "Contact"),
     ("cta", ("call to action", "cta", "get started", "sign up"), "Call to action"),
     ("footer", ("footer",), "Footer"),
 )
@@ -174,11 +175,7 @@ def plan_generation(goal: str, existing_html: str = "") -> GenerationPlan:
         # An edit that names no palette keeps the page's own colours rather
         # than repainting it with the default.  The palette is read from the
         # page's CSS declarations, which is a string operation.
-        palette = tuple(
-            word for word in ("cyan", "magenta", "purple", "violet", "orange",
-                              "green", "red", "blue", "yellow", "pink", "gold")
-            if re.search(rf"\b{word}\b", existing_html, re.I)
-        )
+        palette = _palette_of(existing_html)
 
     path = "index.html"
     match = re.search(r"\b([\w./-]+\.html?)\b", goal or "", re.I)
@@ -207,9 +204,21 @@ def existing_sections(html: str) -> dict[str, str]:
     """The top-level sections of an existing page, keyed by kind.
 
     The kind is the first class token that the catalogue knows (``hero``,
-    ``features``, ``footer``…), falling back to the tag name.  This is how an
-    edit keeps what the page already has: the assembler reuses these fragments
-    for any section the child was not asked to rewrite.
+    ``features``, ``footer``…), falling back to the tag name for the landmarks
+    that have one (``footer``, ``nav``).  This is how an edit keeps what the page
+    already has: the assembler reuses these fragments for any section the child
+    was not asked to rewrite.
+
+    **A section the catalogue does not know is not given an invented name.**
+    The first version keyed it ``section1``, ``section2``… by position, and that
+    name then travelled: it became a *planned* section, so the contract demanded
+    a section called ``section1``, and the assembler — which has no fragment and
+    no fallback for a name it invented — could not produce it.  Measured live on
+    an edit: the run failed with "the artifact did not meet the goal: section
+    'section1'; section 'section6'" on a page that was structurally fine.
+
+    An unknown section is still *preserved* — :func:`assemble_page` appends it
+    verbatim — but it is not a promise the contract can hold the run to.
     """
     out: dict[str, str] = {}
     if not html:
@@ -224,9 +233,8 @@ def existing_sections(html: str) -> dict[str, str]:
         if not kind:
             kind = {"footer": "footer", "nav": "nav", "header": "nav"}.get(tag, "")
         if not kind:
-            # A section with no catalogue class: name it by its position so it
-            # is still preserved rather than dropped.
-            kind = f"section{len(out) + 1}"
+            # Not a section the catalogue knows: keep it, but do not name it.
+            continue
         if kind in out:
             continue
         # Find the matching close tag with a depth counter.
@@ -244,6 +252,30 @@ def existing_sections(html: str) -> dict[str, str]:
                 end = step.end()
         out[kind] = html[match.start():end].strip()
     return out
+
+
+def _palette_of(html: str) -> tuple[str, ...]:
+    """The colours an existing page actually declares, in CSS.
+
+    Read from the ``<style>`` blocks only.  Scanning the whole document was the
+    same defect as counting ``cyan`` in a CSS *comment*: the word appears in
+    prose ("a green future"), in a class name, in a link — and the contract then
+    demanded a colour the page never used.  Measured live on an edit: the run
+    failed with "colour 'green'" for a page whose stylesheet declares cyan and
+    magenta.
+    """
+    if not html:
+        return ()
+    css = "\n".join(
+        block.group(1) for block in re.finditer(r"<style\b[^>]*>(.*?)</style\s*>", html, re.S | re.I)
+    )
+    if not css:
+        return ()
+    return tuple(
+        word for word in ("cyan", "magenta", "purple", "violet", "orange", "green",
+                          "red", "blue", "yellow", "pink", "gold")
+        if re.search(rf"\b{word}\b", css, re.I)
+    )
 
 
 def _derive_title(goal: str) -> str:
@@ -358,13 +390,39 @@ def _clean_css(css: str) -> str:
 
 
 def _clean_markup(markup: str) -> str:
-    """Remove unified-diff artefacts from a child's markup."""
+    """Remove unified-diff artefacts from a child's markup.
+
+    A child is asked for a fragment and sometimes answers with a *diff* — the
+    same model, the same prompt family, and the fix loop's format leaks into the
+    section call.  Measured live on an edit, the footer child returned::
+
+        index 8d7f96b..c3a8eaa 100644
+        --- a/index.html
+        +++ b/index.html
+        @@ -1,4 +1,4 @@
+           </div>
+         </section>
+        +<section class="footer">…</section>
+
+    The line-by-line pass below strips the ``+``/``-`` markers, but it keeps the
+    **context** lines — which are the *old* file — and the ``index …`` header.
+    The page then contained a patch: the run failed its own render check with
+    "6164 characters of CSS are rendered as text", and the closing tags were
+    duplicated.
+
+    So when the answer is a diff, only the added lines are markup.  The
+    line-by-line pass stays for the mixed case (a fragment with a stray ``+``).
+    """
     if not markup:
         return ""
+    if _looks_like_a_diff(markup):
+        return _added_lines_of(markup)
     lines: list[str] = []
     for line in markup.splitlines():
         stripped = line.strip()
-        if stripped.startswith("@@") or stripped.startswith("diff --git"):
+        if stripped.startswith("@@"):
+            continue
+        if stripped.startswith("diff --git") or stripped.startswith("index "):
             continue
         if stripped.startswith("+++") or stripped.startswith("---"):
             continue
@@ -443,6 +501,21 @@ def _strip_document_wrapper(fragment: str) -> str:
     harness keeps the body content and drops everything else, so the assembly
     cannot inherit a second document.
 
+    **A child that answers with a diff is the other common failure.**  Measured
+    live on an edit: the footer child returned
+
+        index 8d7f96b..c3a8eaa 100644
+        --- a/index.html
+        +++ b/index.html
+        @@ -1,4 +1,4 @@
+        -  </div>
+        +<section class="footer">…</section>
+
+    and the harness glued the diff header and the context lines into the page —
+    the run then failed its own render check with "6164 characters of CSS are
+    rendered as text".  A diff is not markup; the added lines are.  Taking them
+    is the difference between a page and a page with a patch pasted into it.
+
     The child's ``<style>`` content is *not* dropped — see :func:`_extract_css`;
     the caller collects it and the assembler puts it in the one ``<style>``.
     """
@@ -453,6 +526,8 @@ def _strip_document_wrapper(fragment: str) -> str:
     fence = re.match(r"^```[a-zA-Z]*\s*\n(.*?)\n```\s*$", text, re.S)
     if fence:
         text = fence.group(1).strip()
+    if _looks_like_a_diff(text):
+        text = _added_lines_of(text)
     body = re.search(r"<body\b[^>]*>(.*?)</body\s*>", text, re.S | re.I)
     if body:
         text = body.group(1).strip()
@@ -462,6 +537,45 @@ def _strip_document_wrapper(fragment: str) -> str:
     text = re.sub(r"<meta\b[^>]*>", "", text, flags=re.I)
     text = re.sub(r"<title\b[^>]*>.*?</title\s*>", "", text, flags=re.S | re.I)
     return text.strip()
+
+
+#: A unified-diff header, a hunk header, or a ``--- a/…``/``+++ b/…`` pair.
+_DIFF_MARKERS = (
+    re.compile(r"^diff --git ", re.M),
+    re.compile(r"^index [0-9a-f]{6,}\.\.[0-9a-f]{6,}", re.M),
+    re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@", re.M),
+    re.compile(r"^--- a/", re.M),
+    re.compile(r"^\+\+\+ b/", re.M),
+)
+
+
+def _looks_like_a_diff(text: str) -> bool:
+    """Is this answer a patch rather than markup?
+
+    Two independent markers, so a page that merely contains a line starting with
+    ``---`` (a horizontal rule in a comment, say) is not mistaken for a patch.
+    """
+    return sum(1 for marker in _DIFF_MARKERS if marker.search(text)) >= 2
+
+
+def _added_lines_of(patch: str) -> str:
+    """The added lines of a unified diff, with the patch furniture removed.
+
+    Only ``+`` lines are kept: the context lines are the *old* file, and pasting
+    them in is what duplicated the closing tags.  ``+++ b/…`` is a header, not
+    content.
+    """
+    kept: list[str] = []
+    for line in patch.splitlines():
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("@@"):
+            continue
+        if line.startswith("diff --git") or line.startswith("index "):
+            continue
+        if line.startswith("+"):
+            kept.append(line[1:])
+    return "\n".join(kept).strip()
 
 
 def _layout_invariants() -> str:
