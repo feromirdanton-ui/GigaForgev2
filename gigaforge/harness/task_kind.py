@@ -65,6 +65,7 @@ instead of asserting it.
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -169,6 +170,65 @@ def _named_paths(goal: str) -> list[str]:
     return out
 
 
+def _repo_anchor(root: Path) -> tuple[Path, Path] | None:
+    """Where to ask, and which directory *root* corresponds to in that tree.
+
+    Returns ``(anchor, base)``:
+
+    * ``anchor`` — the directory whose committed state answers the question;
+    * ``base`` — the directory in *anchor*'s tree that *root* stands for.
+
+    Normally both are *root* itself.  But a goal loop does not run against the
+    user's project: it runs against a **copy** of it
+    (``<project>/.gigaforge/workspaces/<goal>/project``), and the copy excludes
+    ``.git`` on purpose — a nested repository would make every git command in
+    the run answer about the wrong tree.
+
+    The consequence was a live defect: ``git -C <copy> rev-parse --show-toplevel``
+    walked *up* to the user's repository, and the copy's own path
+    (``.gigaforge/workspaces/.../project/index.html``) is not in that
+    repository's HEAD — so a committed page was reported as "not committed",
+    "Update index.html" was classified as a *creation*, the existing page was
+    never read, and the run regenerated it from scratch, losing the hero and the
+    grid the user already had.
+
+    The copy's manifest records where it came from, so for a copy the anchor is
+    the destination and the base is the destination's root.
+
+    **Why the base is separate from the anchor.**  ``git -C <dir> ls-tree --
+    <path>`` interprets ``<path>`` relative to ``<dir>``, not to the repository
+    root.  Asking from ``pages/`` about ``about.html`` must resolve to
+    ``pages/about.html`` in the tree, not ``about.html``.  Returning one value
+    for both jobs got that wrong.
+    """
+    current = root.resolve()
+    for candidate in (current, *current.parents):
+        workspaces = candidate / ".gigaforge" / "workspaces"
+        if workspaces.is_dir():
+            for entry in sorted(workspaces.iterdir()):
+                record = entry / "manifest.json"
+                if not record.is_file():
+                    continue
+                try:
+                    data = json.loads(record.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                destination = data.get("destination")
+                workspace = data.get("workspace")
+                if not destination or not workspace:
+                    continue
+                try:
+                    inside = current.is_relative_to(Path(workspace).resolve())
+                except (OSError, ValueError):
+                    inside = False
+                if inside:
+                    # The copy stands for the destination's root.
+                    return Path(destination).resolve(), Path(destination).resolve()
+        if (candidate / ".git").exists():
+            return candidate, current
+    return None
+
+
 def _tracked_in_head(root: Path, rel: str) -> bool | None:
     """Is *rel* part of the repository's committed state?
 
@@ -184,12 +244,41 @@ def _tracked_in_head(root: Path, rel: str) -> bool | None:
     question the routing asks is "is this path part of the repository the user
     gave me", and the answer to that is the committed state, not the run's own
     scratch output.
+
+    **Why the toplevel is resolved first.**  ``git -C <dir> ls-tree -- <path>``
+    interprets ``<path>`` relative to ``<dir>``, not to the repository root.  A
+    goal loop runs the pipeline against a *copy* of the project
+    (``.gigaforge/workspaces/<goal>/project``), which is a subdirectory of the
+    repository, so ``ls-tree -- index.html`` from there matched nothing and the
+    function answered "not committed" for a file that was committed.  Measured
+    live: "Update index.html to add a pricing section" was classified
+    ``artifact`` (create) instead of ``artifact_edit``, the existing page was
+    never read, and the run regenerated it from scratch — losing the hero and
+    the grid the user already had.  Resolving the toplevel and re-relativising
+    the path is what makes the answer independent of where the pipeline runs.
     """
     try:
         import subprocess
 
+        anchor = _repo_anchor(root)
+        if anchor is None:
+            return None
+        ask_from, base = anchor
+        top = subprocess.run(
+            ["git", "-C", str(ask_from), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        if top.returncode != 0 or not top.stdout.strip():
+            return None
+        toplevel = Path(top.stdout.strip())
+        try:
+            rel_to_top = (base / rel).resolve().relative_to(toplevel.resolve())
+        except (ValueError, OSError):
+            # The path is outside the repository: it cannot be committed in it.
+            return False
         result = subprocess.run(
-            ["git", "-C", str(root), "ls-tree", "-r", "--name-only", "HEAD", "--", rel],
+            ["git", "-C", str(toplevel), "ls-tree", "-r", "--name-only", "HEAD",
+             "--", rel_to_top.as_posix()],
             capture_output=True, text=True, timeout=10, check=False,
         )
     except (OSError, subprocess.SubprocessError):
