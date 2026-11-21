@@ -619,6 +619,36 @@ class BenchResult:
     tests_passed_after_apply: bool = False
     method: str = ""
     error: str = ""
+    #: How many independent attempts this task was given (``--repeats``).
+    attempts: int = 1
+    #: How many of those attempts succeeded.  ``-1`` means "not measured" — a
+    #: result built directly (a test, a single ad-hoc run) has no attempt count,
+    #: and reporting 0 passes for a successful run would be a lie.
+    passes: int = -1
+
+    @property
+    def pass_at_k(self) -> float:
+        """Fraction of attempts that succeeded, 0..1.
+
+        **Why this exists.**  A single run of a stochastic pipeline is a coin
+        flip reported as a fact.  The bench said "5/5 passed" and that number
+        could not distinguish a harness that works every time from one that
+        works four times in five — and the difference is the whole question for
+        a harness whose output comes from a model.
+
+        ``pass@k`` here is the empirical pass rate over ``k`` independent
+        attempts: ``passes / attempts``.  It is not the unbiased estimator from
+        the Codex paper (that one needs ``n > k`` samples and a combinatorial
+        correction); with ``k`` attempts and no extra samples the honest number
+        is the observed rate, and calling it anything else would be a claim the
+        data does not support.
+        """
+        if self.attempts <= 0:
+            return 0.0
+        if self.passes < 0:
+            # Not measured: the honest answer is the single run's own outcome.
+            return 1.0 if self.success else 0.0
+        return self.passes / self.attempts
 
     def to_row(self) -> dict[str, Any]:
         return {
@@ -632,6 +662,9 @@ class BenchResult:
             "latency_s": round(self.latency_s, 3),
             "tests_passed": self.tests_passed_after_apply,
             "method": self.method,
+            "attempts": self.attempts,
+            "passes": self.passes,
+            "pass_at_k": round(self.pass_at_k, 4),
             "error": self.error[:200] if self.error else "",
         }
 
@@ -663,36 +696,65 @@ class BenchRunner:
         *,
         work_root: Path | None = None,
         tasks: list[TaskFixture] | None = None,
+        repeats: int = 1,
     ) -> None:
         self._work_root = work_root or Path("/tmp/gigaforge_bench")
         self._work_root.mkdir(parents=True, exist_ok=True)
         self._tasks = tasks if tasks is not None else list(TASKS)
+        #: Independent attempts per task.  ``1`` is the default because the
+        #: bench is deterministic offline; a live run passes ``--repeats k`` to
+        #: measure pass@k, which is the only honest way to report a stochastic
+        #: pipeline's reliability.
+        self._repeats = max(1, int(repeats))
 
     def run_all(self) -> list[BenchResult]:
         """Run every task fixture; return a list of BenchResult (one per task)."""
         results: list[BenchResult] = []
         for fixture in self._tasks:
-            try:
-                result = self._run_one(fixture)
-            except Exception as exc:  # noqa: BLE001 — bench must not crash
-                result = BenchResult(
-                    name=fixture.name,
-                    task=fixture.task,
-                    success=False,
-                    cache_hit=False,
-                    llm_calls=0,
-                    tokens_in=0,
-                    tokens_out=0,
-                    latency_s=0.0,
-                    error=f"{type(exc).__name__}: {exc}",
-                )
-            results.append(result)
+            attempts: list[BenchResult] = []
+            for attempt in range(self._repeats):
+                try:
+                    result = self._run_one(fixture, attempt=attempt)
+                except Exception as exc:  # noqa: BLE001 — bench must not crash
+                    result = BenchResult(
+                        name=fixture.name,
+                        task=fixture.task,
+                        success=False,
+                        cache_hit=False,
+                        llm_calls=0,
+                        tokens_in=0,
+                        tokens_out=0,
+                        latency_s=0.0,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                attempts.append(result)
+            # The reported result is the FIRST attempt (so a single-run bench is
+            # unchanged), annotated with how many of the k attempts passed.
+            head = attempts[0]
+            head.attempts = len(attempts)
+            head.passes = sum(1 for a in attempts if a.success)
+            if head.passes < head.attempts:
+                # A task that does not pass every time is not a pass: the bench
+                # gate must fail on flakiness, not average it away.
+                head.success = False
+                if not head.error:
+                    head.error = (
+                        f"flaky: {head.passes}/{head.attempts} attempts passed"
+                    )
+            results.append(head)
         return results
 
-    def _run_one(self, fixture: TaskFixture) -> BenchResult:
-        """Build the repo, run the real DAG, verify the diff + tests."""
+    def _run_one(self, fixture: TaskFixture, *, attempt: int = 0) -> BenchResult:
+        """Build the repo, run the real DAG, verify the diff + tests.
+
+        ``attempt`` only names the scratch directory, so k independent attempts
+        do not share a tree — sharing one would make attempt 2 start from
+        attempt 1's result and measure nothing.
+        """
         # Each task gets its own scratch dir under work_root.
-        task_dir = self._work_root / fixture.name
+        task_dir = self._work_root / (
+            fixture.name if attempt == 0 else f"{fixture.name}__attempt{attempt}"
+        )
         if task_dir.exists():
             _safe_rmtree(task_dir)
         task_dir.mkdir(parents=True, exist_ok=True)

@@ -988,6 +988,10 @@ def bench(
         typer.Option("--out", help="Write the JSON report to this path (for CI)."),
     ] = "",
     verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
+    repeats: Annotated[
+        int,
+        typer.Option("--repeats", "-k", help="Independent attempts per task (pass@k)."),
+    ] = 1,
 ) -> None:
     """Run the offline benchmark suite across tasks.
 
@@ -995,10 +999,15 @@ def bench(
     task failed, so CI can gate on the bench instead of parsing stdout.  The
     bench was not wired to CI at all, and it contained no HTML task, so a
     regression that broke page generation outright left every check green.
+
+    ``--repeats k`` runs each task k times and reports ``pass_at_k``.  A single
+    run of a stochastic pipeline is a coin flip reported as a fact: "5/5 passed"
+    cannot distinguish a harness that works every time from one that works four
+    times in five, and that difference is the whole question.
     """
     from gigaforge.bench import BenchRunner, bench_report, bench_report_json
 
-    runner = BenchRunner()
+    runner = BenchRunner(repeats=repeats)
     results = runner.run_all()
     if out:
         import json as _json
