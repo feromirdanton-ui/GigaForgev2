@@ -306,6 +306,38 @@ class ContractVerdict:
     def ok(self) -> bool:
         return not self.unmet
 
+    @property
+    def completeness(self) -> float:
+        """Fraction of the contract's requirements the artifact satisfies, 0..1.
+
+        **Why this is a property and not a number in a report.**  Every report
+        this project produced said "9/10" — a figure a human typed after looking
+        at a screenshot.  It was not reproducible, it did not move when the code
+        changed, and two runs of the same build could be scored differently by
+        the same person.  A number that cannot be recomputed is not a metric.
+
+        This one is computed from the verdict: ``met / (met + unmet)``.  It is
+        the same arithmetic for every mode, it is in the run's own output, and
+        it changes when the artifact changes.  ``1.0`` means every requirement
+        the plan set was satisfied; ``0.0`` means none was.
+        """
+        total = len(self.met) + len(self.unmet)
+        if total <= 0:
+            # Nothing was checked.  Reporting 1.0 would claim a perfect artifact
+            # on the strength of having checked nothing.
+            return 0.0
+        return len(self.met) / total
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "ok": self.ok,
+            "completeness": round(self.completeness, 4),
+            "met": list(self.met),
+            "unmet": list(self.unmet),
+            "checked": list(self.checked),
+            "files": list(self.files),
+        }
+
     def as_observation(self) -> str:
         """The text handed back to the model as a correction step."""
         if self.ok:

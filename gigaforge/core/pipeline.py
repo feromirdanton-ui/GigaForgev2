@@ -161,6 +161,11 @@ class PipelineResult:
     #: model's own judgement — the distinction a caller needs to tell "the model
     #: gave up" from "the harness refused to call this done".
     contract_unmet: list[str] = field(default_factory=list)
+    #: Fraction of the contract's requirements the artifact satisfies, 0..1.
+    #: Computed from the verdict (``met / (met + unmet)``), not typed by hand:
+    #: a number that cannot be recomputed is not a metric.  ``None`` when no
+    #: contract ran (a code goal with no contract, a run that produced nothing).
+    completeness: float | None = None
 
     def __post_init__(self) -> None:
         if self.success and not self.accepted:
@@ -199,6 +204,7 @@ class PipelineResult:
             "phase_usages": self.phase_usages,
             "diff_chars": len(self.final_diff or self.diff or ""),
             "contract_unmet": list(self.contract_unmet),
+            "completeness": self.completeness,
             "summary": self.summary,
             "plan": list(self.plan),
             "duration_ms": round(self.duration_ms, 3),
@@ -2428,10 +2434,12 @@ class TaskPipeline:
         if contract is not None:
             ctx.state.artifacts["contract"] = {
                 "ok": contract.ok,
+                "completeness": round(contract.completeness, 4),
                 "checked": contract.checked,
                 "met": contract.met,
                 "unmet": contract.unmet,
             }
+            ctx.extras["completeness"] = round(contract.completeness, 4)
         ctx.state.add_note(
             f"settle: accepted={accepted} diff_chars={len(final)} files={len(changed)} "
             f"review={verdict.get('verdict', 'ok') if isinstance(verdict, Mapping) else 'ok'}"
@@ -2484,6 +2492,16 @@ class TaskPipeline:
             before=before,
         )
         ctx.extras["code_contract"] = verdict.to_dict()
+        # A code goal's completeness is the same arithmetic on its own verdict:
+        # the checks that passed over the checks that ran.  Without this a code
+        # run reported ``completeness: None`` while an artifact run reported a
+        # number, and the report could not compare the two modes.
+        if ctx.extras.get("completeness") is None:
+            total = len(verdict.unmet) + len(verdict.not_checked)
+            if total:
+                ctx.extras["completeness"] = round(
+                    max(0.0, 1.0 - len(verdict.unmet) / total), 4
+                )
         self._event("pipeline.code_contract", run_id=ctx.run_id,
                     ok=verdict.ok, unmet=verdict.unmet[:4],
                     not_checked=verdict.not_checked[:4])
@@ -2855,6 +2873,8 @@ class TaskPipeline:
             cache_hits=int(getattr(state, "cache_hits", 0) or 0),
             cache_lookups=int(getattr(state, "cache_lookups", 0) or 0),
             degraded=list(getattr(state, "degraded", []) or []),
+            contract_unmet=list(ctx.extras.get("contract_unmet") or []),
+            completeness=ctx.extras.get("completeness"),
             diff_repaired=list(
                 (ctx.extras.get("diff_repaired") or {}).get("repaired") or []
             ),
