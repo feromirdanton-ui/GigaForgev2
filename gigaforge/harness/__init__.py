@@ -201,6 +201,10 @@ class Harness:
         self._tracer = tracer
         self._budgets = budgets
         self.checkpointer = checkpointer
+        #: The model the ledger prices against.  Set by :meth:`run` from the
+        #: runner's router; empty means "price with the default table", which
+        #: still yields a real number for a known family.
+        self._ledger_model = ""
 
     # -- public API ----------------------------------------------------------
     def run(
@@ -239,6 +243,16 @@ class Harness:
             goal=task,
             engine=resolved_engine or type(runner).__name__,
         )
+        # The model the ledger prices against.  The router is the only thing
+        # that knows which model a phase resolves to, and the ledger needs a
+        # name to look up a price.  Without this the cost columns were zero for
+        # every run — see the note in ``_record_result``.
+        try:
+            router = getattr(runner, "router", None)
+            if router is not None:
+                self._ledger_model = str(router.route("code") or "")
+        except Exception:  # noqa: BLE001 - a missing router is not fatal
+            self._ledger_model = ""
         outcome = HarnessResult(ledger=ledger)
         compactions = 0
 
@@ -359,3 +373,38 @@ class Harness:
                 ledger.tokens_out_override = int(used.get("out", 0))
             except Exception:  # noqa: BLE001 - accounting is best-effort
                 pass
+
+        # Cost.  ``note_cost`` existed and was never called by anything, so the
+        # ledger's cost columns were structurally zero: measured live, a run
+        # that spent 12 769 prompt + 2 095 completion tokens across six calls
+        # reported ``cost_per_task_usd = 0.0`` and ``phase_cost_micros`` all
+        # zero.  A cost report that always says 0.00 is worse than no report,
+        # because it looks authoritative.
+        #
+        # The per-phase token totals are what the price is applied to, so the
+        # report can say WHERE the money went, not only how much.
+        try:
+            from gigaforge.core.cost import PriceTable
+
+            prices = PriceTable.from_env()
+            phases = getattr(budgets, "_phase_used", None) if budgets is not None else None
+            model = str(getattr(self, "_ledger_model", "") or "")
+            if isinstance(phases, dict) and phases:
+                for phase, totals in phases.items():
+                    ledger.note_cost(
+                        model=model,
+                        phase=str(phase),
+                        tokens_in=int(totals.get("in", 0) or 0),
+                        tokens_out=int(totals.get("out", 0) or 0),
+                        prices=prices,
+                    )
+            else:
+                ledger.note_cost(
+                    model=model,
+                    phase="total",
+                    tokens_in=ledger.tokens_in,
+                    tokens_out=ledger.tokens_out,
+                    prices=prices,
+                )
+        except Exception:  # noqa: BLE001 - accounting is best-effort
+            pass

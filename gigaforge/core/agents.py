@@ -254,8 +254,23 @@ class WorktreeManager:
             shutil.rmtree(path, ignore_errors=True)
         shutil.copytree(
             self.repo_root, path,
-            ignore=shutil.ignore_patterns(".git", "node_modules", ".venv", "__pycache__",
-                                          ".gigaforge", ".pytest_cache"),
+            ignore=shutil.ignore_patterns(
+                ".git", "node_modules", ".venv", "__pycache__",
+                ".gigaforge", ".pytest_cache",
+                # A live SQLite database's journal is created and deleted by the
+                # database itself while the copy walks the tree.  ``copytree``
+                # stats it, then fails to open it, and the whole fan-out dies
+                # with ``[Errno 2] No such file or directory:
+                # 'core.sqlite3-journal'`` — measured as a flaky failure of
+                # ``test_subagents_fan_out_on_the_default_engine`` that passed
+                # five times in isolation and failed in the full suite.
+                #
+                # A journal is not data: it is a rollback log for a transaction
+                # that is either committed (and in the .sqlite3 file) or not
+                # (and irrelevant to a copy).  Copying it is never correct.
+                "*.sqlite3-journal", "*.sqlite-journal", "*.db-journal",
+                "*.sqlite3-wal", "*.sqlite3-shm",
+            ),
         )
         worktree = Worktree(name=name, path=path, branch="", base="",
                             created=True, error="not a git repo: used a directory copy")
