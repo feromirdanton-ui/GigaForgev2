@@ -361,7 +361,13 @@ class TaskState:
 
                 prices = getattr(self, "_prices", None)
                 if prices is None:
-                    prices = PriceTable()
+                    # ``PriceTable()`` uses the built-in placeholder prices and
+                    # ignores ``GF_CORE__PRICES__*`` entirely, so a deployment
+                    # that configured its own prices got ``cost_usd = 0.0`` on
+                    # every run — measured live: 12 769 prompt + 2 095 completion
+                    # tokens on GigaChat, priced at 0.00.  ``from_env`` is the
+                    # constructor that reads the configuration.
+                    prices = PriceTable.from_env()
                     self._prices = prices
                 micros = int(
                     prices.cost_micros(

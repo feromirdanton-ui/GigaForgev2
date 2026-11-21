@@ -54,10 +54,21 @@ class ModelPrice:
 
 #: Default prices.  These are *placeholders* for a self-hosted / contract-priced
 #: deployment and are meant to be overridden with ``GF_CORE__PRICES__*``.
+#:
+#: The keys cover the catalogue the router actually serves, not only the family
+#: names.  A live run was served ``GigaChat-2-Max`` and ``GigaChat-Plus`` while
+#: the table knew ``GigaChat-Max`` and ``GigaChat-Plus``, so every call fell to
+#: the unknown sentinel and the run reported ``cost_usd = 0.0`` for 14 864
+#: tokens.  A placeholder price is a number the report can qualify; a silent
+#: zero is a number the report cannot tell from a free run.
 DEFAULT_PRICES: dict[str, ModelPrice] = {
     "GigaChat": ModelPrice("GigaChat", prompt_per_million=0.50, completion_per_million=1.50),
+    "GigaChat-2": ModelPrice("GigaChat-2", prompt_per_million=0.50, completion_per_million=1.50),
+    "GigaChat-Plus": ModelPrice("GigaChat-Plus", prompt_per_million=1.00, completion_per_million=4.00),
     "GigaChat-Pro": ModelPrice("GigaChat-Pro", prompt_per_million=2.50, completion_per_million=10.00),
+    "GigaChat-2-Pro": ModelPrice("GigaChat-2-Pro", prompt_per_million=2.50, completion_per_million=10.00),
     "GigaChat-Max": ModelPrice("GigaChat-Max", prompt_per_million=5.00, completion_per_million=20.00),
+    "GigaChat-2-Max": ModelPrice("GigaChat-2-Max", prompt_per_million=5.00, completion_per_million=20.00),
 }
 
 #: Used for any model the table does not know.  Zero by default: an unknown
@@ -80,7 +91,20 @@ class PriceTable:
         self._default = default or UNKNOWN_PRICE
 
     def price_for(self, model: str) -> ModelPrice:
-        """Exact match first, then a case-insensitive match, then the default."""
+        """Exact match, then case-insensitive, then **family prefix**, then default.
+
+        The prefix step is what makes a live run's cost real.  The router serves
+        ``GigaChat-2-Max`` and ``GigaChat-Plus`` (the account's actual catalogue)
+        while the price table is keyed by the family names ``GigaChat-Max`` and
+        ``GigaChat-Plus``.  Without it every call was priced at the unknown
+        sentinel — measured live: 12 769 prompt + 2 095 completion tokens across
+        six calls, ``cost_usd = 0.0``.  A run that reports zero cost is not a
+        cheap run; it is a run whose cost was never computed, and the report
+        cannot tell the two apart.
+
+        The longest matching prefix wins, so ``GigaChat-2-Max`` prefers
+        ``GigaChat-2-Max`` over ``GigaChat-2`` over ``GigaChat``.
+        """
         if not model:
             return self._default
         exact = self._prices.get(model)
@@ -90,6 +114,13 @@ class PriceTable:
         for name, price in self._prices.items():
             if name.lower() == lowered:
                 return price
+        best: ModelPrice | None = None
+        best_len = -1
+        for name, price in self._prices.items():
+            if lowered.startswith(name.lower()) and len(name) > best_len:
+                best, best_len = price, len(name)
+        if best is not None:
+            return best
         return self._default
 
     def cost_micros(self, model: str, prompt_tokens: int, completion_tokens: int) -> int:
