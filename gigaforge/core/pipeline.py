@@ -949,13 +949,17 @@ class TaskPipeline:
                         paths.append(path)
                     if len(paths) >= limit:
                         return paths
-            except Exception:  # noqa: BLE001 - an unbuilt index is not fatal
-                pass
+            except Exception as exc:  # noqa: BLE001 - an unbuilt index is not fatal
+                # Not fatal, but not silent either: a repo map that never built
+                # is why a run picks the wrong files, and the report must be able
+                # to say so instead of showing an empty slice with no reason.
+                self._degraded("repo_map", exc, "context")
         if paths:
             return paths[:limit]
         try:
             files = list(self.indexer.discover()) if self.indexer is not None else []
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            self._degraded("indexer_discover", exc, "context")
             return []
         words = {w.lower() for w in re.findall(r"[A-Za-z0-9_]{3,}",
                                                getattr(self, "_goal_hint", "") or "")}
@@ -1207,7 +1211,8 @@ class TaskPipeline:
 
             config = getattr(self.firewall, "config", None)
             paths = Extractor(config).extract(goal).paths
-        except Exception:  # noqa: BLE001 - extra context must never fail a run
+        except Exception as exc:  # noqa: BLE001 - extra context must never fail a run
+            self._degraded("slicer_keywords", exc, "context")
             return ""
         # The repository root comes from the pipeline's own config, NOT from the
         # firewall.  ``getattr(self.firewall, "config", None)`` is ``None``
@@ -1542,7 +1547,8 @@ class TaskPipeline:
 
             config = getattr(self.firewall, "config", None)
             paths = Extractor(config).extract(ctx.state.goal).paths
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            self._degraded("slicer_keywords", exc, "generation")
             return ""
         root = self._repo_root()
         named = [
@@ -1884,7 +1890,8 @@ class TaskPipeline:
             )
             try:
                 text = self._ask("code", prompt, ctx)
-            except Exception:  # noqa: BLE001 - a missing creation is reported, not fatal
+            except Exception as exc:  # noqa: BLE001 - a missing creation is reported, not fatal
+                self._degraded("focused_create", exc, "generation")
                 continue
             proposal = extract_diff(text)
             if proposal and ("/dev/null" in proposal or f"+++ b/{rel}" in proposal):
@@ -1910,7 +1917,8 @@ class TaskPipeline:
             from .fileblocks import extract_file_blocks
 
             blocks = extract_file_blocks(text)
-        except Exception:  # noqa: BLE001 - a parse failure just means "no blocks"
+        except Exception as exc:  # noqa: BLE001 - a parse failure just means "no blocks"
+            self._degraded("file_blocks", exc, "generation")
             return {}
         if not blocks:
             return {}
@@ -2481,7 +2489,11 @@ class TaskPipeline:
                     ["git", "show", f"HEAD:{path}"], cwd=root,
                     capture_output=True, text=True, timeout=20,
                 )
-            except Exception:  # noqa: BLE001 - no git, no baseline
+            except Exception as exc:  # noqa: BLE001 - no git, no baseline
+                # Without a baseline the public-symbol check cannot tell a
+                # removal from a rename, so it is skipped -- and the report must
+                # say the check did not run rather than imply it passed.
+                self._degraded("code_contract_baseline", exc, "settle")
                 continue
             if proc.returncode == 0:
                 before[str(path)] = proc.stdout
@@ -2896,8 +2908,12 @@ class TaskPipeline:
             state.note_degraded(
                 what=what, why=f"{type(exc).__name__}: {exc}", where=where
             )
-        except Exception:  # noqa: BLE001 - reporting must never fail a run
-            pass
+        except Exception as exc:  # noqa: BLE001 - reporting must never fail a run
+            # The degradation could not be recorded.  It must still not vanish:
+            # a run whose own reporting is broken is exactly the run whose
+            # failures need to be visible.
+            self._event("pipeline.degraded_unrecorded", run_id="",
+                        what=what, why=f"{type(exc).__name__}: {exc}", where=where)
 
     def _event(self, kind: str, **payload: Any) -> None:
         if self.metrics is not None:
@@ -3139,7 +3155,8 @@ class TaskPipeline:
         if child_test_runner is not None and hasattr(child_test_runner, "root"):
             try:
                 child_test_runner = type(child_test_runner)(worktree)
-            except Exception:  # noqa: BLE001 - a custom gate may not expose a cloneable type
+            except Exception as exc:  # noqa: BLE001 - a custom gate may not expose a cloneable type
+                self._degraded("child_test_runner", exc, "subagents")
                 child_test_runner = None
         child = TaskPipeline(
             config=child_config,
