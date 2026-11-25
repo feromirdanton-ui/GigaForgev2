@@ -985,6 +985,13 @@ def bench(
         int,
         typer.Option("--repeats", "-k", help="Independent attempts per task (pass@k)."),
     ] = 1,
+    live: Annotated[
+        bool,
+        typer.Option(
+            "--live",
+            help="Use the real provider instead of the scripted fake (nightly).",
+        ),
+    ] = False,
 ) -> None:
     """Run the offline benchmark suite across tasks.
 
@@ -1000,7 +1007,7 @@ def bench(
     """
     from gigaforge.bench import BenchRunner, bench_report, bench_report_json
 
-    runner = BenchRunner(repeats=repeats)
+    runner = BenchRunner(repeats=repeats, live=live)
     results = runner.run_all()
     if out:
         import json as _json

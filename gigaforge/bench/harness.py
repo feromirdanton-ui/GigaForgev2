@@ -755,6 +755,7 @@ class BenchRunner:
         work_root: Path | None = None,
         tasks: list[TaskFixture] | None = None,
         repeats: int = 1,
+        live: bool = False,
     ) -> None:
         self._work_root = work_root or Path("/tmp/gigaforge_bench")
         self._work_root.mkdir(parents=True, exist_ok=True)
@@ -764,6 +765,16 @@ class BenchRunner:
         #: measure pass@k, which is the only honest way to report a stochastic
         #: pipeline's reliability.
         self._repeats = max(1, int(repeats))
+        #: Use the real provider instead of the scripted fake.
+        #:
+        #: **Why both exist.**  The fake proves the *wiring*: the same config,
+        #: firewall, indexer and pipeline as the app, with a scripted model.  It
+        #: is fast, deterministic and runs on every push.  It cannot prove the
+        #: product works, because the model is a fixture — a prompt that the real
+        #: model cannot follow still passes.  The live mode is the only mode that
+        #: measures the thing the user experiences, so it runs nightly where a
+        #: slow, flaky, paid run is acceptable and a push-time gate is not.
+        self._live = bool(live)
 
     def run_all(self) -> list[BenchResult]:
         """Run every task fixture; return a list of BenchResult (one per task)."""
@@ -860,6 +871,14 @@ class BenchRunner:
         firewall = ContextFirewall(l0_store, config=FirewallConfig(repo_root=str(repo)))
 
         provider = BenchFakeGigaClient(fixture)
+        if self._live:
+            # The real client, built from the environment exactly as the CLI
+            # builds it.  A live bench that used a different construction path
+            # would measure a different product.
+            from gigaforge.client.client import GigaClient
+            from gigaforge.client.config import ClientConfig
+
+            provider = GigaClient(ClientConfig.from_env())
         client = SyncChatClient(provider)
         pipeline = TaskPipeline(config=cfg, client=client, firewall=firewall,
                                 indexer=indexer)
