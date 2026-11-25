@@ -128,22 +128,6 @@ class GenerationPlan:
         return [section.kind for section in self.sections]
 
 
-def is_page_goal(goal: str, repo_root: "Path | str | None" = None) -> bool:
-    """Deprecated alias for :func:`gigaforge.harness.task_kind.is_artifact_goal`.
-
-    Kept only so an external caller does not break.  The product does not call
-    it: routing is decided once, in ``classify_task``, and a second entry point
-    that answers the same question is a second source of truth — the review
-    found this one alive in the module while the product used the other, with
-    three tests still asserting on it.
-
-    New code must call ``classify_task`` and read ``TaskKind.is_artifact``.
-    """
-    from gigaforge.harness.task_kind import is_artifact_goal
-
-    return is_artifact_goal(goal, repo_root)
-
-
 def plan_generation(goal: str, existing_html: str = "") -> GenerationPlan:
     """Derive the artifact's shape from the goal, deterministically.
 
