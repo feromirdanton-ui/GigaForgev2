@@ -116,6 +116,35 @@ def test_a_markdown_path_is_never_quoted_as_source(tree) -> None:
     assert all(not p.endswith(".md") for p, _ in brief.grounding)
 
 
+def test_a_tree_under_a_skipped_directory_is_still_measured(tmp_path) -> None:
+    """The live defect: the run's copy lives under ``.gigaforge/``.
+
+    A goal run works in ``<repo>/.gigaforge/workspaces/<id>/project``.  The skip
+    list was applied to the ABSOLUTE path, so every file in the copy matched
+    ``.gigaforge`` and the whole tree was skipped: ``files: 0`` on a 400-file
+    repository, and no source quoted.  A skip list is about the tree being
+    measured, not about where that tree happens to live.
+    """
+    root = tmp_path / ".gigaforge" / "workspaces" / "g1" / "project"
+    (root / "gigaforge" / "core").mkdir(parents=True)
+    (root / "gigaforge" / "core" / "ladder.py").write_text("L0_DETERMINISTIC = 0\n")
+    (root / "a.py").write_text("x = 1\n")
+
+    brief = build_brief("Write a note to docs/design.md about the decision ladder",
+                        repo_root=root)
+    assert brief.file_count == 2
+    assert [p for p, _ in brief.grounding] == ["gigaforge/core/ladder.py"]
+
+
+def test_a_nested_skipped_directory_is_still_skipped(tmp_path) -> None:
+    """The fix must not stop skipping a real ``.venv`` inside the tree."""
+    (tmp_path / "a.py").write_text("x = 1\n")
+    (tmp_path / ".venv" / "lib").mkdir(parents=True)
+    (tmp_path / ".venv" / "lib" / "dep.py").write_text("y = 2\n")
+    brief = build_brief("Fix a.py", repo_root=tmp_path)
+    assert brief.file_count == 1
+
+
 def test_the_quote_is_capped(tree) -> None:
     """A brief is context, not a repository dump."""
     (tree / "gigaforge" / "core" / "huge.py").write_text("x = 1\n" * 50_000)

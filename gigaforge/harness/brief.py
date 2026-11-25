@@ -226,7 +226,15 @@ def _named_paths(goal: str, *, root: Path | None = None) -> list[str]:
 
 
 def _walk(root: Path, *, max_files: int) -> tuple[int, dict[str, int]]:
-    """Count files and languages, skipping the directories that are not source."""
+    """Count files and languages, skipping the directories that are not source.
+
+    The skip test is applied to the path **relative to the root**, not to the
+    absolute path.  Measured live: a goal run works in an isolated copy at
+    ``<repo>/.gigaforge/workspaces/<id>/project``, and the absolute path of
+    every file in it contains ``.gigaforge`` — so the whole copy was skipped and
+    the brief reported ``files: 0`` on a 400-file repository.  A skip list is
+    about the tree being measured, not about where that tree happens to live.
+    """
     skip = {
         ".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache",
         ".ruff_cache", ".mypy_cache", "dist", "build", ".gigaforge", ".tox",
@@ -240,9 +248,10 @@ def _walk(root: Path, *, max_files: int) -> tuple[int, dict[str, int]]:
         try:
             if not path.is_file():
                 continue
-        except OSError:
+            relative = path.relative_to(root)
+        except (OSError, ValueError):
             continue
-        if any(part in skip for part in path.parts):
+        if any(part in skip for part in relative.parts):
             continue
         count += 1
         language = _language_of(path)
@@ -305,8 +314,15 @@ def _grounding(
     #    names is the subject; the path it writes to is the output.
     try:
         for path in sorted(root.rglob("*.py")):
+            try:
+                relative = path.relative_to(root)
+            except ValueError:
+                continue
+            # Relative parts, not absolute: a goal run's copy lives under
+            # ``.gigaforge/workspaces/…``, so an absolute-path test skipped the
+            # entire tree and the brief quoted nothing.
             if any(part in {".git", ".venv", "node_modules", "tests"}
-                   for part in path.parts):
+                   for part in relative.parts):
                 continue
             if path.stem.lower() in words:
                 candidates.append(path)
