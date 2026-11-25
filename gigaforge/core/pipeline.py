@@ -1235,6 +1235,45 @@ class TaskPipeline:
                 "plan": ["Answer the question from the repository and the web."],
                 "plan_meta": {"strategy": "answer", "steps": 1, "answer": True},
             }
+        # An artifact goal has no file to target either: the page does not exist
+        # yet, and the ReAct planner demands a step naming an existing path, so
+        # it returned ``steps: 0`` and the run died in ``plan``.  Measured live
+        # on the site goal: cycle 1 failed the contract on a section name, then
+        # cycles 2 and 3 failed at ``plan`` with ``{'steps': 0}`` and the goal
+        # stopped with "the same output and failure repeated" — the second
+        # failure was the harness's own, not the model's.  The plan for a page
+        # is its sections, which ``plan_generation`` already decides.
+        kind = _task_kind_for(self, ctx)
+        if kind.is_artifact and not kind.is_code:
+            try:
+                from gigaforge.harness.generation import plan_generation
+
+                plan_obj = plan_generation(ctx.state.goal)
+                sections = list(getattr(plan_obj, "kinds", lambda: [])() or [])
+                path = str(getattr(plan_obj, "path", "") or "index.html")
+            except Exception as exc:  # noqa: BLE001 - fall back to the planner
+                self._degraded("generation_plan", exc, "plan")
+                sections, path = [], "index.html"
+            if sections:
+                self._event(
+                    "pipeline.plan_artifact",
+                    run_id=ctx.run_id,
+                    sections=sections,
+                    path=path,
+                    reason="a page decomposes into sections, not file edits",
+                )
+                return {
+                    "plan": [
+                        f"Build {path} section by section: " + ", ".join(sections)
+                    ],
+                    "plan_meta": {
+                        "strategy": "artifact",
+                        "steps": len(sections),
+                        "sections": sections,
+                        "path": path,
+                        "artifact": True,
+                    },
+                }
         if self.router is None:
             raise PipelineError("no model client is wired into the pipeline")
         slice_obj = inputs.get("slice")

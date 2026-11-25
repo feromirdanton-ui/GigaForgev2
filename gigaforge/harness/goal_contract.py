@@ -414,6 +414,29 @@ class Requirement:
                 and updates_expanded
                 and changes_menu_state
             )
+        if self.kind == "section":
+            # A section is identified by the *name* the plan gave it, and a
+            # model may carry that name in either attribute.  Measured live on
+            # the site goal: the assembler wrote ``<section id="features">``
+            # while the contract's needle was ``class="features"``, so a page
+            # with a complete, correct feature section failed with
+            # "section 'features'" — and the same failure repeated every cycle
+            # until the goal gave up.  The name is the fact; the attribute is
+            # not.  Both spellings are accepted, and the bare word is accepted
+            # as a last resort so a section named in prose still counts.
+            for needle in self.needles:
+                if needle in low:
+                    return True
+            for name in self.needles:
+                token = name.strip("\"'")
+                if not token or token.startswith("<") or ":" in token:
+                    continue
+                if re.search(
+                    rf"\b(?:class|id)\s*=\s*[\"'][^\"']*\b{re.escape(token)}\b",
+                    low,
+                ):
+                    return True
+            return False
         if self.kind == "section_heading":
             sections = re.findall(r"<section\b[^>]*>(.*?)</section\s*>", low, re.S)
             for section in sections:
