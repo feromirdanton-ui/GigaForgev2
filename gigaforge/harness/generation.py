@@ -683,6 +683,29 @@ def _drop_foreign_sections(fragment: str, kind: str, kinds: set[str]) -> str:
     return pattern.sub("", fragment).strip()
 
 
+def _looks_like_markup(fragment: str) -> bool:
+    """Does this fragment contain any HTML element at all?
+
+    Measured live on ``goal`` at HEAD e00dd90: the footer child answered in
+    Slim/HAML instead of HTML —
+
+        section.class=footer
+          h2
+            = "Join the Future"
+
+    — and the assembler pasted it in as text.  The page rendered the template
+    source as prose and had no footer at all, while every structural check
+    passed because the file was valid HTML *around* the garbage.
+
+    A fragment with no element is not markup.  The harness cannot translate an
+    arbitrary template language, and it must not ship the source: the plan
+    promised a footer, so the fallback fills it.
+    """
+    if not fragment:
+        return False
+    return bool(re.search(r"<[a-zA-Z][a-zA-Z0-9-]*\b[^>]*>", fragment))
+
+
 def _drop_dead_anchors(page: str) -> str:
     """Turn a link to a section that does not exist into plain text.
 
@@ -888,6 +911,10 @@ def assemble_page(
         fragment = _drop_foreign_sections(
             fragment, section.kind, {s.kind for s in plan.sections}
         )
+        # A child that answers in a template language (Slim/HAML/Pug) has not
+        # produced markup.  Shipping its source renders the template as prose.
+        if fragment and not _looks_like_markup(fragment):
+            fragment = ""
         if not fragment:
             # A planned section with no fragment used to be skipped silently, so
             # the page came out missing a part the plan promised.  Measured live

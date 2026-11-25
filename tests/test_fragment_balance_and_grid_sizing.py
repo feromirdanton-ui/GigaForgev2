@@ -238,3 +238,41 @@ def test_a_live_anchor_is_untouched():
 
     page = '<section id="a"><a href="#b">B</a></section><section id="b"></section>'
     assert _drop_dead_anchors(page) == page
+
+
+def test_a_template_language_answer_is_not_markup():
+    """A child that answers in Slim/HAML has not produced a section.
+
+    Measured live on ``goal``: the footer child answered
+
+        section.class=footer
+          h2
+            = "Join the Future"
+
+    and the assembler pasted it in as text — the page rendered the template
+    source as prose and had no footer, while every structural check passed.
+    """
+    from gigaforge.harness.generation import _looks_like_markup
+
+    assert not _looks_like_markup('section.class=footer\n  h2\n    = "Join"')
+    assert not _looks_like_markup("Here is your footer section.")
+    assert not _looks_like_markup("")
+    assert _looks_like_markup("<footer><p>x</p></footer>")
+
+
+def test_a_template_answer_falls_back_to_the_plan():
+    from gigaforge.harness.generation import assemble_page, plan_generation
+
+    plan = plan_generation(
+        "Create a single-file index.html: a cyberpunk landing page about "
+        "GigaForge with a hero, a feature grid of four cards, and a footer"
+    )
+    fragments = {
+        s.kind: f'<section class="{s.kind}"><h2>{s.kind}</h2>'
+        f"<p>{'Real content for this section. ' * 8}</p></section>"
+        for s in plan.sections
+    }
+    fragments["footer"] = 'section.class=footer\n  h2\n    = "Join"'
+    page = assemble_page(plan, fragments)
+    assert "section.class=footer" not in page
+    assert "<footer" in page
