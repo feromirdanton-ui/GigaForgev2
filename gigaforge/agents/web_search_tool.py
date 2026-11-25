@@ -38,7 +38,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
-from typing import Any
+from typing import Any, Mapping
 
 __all__ = ["WebSearchTool", "SearchBudget", "SearchCache", "SEARCH_CACHE"]
 
@@ -140,6 +140,75 @@ def _search_endpoints(query: str) -> list[str]:
         DEFAULT_SEARCH_URL.replace("{query}", encoded),
         DEFAULT_LITE_SEARCH_URL.replace("{query}", encoded),
     ]
+
+
+#: Wikipedia's search API.  It is the *first* provider, not a fallback, because
+#: it is the only keyless endpoint measured to work from this sandbox: the
+#: DuckDuckGo HTML endpoints answer ``HTTP 202`` with an anti-bot page and zero
+#: result links, so a search that relied on them alone reported "unavailable"
+#: for every query — measured live, the model then told the user "since
+#: web_search is unavailable, I cannot determine the current stable Python
+#: release".  The tool was not broken; its only provider was.
+WIKIPEDIA_SEARCH_URL = (
+    "https://en.wikipedia.org/w/api.php?action=query&list=search"
+    "&srsearch={query}&format=json&srlimit={limit}&srprop=snippet"
+)
+
+
+def _wikipedia_endpoint(query: str, limit: int = MAX_RESULTS) -> str:
+    return WIKIPEDIA_SEARCH_URL.replace(
+        "{query}", urllib.parse.quote_plus(query)
+    ).replace("{limit}", str(limit))
+
+
+def parse_wikipedia(payload: str) -> list[tuple[str, str, str]]:
+    """Read ``(title, url, snippet)`` out of a Wikipedia search response.
+
+    The snippet carries ``<span class="searchmatch">`` markup and HTML
+    entities; both are stripped, because the observation is read by a model and
+    raw markup is tokens spent on nothing.
+    """
+    import json as _json
+    import re as _re
+
+    try:
+        data = _json.loads(payload)
+    except (ValueError, TypeError):
+        return []
+    hits = ((data or {}).get("query") or {}).get("search") or []
+    results: list[tuple[str, str, str]] = []
+    for hit in hits:
+        title = str(hit.get("title") or "").strip()
+        if not title:
+            continue
+        snippet = _re.sub(r"<[^>]+>", "", str(hit.get("snippet") or ""))
+        snippet = _html.unescape(snippet).strip()
+        url = "https://en.wikipedia.org/wiki/" + urllib.parse.quote(title.replace(" ", "_"))
+        results.append((title, url, snippet[:MAX_SNIPPET]))
+    return results
+
+
+def _providers(query: str) -> list[tuple[str, Any]]:
+    """Endpoints to try, in order, each with its own parser.
+
+    The parsers differ by construction: Wikipedia answers JSON, the HTML
+    endpoints answer a page.  Pairing them here keeps "which endpoint" and "how
+    to read it" from drifting apart in ``run``.
+    """
+    configured = os.environ.get("GIGAFORGE_SEARCH_URL", "").strip()
+    if configured:
+        # A configured endpoint is the *only* endpoint.  Falling back to a
+        # public provider would send a deployment's queries to a third party it
+        # did not choose, which is a privacy decision the tool must not make on
+        # its own.  The documented contract is "overrides", and it is kept.
+        return [
+            (configured.replace("{query}", urllib.parse.quote_plus(query)), parse_results)
+        ]
+    providers: list[tuple[str, Any]] = [
+        (_wikipedia_endpoint(query), parse_wikipedia)
+    ]
+    providers.extend((endpoint, parse_results) for endpoint in _search_endpoints(query))
+    return providers
 
 
 class _ResultParser(HTMLParser):
@@ -282,8 +351,28 @@ class WebSearchTool:
             return response.read().decode(charset, errors="replace")
 
     # -- tool protocol -------------------------------------------------------
-    async def run(self, action_input: str, *, ctx: Any = None) -> str:
-        query = (action_input or "").strip()
+    @staticmethod
+    def _query_of(action_input: Any) -> str:
+        """The query, from either shape a caller sends.
+
+        The runner passes a **dict** when the model emits structured arguments
+        (``{"query": "..."}``) and a **string** otherwise.  ``run`` assumed a
+        string and called ``.strip()`` on whatever arrived, so a structured call
+        raised ``AttributeError: 'dict' object has no attribute 'strip'`` — the
+        tool was unreachable for exactly the call shape the prompt asks for.
+        """
+        if isinstance(action_input, Mapping):
+            for key in ("query", "q", "action_input", "text"):
+                value = action_input.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            # A dict with no recognisable key: join its values rather than
+            # discarding the call.
+            return " ".join(str(v) for v in action_input.values() if v).strip()
+        return str(action_input or "").strip()
+
+    async def run(self, action_input: Any, *, ctx: Any = None) -> str:
+        query = self._query_of(action_input)
         if not query:
             return "ERROR: web_search needs a query"
 
@@ -298,9 +387,15 @@ class WebSearchTool:
                 "not ask again."
             )
 
+        # Providers are tried in order, and the first one that parses wins.
+        # Wikipedia is first because it is the only keyless endpoint measured to
+        # answer from this sandbox (DuckDuckGo's HTML endpoints return HTTP 202
+        # with an anti-bot page); the HTML endpoints follow, and a deployment can
+        # put its own service ahead of both with ``GIGAFORGE_SEARCH_URL``.
         pages: list[str] = []
         errors: list[Exception] = []
-        for endpoint in _search_endpoints(query):
+
+        for endpoint, parser in _providers(query):
             try:
                 page = self._opener(endpoint, self.timeout)
             except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as exc:
@@ -310,7 +405,7 @@ class WebSearchTool:
                 return f"ERROR: web_search failed ({str(exc)[:120]}); continue without it."
 
             pages.append(page)
-            results = parse_results(page)
+            results = parser(page)
             if results:
                 text = format_results(query, results)
                 self.cache.put(query, text)
@@ -319,7 +414,7 @@ class WebSearchTool:
         if pages and any(
             marker in page.lower()
             for page in pages
-            for marker in ("no results found", "no results for", "class=\"no-results")
+            for marker in ("no results found", "no results for", 'class="no-results')
         ):
             text = format_results(query, [])
         elif errors and not pages:

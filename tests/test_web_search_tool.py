@@ -95,10 +95,14 @@ class TestBudget:
                              opener=opener)
         assert "Search results" in _run(tool, "one")
         assert "Search results" in _run(tool, "two")
+        before = len(calls)
         third = _run(tool, "three")
         assert third.startswith("ERROR")
         assert "budget exhausted" in third
-        assert len(calls) == 2, "the third call reached the network"
+        # The invariant is that the refused call reached *no* provider.  Counting
+        # absolute calls would encode how many providers exist, so a provider
+        # being added or removed would fail a test about the budget.
+        assert len(calls) == before, "the third call reached the network"
 
     def test_a_refusal_is_an_observation_not_an_exception(self) -> None:
         tool = WebSearchTool(budget=SearchBudget(max_calls=0), cache=SearchCache(),
@@ -124,8 +128,9 @@ class TestCache:
         tool = WebSearchTool(budget=SearchBudget(max_calls=5), cache=SearchCache(),
                              opener=opener)
         first = _run(tool, "gigaforge harness")
+        before = len(calls)
         second = _run(tool, "  GigaForge   Harness  ")
-        assert len(calls) == 1, "the cache did not absorb the repeat"
+        assert len(calls) == before, "the cache did not absorb the repeat"
         assert "cached" in second
         assert first.split("\n")[0] == second.split("\n")[0]
 
@@ -151,8 +156,9 @@ class TestCache:
         first = WebSearchTool(budget=SearchBudget(max_calls=3), opener=opener)
         second = WebSearchTool(budget=SearchBudget(max_calls=3), opener=opener)
         _run(first, "shared query")
+        before = len(calls)
         _run(second, "shared query")
-        assert len(calls) == 1
+        assert len(calls) == before
         SEARCH_CACHE.clear()
 
     def test_an_expired_entry_is_not_served(self) -> None:
@@ -222,6 +228,12 @@ class TestHonestDegradation:
     def test_default_search_falls_back_to_lite_when_primary_is_blocked(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """A blocked primary must not end the search.
+
+        The fallback chain is what keeps one dead provider from turning every
+        query into "unavailable" — the live failure mode when DuckDuckGo's HTML
+        endpoints began answering HTTP 202 with an anti-bot page.
+        """
         monkeypatch.delenv("GIGAFORGE_SEARCH_URL", raising=False)
         calls: list[str] = []
 
@@ -232,8 +244,7 @@ class TestHonestDegradation:
         tool = WebSearchTool(cache=SearchCache(), opener=opener)
         out = _run(tool, "lite fallback")
         assert "First Lite Result" in out
-        assert len(calls) == 2
-        assert "lite.duckduckgo.com" in calls[1]
+        assert "lite.duckduckgo.com" in calls[-1]
 
     def test_custom_search_endpoint_is_not_overridden(
         self, monkeypatch: pytest.MonkeyPatch
