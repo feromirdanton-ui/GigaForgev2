@@ -93,3 +93,20 @@ def test_a_goal_without_an_answer_reports_an_empty_string():
     ).to_dict()
     assert payload["answer"] == ""
     assert payload["answer_citations"] == []
+
+
+def test_the_langgraph_path_carries_the_answer():
+    """The graph the product actually runs must not drop the reply.
+
+    Measured live: ``pipeline.answer`` logged 20 chars, ``settle`` accepted,
+    and the goal record still had ``answer: None`` — the LangGraph cycle node
+    never copied the field into its state.  The classic GoalRunner did.
+    """
+    import inspect
+
+    from gigaforge.core import langgraph_goal
+
+    source = inspect.getsource(langgraph_goal)
+    assert '"answer": str(getattr(result, "answer"' in source
+    assert '"answer": str(values.get("answer")' in source
+    assert "answer: str" in inspect.getsource(langgraph_goal.GoalState)

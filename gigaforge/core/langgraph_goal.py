@@ -118,6 +118,11 @@ class GoalState(TypedDict, total=False):
     pending_diff: str
     verification: Optional[dict[str, Any]]
     approval: dict[str, Any]
+    #: The reply, when the goal asked for one.  A chat goal's output is a
+    #: sentence, not a diff; it has to survive the graph to reach the result.
+    answer: str
+    answer_citations: list[str]
+    answer_searched: bool
 
 
 def _writer() -> Callable[[dict[str, Any]], None]:
@@ -408,6 +413,14 @@ def build_goal_graph(
             "verification": None,
             "tokens": total_tokens,
             "calls": total_calls,
+            # The reply, when the goal asked for one.  This is the LangGraph
+            # path — the one the product actually runs — and it dropped the
+            # answer: measured live, "What is 2+2?" completed with
+            # ``answer: None`` while ``pipeline.answer`` had logged 20 chars.
+            # The classic GoalRunner carried it; this path did not.
+            "answer": str(getattr(result, "answer", "") or ""),
+            "answer_citations": list(getattr(result, "answer_citations", []) or []),
+            "answer_searched": bool(getattr(result, "answer_searched", False)),
             "updated_at": _now(),
         }
 
@@ -1036,6 +1049,9 @@ def run_goal_graph(
         "conversation_context": conversation_context,
         "workspace_root": str(values.get("workspace_root") or ""),
         "published_files": list(values.get("published_files") or []),
+        "answer": str(values.get("answer") or ""),
+        "answer_citations": list(values.get("answer_citations") or []),
+        "answer_searched": bool(values.get("answer_searched")),
         "engine": "langgraph",
     }
     if record["status"] == "running":
@@ -1108,4 +1124,7 @@ def _result_from_record(record: Mapping[str, Any]) -> GoalResult:
         error=str(record.get("error") or ""),
         workspace_root=str(record.get("workspace_root") or ""),
         published_files=list(record.get("published_files") or []),
+        answer=str(record.get("answer") or ""),
+        answer_citations=list(record.get("answer_citations") or []),
+        answer_searched=bool(record.get("answer_searched")),
     )
