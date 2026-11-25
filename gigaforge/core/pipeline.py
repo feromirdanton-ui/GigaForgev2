@@ -876,8 +876,44 @@ class TaskPipeline:
             ctx.state.note_degraded(
                 what="skills", why=f"{type(exc).__name__}: {exc}", where="prefix"
             )
+        # The brief is what the harness MEASURED about this task: which paths
+        # the goal names and whether they exist, the repository's shape, the
+        # test command, and whether the goal forbids changes.  Every line is a
+        # fact, so the model does not spend tokens guessing at the tree — and a
+        # wrong guess about the tree is the most expensive kind, because it
+        # produces an edit to a file that is not there.
+        brief_text = ""
+        try:
+            from gigaforge.harness.brief import build_brief, render_brief
+
+            kind_obj = None
+            try:
+                kind_obj = _task_kind_for(self, ctx)
+            except Exception:  # noqa: BLE001 - a brief must not fail a run
+                kind_obj = None
+            brief = build_brief(
+                str(ctx.task or ""),
+                repo_root=getattr(ctx, "worktree", None) or getattr(self, "repo_root", None),
+                task_kind=getattr(kind_obj, "kind", "") or "",
+                task_evidence=getattr(kind_obj, "evidence", "") or "",
+            )
+            brief_text = render_brief(brief)
+            self._event(
+                "pipeline.brief",
+                run_id=ctx.run_id,
+                task_kind=brief.task_kind,
+                named_paths=len(brief.named_paths),
+                files=brief.file_count,
+                test_command=brief.test_command,
+                read_only=brief.read_only,
+            )
+        except Exception as exc:  # noqa: BLE001 - the brief is an optimisation
+            ctx.state.note_degraded(
+                what="brief", why=f"{type(exc).__name__}: {exc}", where="prefix"
+            )
         ctx.state.prefix = build_system_prefix(
-            repo_map=repo_map, tool_contract=tool_contract, skills=skills_text
+            repo_map=repo_map, tool_contract=tool_contract, skills=skills_text,
+            extra={"brief": brief_text} if brief_text else None,
         )
         self._event(
             "pipeline.prefix",
