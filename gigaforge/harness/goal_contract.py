@@ -698,6 +698,35 @@ def extract_requirements(goal: str) -> list[Requirement]:
     return reqs
 
 
+def requested_card_count(goal: str) -> int:
+    """How many cards the goal asked for, or 0 when it did not say.
+
+    Measured live: the goal said "a features grid with 4 cards", the page
+    shipped three, and the contract passed it because the requirement was a
+    hard-coded "at least 3".  The number the user wrote is a fact about the
+    request, and the harness can read it without a model call.
+
+    Only a number attached to a card-ish noun counts, so "4 sections" or
+    "3 colours" does not become a card requirement.  A number above 24 is
+    ignored: it is a year, a price or a token count, not a grid.
+    """
+    text = (goal or "").lower()
+    if not text:
+        return 0
+    pattern = re.compile(
+        r"(?<![\d.])(\d{1,2})(?![\d.])\s*(?:[\w-]+\s+){0,2}?"
+        r"(?:cards?|tiles?|panels?|items?|columns?|boxes?)\b"
+    )
+    for match in pattern.finditer(text):
+        try:
+            value = int(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        if 1 <= value <= 24:
+            return value
+    return 0
+
+
 def requirements_from_plan(plan: Any) -> list[Requirement]:
     """The contract for a page goal, taken from the plan the harness itself made.
 
@@ -756,11 +785,23 @@ def requirements_from_plan(plan: Any) -> list[Requirement]:
         # ``.feature-card``.  The count is checked on the markup, and both
         # spellings are accepted — the harness must not fail a page over a
         # class name it did not fix.
+        #
+        # The *number* comes from the goal when the goal states one.  Measured
+        # live: the goal asked for "a features grid with 4 cards", the page
+        # shipped three, and the contract passed it — because the requirement
+        # was a hard-coded "at least 3".  A contract that ignores the number the
+        # user wrote is grading the harness's default, not the request.
+        wanted = requested_card_count(getattr(plan, "goal", "") or "")
         reqs.append(
             Requirement(
                 "card_count",
-                "at least 3 feature cards in the grid",
+                (
+                    f"at least {wanted} feature cards in the grid"
+                    if wanted
+                    else "at least 3 feature cards in the grid"
+                ),
                 ("feature-card", "feature-item", "card"),
+                minimum=wanted or 3,
             )
         )
     # A page has one footer and one header.  Measured live: a page assembled
@@ -1041,7 +1082,11 @@ def check_artifacts(
                     found = max(found, len(re.findall(
                         rf'class="[^"]*\b{re.escape(needle)}\b', text, re.I)))
                 best = max(best, found, _count_grid_children(text))
-            if best >= 3:
+            # The threshold is the number the goal asked for, not a constant.
+            # A page that ships three cards for a "4 cards" goal is short by
+            # one, and the contract must say so.
+            needed = int(req.minimum or 3)
+            if best >= needed:
                 verdict.met.append(req.label)
             else:
                 verdict.unmet.append(

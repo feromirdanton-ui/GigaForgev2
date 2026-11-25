@@ -102,6 +102,10 @@ class GenerationPlan:
     sections: list[SectionPlan] = field(default_factory=list)
     palette: tuple[str, ...] = ()
     title: str = ""
+    #: The goal this plan was made for.  The contract reads the *number* the
+    #: user wrote ("a grid with 4 cards") from it, so a page that ships three
+    #: is rejected instead of passing against the harness's default of three.
+    goal: str = ""
 
     @property
     def ok(self) -> bool:
@@ -195,7 +199,9 @@ def plan_generation(goal: str, existing_html: str = "") -> GenerationPlan:
         found = re.search(r"<title\b[^>]*>(.*?)</title\s*>", existing_html, re.S | re.I)
         if found and found.group(1).strip():
             title = found.group(1).strip()
-    return GenerationPlan(path=path, sections=sections, palette=palette, title=title)
+    return GenerationPlan(
+        path=path, sections=sections, palette=palette, title=title, goal=goal
+    )
 
 
 #: A top-level section of an existing page: ``<section class="hero">…</section>``,
