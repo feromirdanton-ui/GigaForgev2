@@ -542,7 +542,72 @@ def _strip_document_wrapper(fragment: str) -> str:
     text = re.sub(r"</?(?:html|head|body)\b[^>]*>", "", text, flags=re.I)
     text = re.sub(r"<meta\b[^>]*>", "", text, flags=re.I)
     text = re.sub(r"<title\b[^>]*>.*?</title\s*>", "", text, flags=re.S | re.I)
-    return text.strip()
+    return _balance_fragment(text.strip())
+
+
+#: Elements that never have a closing tag, so they must not be counted.
+_VOID_TAGS = frozenset(
+    {
+        "area", "base", "br", "col", "embed", "hr", "img", "input",
+        "link", "meta", "param", "source", "track", "wbr",
+    }
+)
+
+_TAG_RE_BALANCE = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9-]*)\b[^>]*?(/?)>", re.S)
+
+
+def _balance_fragment(fragment: str) -> str:
+    """Close the tags a child left open, and drop the ones it closed twice.
+
+    Measured live on the site goal: the hero child returned
+
+        <section class="hero"><div class="container">…</div></div>
+
+    — it closed the container twice and never closed the section.  The
+    assembler pasted that in verbatim, so the ``<section>`` stayed open for the
+    rest of the document: the features section and the footer became its
+    children, the hero measured 6232px tall, and the grid laid out at 56px per
+    card.  Every structural check passed, because the markup was *valid* — it
+    was just nested wrongly.
+
+    A fragment is a self-contained piece of markup, so the harness makes it one:
+    an unmatched closing tag is dropped, and a tag left open is closed at the
+    end.  This is not a parser and does not try to be; it is the invariant that
+    a fragment cannot leak its nesting into the page.
+    """
+    if not fragment:
+        return ""
+    # Comments and CDATA are not markup for this purpose.
+    cleaned = re.sub(r"<!--.*?-->", "", fragment, flags=re.S)
+    cleaned = re.sub(r"<!\[CDATA\[.*?\]\]>", "", cleaned, flags=re.S)
+    stack: list[str] = []
+    out: list[str] = []
+    cursor = 0
+    for match in _TAG_RE_BALANCE.finditer(cleaned):
+        out.append(fragment[cursor:match.start()])
+        cursor = match.end()
+        closing, name, self_closing = match.group(1), match.group(2).lower(), match.group(3)
+        if name in _VOID_TAGS or self_closing:
+            out.append(match.group(0))
+            continue
+        if closing:
+            if name in stack:
+                # Close everything opened after it, then it: a child that
+                # forgot an inner ``</div>`` still gets a balanced result.
+                while stack:
+                    top = stack.pop()
+                    out.append(f"</{top}>")
+                    if top == name:
+                        break
+            # An unmatched closing tag is dropped: it would close a tag the
+            # harness opened, which is how the hero swallowed the page.
+            continue
+        stack.append(name)
+        out.append(match.group(0))
+    out.append(fragment[cursor:])
+    while stack:
+        out.append(f"</{stack.pop()}>")
+    return "".join(out).strip()
 
 
 #: A unified-diff header, a hunk header, or a ``--- a/…``/``+++ b/…`` pair.
@@ -610,6 +675,39 @@ def _layout_invariants() -> str:
         ".feature-grid > *, .features-grid > *, .features > * {\n"
         "    min-width: 0;\n"
         "    overflow-wrap: anywhere;\n"
+        "}\n"
+        # A child model that has seen Bootstrap writes its own container names:
+        # measured live, the section child emitted ``<div class="grid">`` and
+        # its own ``.grid { display: flex }`` rule, which came AFTER the
+        # harness's earlier ``.grid`` rule and won.  The page reported four
+        # cards and laid them out in one row.  The invariant has to be stated
+        # in the block that is emitted last, or it is not an invariant.
+        ".grid, .row {\n"
+        "    display: grid !important;\n"
+        "    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)) !important;\n"
+        "    gap: 1.5rem;\n"
+        "    width: 100%;\n"
+        "}\n"
+        ".grid > *, .row > * {\n"
+        "    min-width: 0;\n"
+        "    overflow-wrap: anywhere;\n"
+        "}\n"
+        # A card inside a grid is sized by the grid, not by its own width.  A
+        # child that has seen a float/flex layout writes
+        # ``.feature-card { width: calc(25% - 20px) }``; inside a grid that
+        # resolves against the *column*, so four cards measured 56px wide and
+        # 2708px tall — the page "had four cards" and was unreadable.  The
+        # harness owns the sizing of a grid item; the child owns its look.
+        ".feature-grid > *, .features-grid > *, .features > *,\n"
+        ".grid > *, .row > * {\n"
+        "    width: auto !important;\n"
+        "    max-width: none !important;\n"
+        "    flex: none !important;\n"
+        "}\n"
+        '[class*="col-"] {\n'
+        "    min-width: 0;\n"
+        "    width: auto !important;\n"
+        "    max-width: none !important;\n"
         "}\n"
     )
 
