@@ -312,6 +312,10 @@ class TaskPipeline:
         self.memory = memory
         self.optimizer = optimizer
         self.clock: Clock = clock or SystemClock()
+        #: Measured system prefixes by run id.  The ReAct runner is built with a
+        #: fresh ``TaskState`` and cannot see the pipeline's, so the brief and
+        #: the skills are published here for it to pick up.
+        self._prefixes: dict[str, Any] = {}
         self.indexer = indexer if indexer is not None else index
         self.index = self.indexer
         self.git = git
@@ -956,6 +960,15 @@ class TaskPipeline:
             repo_map=repo_map, tool_contract=tool_contract, skills=skills_text,
             extra={"brief": brief_text} if brief_text else None,
         )
+        # The ReAct runner is built with a fresh ``TaskState`` and cannot see
+        # this one, so the prefix is published by run id for it to pick up.
+        # ``getattr`` rather than ``self._prefixes``: a pipeline assembled
+        # without ``__init__`` (tests, and any future partial construction)
+        # must still build a prefix rather than fail on a missing attribute.
+        registry = getattr(self, "_prefixes", None)
+        if registry is None:
+            registry = self._prefixes = {}
+        registry[ctx.run_id] = ctx.state.prefix
         self._event(
             "pipeline.prefix",
             run_id=ctx.run_id,
@@ -1231,6 +1244,17 @@ class TaskPipeline:
                 owners[symbol] = scores[0][1]
         return owners
 
+    def _prefix_for(self, run_id: str) -> Any:
+        """The measured prefix for *run_id*, or ``None`` when none was built.
+
+        A missing prefix is not an error: a run that never reached intake has
+        nothing measured to deliver, and the ReAct loop composes a prompt
+        without it.
+        """
+        if not run_id:
+            return None
+        return (getattr(self, "_prefixes", None) or {}).get(run_id)
+
     def _build_react_runner(
         self,
         goal: str = "",
@@ -1289,6 +1313,20 @@ class TaskPipeline:
         # the DAG's run id goes there — a synthetic id would split one run's
         # trace across two files.
         runner.state = TaskState(goal=goal, task_id=run_id or "react-plan")
+        # The runner's state is a FRESH ``TaskState``, so its ``prefix`` is
+        # ``None`` — and the measured brief, the skills and the repo map live on
+        # the pipeline's own state prefix.  Measured live: a document goal about
+        # the decision ladder produced a confident, entirely invented
+        # description of it while a 17 324-character prefix quoting
+        # ``core/ladder.py`` was built and never delivered.  The tokens were
+        # paid for and thrown away.
+        #
+        # The prefix is looked up by run id rather than passed in because the
+        # strategy factories that build this runner are constructed before the
+        # run exists; the registry is filled by ``_build_prefix`` at intake.
+        prefix = self._prefix_for(run_id)
+        if prefix is not None:
+            runner.state.prefix = prefix
         runner.ctx = ReActContext(
             repo_root=root,
             worktree=root,

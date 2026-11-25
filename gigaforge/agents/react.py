@@ -1764,6 +1764,19 @@ class ReActRunner:
         except ValueError:
             log.warning("unknown GIGAFORGE_HARNESS_PROFILE=%r; using native_fs", variant)
             harness = build_harness_prompt("native_fs", tool_names=sorted(self._registry.names()))
+        # The harness's measured prefix — the task brief (which paths the goal
+        # names, the repository's shape, the test command) and the selected
+        # skills — lives on ``state.prefix.text``.  This loop never read it: it
+        # serialised only ``serialize_prefix()``, a three-key dict of goal, plan
+        # and slice hash.  Measured live: a document goal about the decision
+        # ladder produced a confident, entirely invented description of it
+        # ("L0: Initial Assessment") while the brief, which quoted
+        # ``core/ladder.py`` verbatim, sat unread in the state.  The tokens were
+        # paid for and never delivered.
+        measured = ""
+        prefix_obj = getattr(state, "prefix", None)
+        if prefix_obj is not None:
+            measured = str(getattr(prefix_obj, "text", "") or "")
         parts = [
             harness,
             _REACT_PROMPT,
@@ -1779,6 +1792,10 @@ class ReActRunner:
             "\"action_input\": \"[{\\\"tool\\\": \\\"edit_function\\\", \\\"args\\\": {...}}]\"} "
             "with whatever you have learned \u2014 an empty plan is a failed episode.",
         ]
+        if measured:
+            # Placed after the step contract and before the task: the model
+            # reads the rules, then the measurements, then what to do.
+            parts.append(measured)
         if read_only:
             parts.append(
                 "Read-only planning episode: only grep, read_file, read_structure, and "
