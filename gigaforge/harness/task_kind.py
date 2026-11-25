@@ -76,6 +76,12 @@ __all__ = ["TaskKind", "classify_task", "is_artifact_goal", "PAGE_PHRASES"]
 #: Suffixes that mean "this is a rendered artifact, not source code".
 _ARTIFACT_SUFFIXES = frozenset({".html", ".htm", ".css"})
 
+#: Suffixes that mean "the deliverable is a document, not a diff".  A goal that
+#: names one of these asks for prose in a file; the run's product is the file's
+#: text, and grading it as a patch is what made "Write a design document in
+#: docs/design.md" die in the planner with ``steps: 0``.
+_DOCUMENT_SUFFIXES = frozenset({".md", ".markdown", ".rst", ".txt", ".adoc"})
+
 #: Suffixes worth resolving against the tree.  A path the goal names that is
 #: not in this set is ignored rather than guessed at.
 _KNOWN_SUFFIXES = frozenset(
@@ -154,7 +160,9 @@ PAGE_PHRASES: tuple[str, ...] = (
 class TaskKind:
     """The harness's verdict about what a goal asks for, with its evidence."""
 
-    kind: Literal["code", "artifact", "artifact_edit", "mixed"]
+    kind: Literal[
+        "code", "artifact", "artifact_edit", "mixed", "answer", "analysis", "document"
+    ]
     #: Artifact paths the goal names that are **absent** from the repository.
     artifact_paths: tuple[str, ...] = ()
     #: Artifact paths the goal names that **exist** in the repository — the
@@ -192,6 +200,45 @@ class TaskKind:
         failed at ``plan`` with ``steps: 0``.
         """
         return self.kind == "answer"
+
+    @property
+    def is_analysis(self) -> bool:
+        """True when the goal reads existing code and reports on it.
+
+        The answer dimension was added for chat and never for code: "Analyse
+        calc.py and tell me what is wrong with it" names an existing file, so it
+        classified as ``code``, and the planner demanded an executable step with
+        a target file.  There is no such step — the correct output is a
+        diagnosis — so the run died at ``plan`` with ``steps: 0`` after the
+        model had already produced a useful answer.
+
+        An analysis goal is read-only: it may read the tree, it must not write
+        to it, and its product is text.
+        """
+        return self.kind == "analysis"
+
+    @property
+    def is_document(self) -> bool:
+        """True when the deliverable is a document's text, not a patch."""
+        return self.kind == "document"
+
+    @property
+    def is_read_only(self) -> bool:
+        """True when the run must not change the tree."""
+        return self.kind in ("answer", "analysis")
+
+    @property
+    def is_text_product(self) -> bool:
+        """True when the deliverable is prose, not a diff.
+
+        Both a chat reply and a code diagnosis end in text.  They share the
+        executor (an episode with repository tools and ``web_search``), the
+        validator (a non-empty reply, citations when it searched) and the
+        settlement (no changed files required).  They differ only in the plan
+        sentence, which is why this is one property and not two branches in
+        four places.
+        """
+        return self.kind in ("answer", "analysis")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -359,6 +406,7 @@ def classify_task(goal: str, repo_root: Path | str | None = None) -> TaskKind:
     artifact_paths: list[str] = []
     edit_paths: list[str] = []
     code_paths: list[str] = []
+    document_paths: list[str] = []
     unresolved: list[str] = []
 
     for rel in named:
@@ -368,7 +416,13 @@ def classify_task(goal: str, repo_root: Path | str | None = None) -> TaskKind:
             exists = bool(root is not None and (root / rel).is_file())
         else:
             exists = tracked
-        if exists and suffix in _ARTIFACT_SUFFIXES:
+        if suffix in _DOCUMENT_SUFFIXES:
+            # A document is its own product: the run writes prose into the file
+            # and the file's text is what gets graded.  Treating it as code sent
+            # it to the planner, which demanded an executable step with a target
+            # file and died with ``steps: 0``.
+            document_paths.append(rel)
+        elif exists and suffix in _ARTIFACT_SUFFIXES:
             # An artifact that is already in the repository: the run is asked
             # to change it.  This is ``artifact_edit``, not ``code`` — see the
             # module docstring for the measured consequence of conflating them.
@@ -385,8 +439,14 @@ def classify_task(goal: str, repo_root: Path | str | None = None) -> TaskKind:
         else:
             unresolved.append(rel)
 
-    if artifact_paths and (code_paths or edit_paths):
-        kind: Literal["code", "artifact", "artifact_edit", "mixed", "answer"] = "mixed"
+    if document_paths and not (artifact_paths or edit_paths or code_paths):
+        kind = "document"
+        evidence = (
+            "goal names document path(s), so the deliverable is the file's text: "
+            + ", ".join(document_paths)
+        )
+    elif artifact_paths and (code_paths or edit_paths):
+        kind = "mixed"
         evidence = (
             "goal names artifact path(s) absent from the repo "
             f"({', '.join(artifact_paths)}) and existing path(s) "
@@ -411,8 +471,26 @@ def classify_task(goal: str, repo_root: Path | str | None = None) -> TaskKind:
             "page is being edited: " + ", ".join(edit_paths)
         )
     elif code_paths:
-        kind = "code"
-        evidence = "goal names path(s) that exist in the repo: " + ", ".join(code_paths)
+        # An existing code path plus a question and no mutating verb is a
+        # *diagnosis*, not a patch.  "Analyse calc.py and tell me what is wrong"
+        # names a file, so it used to classify as code and die in the planner
+        # demanding an executable step that does not exist.
+        low = (goal or "").lower()
+        negated = low
+        for phrase in _NO_CHANGE_PHRASES:
+            negated = negated.replace(phrase, " ")
+        mutating = next((v for v in _MUTATING_VERBS if v in negated), "")
+        asking = next((p for p in _ANSWER_PHRASES if p in low), "")
+        if asking and not mutating:
+            kind = "analysis"
+            evidence = (
+                "goal names existing code (" + ", ".join(code_paths) + ") and "
+                f"asks {asking!r} without a mutating verb: the run reads and "
+                "reports, it does not patch"
+            )
+        else:
+            kind = "code"
+            evidence = "goal names path(s) that exist in the repo: " + ", ".join(code_paths)
     else:
         low = (goal or "").lower()
         phrase = next((p for p in PAGE_PHRASES if p in low), "")

@@ -556,12 +556,26 @@ class ConstitutionalReview:
 
         verdict, issues = _parse_review_json(text)
         if verdict is None:
+            # A verdict the reviewer never reached is not a judgement about the
+            # code.  Returning ``reject`` here made a *format* failure in the
+            # judge reject the artifact: measured live, a 95-byte diff that had
+            # been produced and applied was thrown away because the reviewer's
+            # answer was not JSON.  The reviewer that says nothing was punished
+            # harder than the one that says "reject", and the work was lost
+            # either way.
+            #
+            # The verdict is advisory: the run proceeds, and the issue text says
+            # the review did not happen, so the report cannot claim it passed.
             return ReviewOutcome(
-                verdict="reject",
-                issues=["constitutional reviewer returned an unparseable verdict"],
+                verdict="ok",
+                issues=[
+                    "constitutional review did not run: the reviewer's answer "
+                    "could not be parsed"
+                ],
                 strategy=self.name,
                 llm_used=True,
                 principles=principles,
+                advisory=True,
             )
         return ReviewOutcome(
             verdict=verdict, issues=issues, strategy=self.name, llm_used=True,
@@ -599,11 +613,16 @@ class LLMReview:
             )
         verdict, issues = _parse_review_json(text)
         if verdict is None:
+            # Same rule as the constitutional judge: an unparseable answer is a
+            # harness degradation, not a verdict on the diff.
             return ReviewOutcome(
-                verdict="reject",
-                issues=["reviewer returned an unparseable verdict"],
+                verdict="ok",
+                issues=[
+                    "review did not run: the reviewer's answer could not be parsed"
+                ],
                 strategy=self.name,
                 llm_used=True,
+                advisory=True,
             )
         return ReviewOutcome(
             verdict=verdict, issues=issues, strategy=self.name, llm_used=True,

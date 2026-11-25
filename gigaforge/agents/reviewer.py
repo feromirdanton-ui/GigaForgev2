@@ -47,10 +47,19 @@ class ReviewVerdict(BaseModel):
 
     ``verdict`` is either ``"ok"`` (approve the diff) or ``"reject"`` (the
     pipeline retries the Coder with the issues as the rejection reason).
+
+    ``advisory`` marks a verdict the reviewer did not actually reach: its answer
+    could not be parsed, so the harness is reporting a *format failure*, not a
+    judgement about the code.  Such a verdict must not reject the work — see
+    :meth:`ConstitutionalReviewer.review` for why punishing the artifact for the
+    reviewer's syntax error is the wrong incentive — but it must also not be
+    presented as a clean approval, which is what the flag is for.
     """
 
     verdict: Verdict
     issues: list[str] = Field(default_factory=list)
+    #: True when the verdict is a degradation, not a review.
+    advisory: bool = False
 
 
 class ReviewerAgent:

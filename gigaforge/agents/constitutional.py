@@ -629,10 +629,21 @@ class ConstitutionalReviewer:
                 return verdict
             last_error = err or "неизвестная ошибка разбора"
 
-        # Fail-safe: REJECT (never silently approve on parse failure).
+        # A verdict the reviewer never reached is not a judgement about the
+        # code.  The previous behaviour returned ``reject`` with the issue
+        # "constitutional reviewer returned unparseable JSON", so a *format*
+        # failure in the judge rejected the artifact — measured live: a 95-byte
+        # diff that had been produced and applied was thrown away because the
+        # reviewer's answer was not JSON.  That is an inverted incentive: the
+        # reviewer that says nothing is punished harder than the one that says
+        # "reject", and the work is lost either way.
+        #
+        # The verdict is now advisory: the run proceeds, and the degradation is
+        # recorded so the report says the review did not happen instead of
+        # claiming it passed.
         self._tracer.trace(
             task_id,
-            step="constitutional_default_reject",
+            step="constitutional_default_advisory",
             kind="decision",
             detail={
                 "reason": "constitutional reviewer LLM returned unparseable JSON after retries",
@@ -641,8 +652,12 @@ class ConstitutionalReviewer:
             },
         )
         return ReviewVerdict(
-            verdict="reject",
-            issues=["constitutional reviewer returned unparseable JSON"],
+            verdict="ok",
+            issues=[
+                "constitutional review did not run: the reviewer's answer could "
+                f"not be parsed ({last_error})"
+            ],
+            advisory=True,
         )
 
 

@@ -90,10 +90,24 @@ def test_the_prefix_contains_the_selected_skills(tree) -> None:
 
 
 def test_the_prefix_is_substantially_larger_than_the_bare_persona(tree) -> None:
-    """The measured symptom: 2 742 chars where ~9 500 were expected."""
+    """The measured symptom: 2 742 chars where ~9 500 were expected.
+
+    The threshold is deliberately *not* a magic number copied from one run.
+    What the defect produced was a prefix with the persona and nothing else, so
+    the invariant is "the brief and the skills are in there, and they are the
+    bulk of it" — a length floor alone would go stale every time a skill's
+    wording changed, which is exactly what happened when ``document`` became its
+    own task class and stopped inheriting the code skill.
+    """
     ctx = _Ctx("Write a design note to docs/design.md explaining the decision ladder")
     _pipeline(tree)._build_prefix(ctx)
-    assert len(ctx.state.prefix.text) > 3_000
+    text = ctx.state.prefix.text
+    persona = text.split("## rules")[0]
+    assert "## Task brief" in text
+    assert "## Skill:" in text
+    # The brief and skills must be a real share of the prefix, not a stub.
+    assert len(text) - len(persona) > 1_500, len(text)
+    assert len(text) > 2_500, len(text)
 
 
 def test_a_ctx_without_a_worktree_attribute_still_works(tree) -> None:

@@ -1372,12 +1372,26 @@ class TaskPipeline:
         # ``steps: 0`` and the run died here — measured live on "What is 2+2?
         # Answer in chat, do not change any files."  The plan for a reply is the
         # reply itself, produced by the episode in ``act``.
-        if _task_kind_for(self, ctx).is_answer:
+        kind_for_plan = _task_kind_for(self, ctx)
+        if kind_for_plan.is_text_product:
+            # A diagnosis is a text product too: "Analyse calc.py and tell me
+            # what is wrong" names an existing file, so it used to classify as
+            # code and die here demanding an executable step that does not
+            # exist.  The plan for a text product is the sentence that says what
+            # to produce; the episode in ``act`` produces it.
+            sentence = (
+                "Read the named code and report what is wrong with it, with "
+                "file and line references."
+                if kind_for_plan.is_analysis
+                else "Answer the question from the repository and the web."
+            )
             self._event("pipeline.plan_answer", run_id=ctx.run_id,
-                        reason="the goal asks for a reply, not a change to the tree")
+                        reason="the goal asks for a reply, not a change to the tree",
+                        task_kind=kind_for_plan.kind)
             return {
-                "plan": ["Answer the question from the repository and the web."],
-                "plan_meta": {"strategy": "answer", "steps": 1, "answer": True},
+                "plan": [sentence],
+                "plan_meta": {"strategy": kind_for_plan.kind, "steps": 1,
+                              "answer": True, "read_only": True},
             }
         # An artifact goal has no file to target either: the page does not exist
         # yet, and the ReAct planner demands a step naming an existing path, so
@@ -2417,7 +2431,7 @@ class TaskPipeline:
         # for "diff could not be parsed".  The episode is the right executor: it
         # has the repository tools AND ``web_search``, and its ``finish`` prose
         # is the deliverable.
-        if _task_kind_for(self, ctx).is_answer:
+        if _task_kind_for(self, ctx).is_text_product:
             return self._answer_proposal(ctx)
 
         slice_obj = inputs.get("slice")
@@ -2914,7 +2928,7 @@ class TaskPipeline:
         # An answer is validated on its own terms: a non-empty reply, and — when
         # the episode searched — at least one citation that came from a real
         # observation.  Demanding a diff here is what made every reply fail.
-        if _task_kind_for(self, ctx).is_answer:
+        if _task_kind_for(self, ctx).is_text_product:
             return {"validation": self._validate_answer(ctx, proposal)}
         if not diff:
             return {"validation": ValidateResult(accepted=False, reason="no diff to validate")}
@@ -3388,7 +3402,7 @@ class TaskPipeline:
         # below all ask "is the tree right?", which is not a question a reply
         # can answer: running them would reject every answer for having no
         # changed files.
-        if _task_kind_for(self, ctx).is_answer:
+        if _task_kind_for(self, ctx).is_text_product:
             answer = str(ctx.extras.get("answer_text") or "")
             self._event(
                 "pipeline.settle_answer", run_id=ctx.run_id,
