@@ -51,6 +51,18 @@ _STRAY_STYLE_TAG_RE = re.compile(r"</?style\b[^>]*>", re.I)
 _BODY_RE = re.compile(r"<body\b[^>]*>(.*?)</body\s*>", re.S | re.I)
 _HEAD_RE = re.compile(r"<head\b[^>]*>(.*?)</head\s*>", re.S | re.I)
 _HTML_CLOSE_RE = re.compile(r"</html\s*>", re.I)
+#: A second document start.  A ``<!DOCTYPE`` or an ``<html`` tag appearing
+#: *after* the first ``</html>`` means two whole documents were concatenated
+#: rather than one page being edited — see :func:`_split_concatenated_documents`.
+_DOC_START_RE = re.compile(r"<!DOCTYPE\s+html\b|<html\b", re.I)
+#: An ``<html`` open tag.  Used to find document boundaries: a doctype can be
+#: split across lines (``<!`` / ``DOCTYPE html>``, measured live), so it is not
+#: a reliable boundary marker, while ``<html`` is.
+_HTML_OPEN_RE = re.compile(r"<html\b", re.I)
+#: A doctype broken by a newline between ``<!`` and ``DOCTYPE``.  Browsers
+#: tolerate it, but it is not a doctype, and a page without one renders in
+#: quirks mode — so it is repaired rather than left.
+_SPLIT_DOCTYPE_RE = re.compile(r"<!\s*\n\s*DOCTYPE\s+html\s*>", re.I)
 _ID_ATTRIBUTE_RE = re.compile(
     r"""(?<![\w:-])id\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))""",
     re.I,
@@ -483,6 +495,96 @@ def _remove_spans(html: str, spans: list[tuple[int, int]]) -> str:
     return out
 
 
+def _document_spans(html: str) -> list[tuple[int, int, str]]:
+    """Every whole document in *html*, as ``(start, end, text)``.
+
+    A document runs from its ``<html`` to its ``</html>`` (or the end of the
+    text when the close is missing).  Text *before* the first ``<html`` belongs
+    to that first document — a doctype, a comment — and is **not** a document of
+    its own.
+
+    That distinction is the whole point: the first version emitted the leading
+    text as its own span, so a page whose doctype was split across two lines
+    (``<!`` / ``DOCTYPE html>``, measured live) produced three spans, the first
+    of which had no ``<body>``, and the merge bailed out with "nothing to merge
+    into safely" — leaving the two documents exactly as they were.
+    """
+    starts = [m.start() for m in _HTML_OPEN_RE.finditer(html)]
+    if not starts:
+        return [(0, len(html), html)] if html.strip() else []
+    spans: list[tuple[int, int, str]] = []
+    for index, start in enumerate(starts):
+        next_start = starts[index + 1] if index + 1 < len(starts) else len(html)
+        close = _HTML_CLOSE_RE.search(html, start)
+        end = close.end() if close and close.end() <= next_start else next_start
+        # The first document owns everything before it.
+        begin = 0 if index == 0 else start
+        spans.append((begin, end, html[begin:end]))
+    return spans
+
+
+def _dedupe_documents(html: str) -> tuple[str, list[str]]:
+    """Reduce *html* to one document, keeping every section.
+
+    **The defect this repairs.**  A model asked to add a section sometimes
+    answers with a *whole new page* rather than a fragment.  The assembler
+    concatenated it, so the file held two ``<!DOCTYPE>``s, three ``<head>``
+    starts and two complete stylesheets — measured live on the cyberpunk
+    landing page:
+
+        head count: 3   style count: 2   (two full documents, 4186 bytes)
+
+    Every check failed on it: "2 stray <style> tag(s) outside <head>", "2
+    <head> elements on one page", "1403 characters of CSS are rendered as
+    text", "2 <style> blocks (expected 1)".
+
+    The repair keeps the **first** document as the page — its head, its
+    stylesheet, its structure — and merges the *body content* of every later
+    document into the first body.  Content is never dropped: a later document's
+    sections are exactly what the model was asked to produce.  Later documents'
+    head material (``<title>``, ``<meta>``) is dropped, because a page has one
+    of each and the first document already provides them.
+    """
+    spans = _document_spans(html)
+    if len(spans) < 2:
+        return html, []
+    actions: list[str] = []
+    head_text = spans[0][2]
+    body_match = _BODY_RE.search(head_text)
+    if not body_match:
+        # No body in the first document: nothing to merge into safely.
+        return html, []
+    merged_body = body_match.group(1).rstrip()
+    extras: list[str] = []
+    for _start, _end, text in spans[1:]:
+        later = _BODY_RE.search(text)
+        if later and later.group(1).strip():
+            extras.append(later.group(1).strip())
+        else:
+            # A later document with no <body> of its own: take whatever is not
+            # its head material.
+            stripped = _HEAD_RE.sub("", text)
+            stripped = _DOC_START_RE.sub("", stripped)
+            stripped = _HTML_CLOSE_RE.sub("", stripped)
+            if stripped.strip():
+                extras.append(stripped.strip())
+    if not extras:
+        return html, []
+    joined = "\n".join(extras)
+    out = (
+        head_text[: body_match.start(1)]
+        + merged_body
+        + "\n"
+        + joined
+        + "\n"
+        + head_text[body_match.end(1):]
+    )
+    actions.append(
+        f"merged {len(spans) - 1} concatenated document(s) into one page"
+    )
+    return out, actions
+
+
 def repair_html_structure(html: str) -> tuple[str, list[str]]:
     """Fix the structural defects that have exactly one correct repair.
 
@@ -504,6 +606,20 @@ def repair_html_structure(html: str) -> tuple[str, list[str]]:
     """
     actions: list[str] = []
     out = html
+
+    # 0. Two whole documents concatenated.  This runs first because it changes
+    # the structure every later step reasons about: while two documents are
+    # present, the head and body regexes match the wrong one, so the later
+    # repairs would "fix" a page that is still two pages.
+    out, merged = _dedupe_documents(out)
+    actions.extend(merged)
+
+    # 0b. A doctype split across lines is not a doctype, and a page without one
+    # renders in quirks mode.  Measured live: the model emitted "<!" then
+    # "DOCTYPE html>" on the next line.
+    if _SPLIT_DOCTYPE_RE.search(out):
+        out = _SPLIT_DOCTYPE_RE.sub("<!DOCTYPE html>", out, count=1)
+        actions.append("repaired a doctype split across lines")
 
     # 1. A stylesheet appended after </html> cannot participate in the page
     # head. Models commonly do this when an edit misses </style>; move only a
