@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 from gigaforge.agents.observation_cache import CACHEABLE_TOOLS, READ_ONLY_TOOLS
@@ -31,11 +32,28 @@ def test_read_is_bounded_and_reports_truncation(tmp_path: Path) -> None:
 
 
 def test_refuses_paths_outside_the_worktree(tmp_path: Path) -> None:
+    """A traversal attempt must never read the file outside the worktree.
+
+    The first version of this test hard-coded ``..\\name``.  On POSIX that is a
+    *filename* containing a backslash, not a path upwards, so the guard never
+    fired, the tool answered "file not found", and the test failed on Linux —
+    which is what CI runs.  The test asserted a Windows-only spelling of the
+    attack instead of the invariant.
+
+    The invariant is platform-independent: whatever the separator, the bytes
+    outside the worktree are not returned.  Both spellings are checked, and the
+    native one must be refused *as a traversal* rather than merely not found.
+    """
     outside = tmp_path.parent / f"{tmp_path.name}-outside.txt"
     outside.write_text("private", encoding="utf-8")
     try:
-        result = _read(ReadFileTool(), tmp_path, f"..\\{outside.name}")
-        assert "refusing to read outside the worktree" in result
+        for attempt in (f"../{outside.name}", f"..\\{outside.name}"):
+            result = _read(ReadFileTool(), tmp_path, attempt)
+            assert "private" not in result, f"{attempt!r} leaked the file"
+        native = f"..{os.sep}{outside.name}"
+        assert "refusing to read outside the worktree" in _read(
+            ReadFileTool(), tmp_path, native
+        )
     finally:
         outside.unlink(missing_ok=True)
 

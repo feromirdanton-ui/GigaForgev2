@@ -59,6 +59,7 @@ from .dag import CheckpointStore, DagExecutor, DagResult
 from .errors import CoreError, PipelineError
 from .fixloop import FixIteration, FixLoop, FixLoopResult
 from .metrics import MetricsCollector
+from ..harness.diff_parse import normalise_path, split_diff
 from .prompt import build_phase_prompt, extract_diff
 from .router import ModelRouter
 from .state import TaskState
@@ -3989,103 +3990,58 @@ def _parse_plan(text: str) -> list[str]:
 
 
 def _drop_hunks_for(diff: str, paths: set[str]) -> str:
-    """Remove every ``diff --git`` hunk that touches one of *paths*.
+    """Remove every file block that touches one of *paths*.
 
     Used for files the harness wrote itself: the assembled page is authoritative,
     and a model diff for the same path would edit a file the harness just built.
-    A path matches when the hunk header names it as ``a/<path>`` or ``b/<path>``,
-    so ``index.html`` does not match ``sub/index.html``.
+
+    **Both header forms are recognised**, because the harness produces both: the
+    canonical ``diff --git a/X b/X`` and the bare ``--- a/X`` / ``+++ b/X`` pair
+    that ``firewall.validator._add_hinted_file_headers`` emits.  The first
+    version of this function matched only ``diff --git``, so the normalised diff
+    the fix loop actually returns was never dropped: ``final_diff`` described a
+    model edit that was not in the tree, and the report said "restored" while
+    the diff still carried the edit.  See :mod:`gigaforge.harness.diff_parse`.
     """
     if not diff or not paths:
         return diff
-    wanted = {p.replace("\\", "/").lstrip("./") for p in paths}
-    kept: list[str] = []
-    current: list[str] = []
-    drop = False
-
-    def flush() -> None:
-        if current and not drop:
-            kept.extend(current)
-
-    for line in diff.splitlines(keepends=True):
-        if line.startswith("diff --git "):
-            flush()
-            current = [line]
-            drop = False
-            for token in line.split():
-                if token.startswith(("a/", "b/")):
-                    if token[2:].lstrip("./") in wanted:
-                        drop = True
-                        break
-        else:
-            current.append(line)
-    flush()
-    return "".join(kept)
+    wanted = {normalise_path(p) for p in paths}
+    return "".join(
+        block.text for block in split_diff(diff) if block.path not in wanted
+    )
 
 
 def _keep_hunks_for(diff: str, paths: set[str]) -> str:
-    """The complement of :func:`_drop_hunks_for`: only the hunks for *paths*."""
+    """The complement of :func:`_drop_hunks_for`: only the blocks for *paths*."""
     if not diff or not paths:
         return ""
-    wanted = {p.replace("\\", "/").lstrip("./") for p in paths}
-    kept: list[str] = []
-    current: list[str] = []
-    keep = False
-
-    def flush() -> None:
-        if current and keep:
-            kept.extend(current)
-
-    for line in diff.splitlines(keepends=True):
-        if line.startswith("diff --git "):
-            flush()
-            current = [line]
-            keep = False
-            for token in line.split():
-                if token.startswith(("a/", "b/")):
-                    if token[2:].lstrip("./") in wanted:
-                        keep = True
-                        break
-        else:
-            current.append(line)
-    flush()
-    return "".join(kept)
+    wanted = {normalise_path(p) for p in paths}
+    return "".join(
+        block.text for block in split_diff(diff) if block.path in wanted
+    )
 
 
 def _merge_repaired_diff(original: str, repaired: str) -> str:
-    """Replace the per-file hunks of *original* with the ones in *repaired*.
+    """Replace the per-file blocks of *original* with the ones in *repaired*.
 
     The repair node recomputes a diff for the files it rewrote.  Those files
     must come from the recomputed diff — it is the only one that matches the
-    tree — while every other file keeps the hunk the run already produced.
+    tree — while every other file keeps the block the run already produced.
 
-    A file is identified by its ``diff --git a/X b/X`` header.  When the
-    original has no hunk for a file (the repair created it), the recomputed
-    hunk is appended.
+    A file is identified by its path, parsed from either header form.  When the
+    original has no block for a file (the repair created it), the recomputed
+    block is appended.
     """
     if not repaired:
         return original
     if not original:
         return repaired
 
-    def split(diff: str) -> dict[str, str]:
-        chunks: dict[str, str] = {}
-        current: list[str] = []
-        key = ""
-        for line in diff.splitlines(keepends=True):
-            if line.startswith("diff --git "):
-                if key:
-                    chunks[key] = "".join(current)
-                key = line.strip()
-                current = [line]
-            elif key:
-                current.append(line)
-        if key:
-            chunks[key] = "".join(current)
-        return chunks
-
-    merged = split(original)
-    merged.update(split(repaired))
+    merged: dict[str, str] = {}
+    for block in split_diff(original):
+        merged[block.path] = block.text
+    for block in split_diff(repaired):
+        merged[block.path] = block.text
     return "".join(merged.values())
 
 

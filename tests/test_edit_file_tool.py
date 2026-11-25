@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 
 from gigaforge.agents.react import EditFileTool, ReActContext, ToolRegistry
@@ -54,17 +55,30 @@ def test_rejects_missing_or_ambiguous_fragments(tmp_path: Path) -> None:
 
 
 def test_refuses_paths_outside_the_worktree(tmp_path: Path) -> None:
+    """A traversal attempt must never modify the file outside the worktree.
+
+    Hard-coding ``..\\name`` made this a Windows-only test: on POSIX that is a
+    filename, the guard never fired, and CI (ubuntu-latest) was red on every
+    push.  The invariant is that the outside bytes are unchanged, for either
+    separator; the native spelling must additionally be refused as a traversal.
+    """
     outside = tmp_path.parent / f"{tmp_path.name}-outside.txt"
     outside.write_text("private", encoding="utf-8")
     try:
+        for attempt in (f"../{outside.name}", f"..\\{outside.name}"):
+            _edit(
+                EditFileTool(),
+                tmp_path,
+                {"path": attempt, "old_string": "private", "new_string": "changed"},
+            )
+            assert outside.read_text(encoding="utf-8") == "private", (
+                f"{attempt!r} modified a file outside the worktree"
+            )
+        native = f"..{os.sep}{outside.name}"
         result = _edit(
             EditFileTool(),
             tmp_path,
-            {
-                "path": f"..\\{outside.name}",
-                "old_string": "private",
-                "new_string": "changed",
-            },
+            {"path": native, "old_string": "private", "new_string": "changed"},
         )
         assert "refusing to edit outside the worktree" in result
         assert outside.read_text(encoding="utf-8") == "private"
