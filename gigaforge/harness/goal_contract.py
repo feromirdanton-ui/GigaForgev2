@@ -422,10 +422,19 @@ class Requirement:
             # with a complete, correct feature section failed with
             # "section 'features'" — and the same failure repeated every cycle
             # until the goal gave up.  The name is the fact; the attribute is
-            # not.  Both spellings are accepted, and the bare word is accepted
-            # as a last resort so a section named in prose still counts.
+            # not.  Both spellings are accepted.
+            #
+            # **The stylesheet is not the document.**  Measured live: a page
+            # with NO footer element passed the footer requirement, because the
+            # CSS contained ``footer { border-top: … }`` and ``section, footer,
+            # nav { padding: … }``.  The bare-word fallback was matching the
+            # stylesheet, so the contract certified a page that had no footer at
+            # all.  Style and script blocks are removed before the word is
+            # looked for, and a landmark (footer/header/nav) must be a real
+            # element — a class name on a ``<div>`` is not a landmark.
+            markup = _without_style_and_script(low)
             for needle in self.needles:
-                if needle in low:
+                if needle in markup:
                     return True
             for name in self.needles:
                 token = name.strip("\"'")
@@ -433,7 +442,7 @@ class Requirement:
                     continue
                 if re.search(
                     rf"\b(?:class|id)\s*=\s*[\"'][^\"']*\b{re.escape(token)}\b",
-                    low,
+                    markup,
                 ):
                     return True
             return False
@@ -696,6 +705,20 @@ def extract_requirements(goal: str) -> list[Requirement]:
             )
         )
     return reqs
+
+
+def _without_style_and_script(html: str) -> str:
+    """The document with its stylesheet and scripts removed.
+
+    A contract asks what the *document* contains.  The stylesheet is not the
+    document: measured live, a page with no footer element passed the footer
+    requirement because the CSS said ``footer { border-top: … }``.  Removing
+    the blocks first is what makes "the page has a footer" a statement about
+    the page.
+    """
+    text = re.sub(r"<style\b[^>]*>.*?</style\s*>", " ", html, flags=re.S | re.I)
+    text = re.sub(r"<script\b[^>]*>.*?</script\s*>", " ", text, flags=re.S | re.I)
+    return text
 
 
 def requested_card_count(goal: str) -> int:

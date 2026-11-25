@@ -3593,7 +3593,16 @@ class TaskPipeline:
             # plan always exists for a page goal, so the contract always exists.
             requirements = []
             generation = ctx.extras.get("generation") or {}
-            if has_html_artifact and generation.get("sections"):
+            # The gate is "this run produced an HTML artifact", NOT "this run
+            # used sectional generation".  Measured live: `run` (agent mode)
+            # produced a page with four cards and **no footer** for a goal that
+            # asked for a footer, and reported ``accepted: True`` — because
+            # ``generation.sections`` is only populated by the sectional path,
+            # so the plan-derived contract was skipped and the run fell back to
+            # ``extract_requirements``, which returns almost nothing for a page
+            # goal.  One artifact was judged by two different standards and the
+            # weaker one was the one people use.
+            if has_html_artifact:
                 try:
                     from gigaforge.harness.generation import (
                         GenerationPlan,
@@ -3617,13 +3626,18 @@ class TaskPipeline:
                             ],
                             palette=tuple(stored.get("palette") or ()),
                             title=str(stored.get("title") or ""),
+                            goal=_original_goal(ctx.state.goal),
                         )
                     else:
+                        # No stored plan (a non-sectional run, or an edit): the
+                        # goal is the only source, and ``plan_generation`` is
+                        # deterministic, so deriving it here is not a guess.
                         plan = plan_generation(_original_goal(ctx.state.goal))
                     requirements = requirements_from_plan(plan)
                     self._event("pipeline.contract_from_plan", run_id=ctx.run_id,
                                 sections=plan.kinds(), palette=list(plan.palette),
-                                requirements=len(requirements))
+                                requirements=len(requirements),
+                                from_stored_plan=bool(stored.get("sections")))
                 except Exception as exc:  # noqa: BLE001 - fall back to the goal text
                     self._event("pipeline.contract_plan_error", run_id=ctx.run_id,
                                 error=str(exc)[:200])
