@@ -191,3 +191,47 @@ def test_grounding_makes_a_brief_non_empty() -> None:
 def test_the_brief_records_which_files_it_quoted(tree) -> None:
     brief = build_brief("Explain the decision ladder", repo_root=tree)
     assert brief.to_dict()["grounding"] == ["gigaforge/core/ladder.py"]
+
+
+# ── the subject is chosen by content, not by filename ────────────────────────
+def test_a_stem_match_that_is_not_the_subject_loses_to_the_real_module(tmp_path) -> None:
+    """Measured live: the goal said "the decision ladder … in the agent harness".
+
+    ``harness`` matched ``bench/harness.py`` — a file that defines no level at
+    all — and it was quoted FIRST, so the model described L0 as "Initial
+    Assessment".  ``core/ladder.py`` was quoted second and lost in the noise.
+    A filename is a guess; the file's own text is evidence.
+    """
+    root = tmp_path
+    (root / "gigaforge" / "core").mkdir(parents=True)
+    (root / "gigaforge" / "bench").mkdir(parents=True)
+    (root / "gigaforge" / "core" / "ladder.py").write_text(
+        '"""The decision ladder."""\n'
+        "L0_DETERMINISTIC = 0\n"
+        "def escalate(level, evidence):\n"
+        "    '''Move up a level only on evidence.'''\n"
+    )
+    (root / "gigaforge" / "bench" / "harness.py").write_text(
+        '"""Benchmark harness — runs fixtures."""\n'
+        "def run_all():\n    return []\n"
+    )
+
+    brief = build_brief(
+        "Write a document describing the decision ladder in GigaForge: what L0, "
+        "L1, L2 and L3 mean, when the harness escalates, and why",
+        repo_root=root,
+        task_kind="document",
+    )
+    quoted = [p for p, _ in brief.grounding]
+    assert quoted[0] == "gigaforge/core/ladder.py", quoted
+
+
+def test_a_file_sharing_no_vocabulary_and_no_stem_is_not_quoted(tmp_path) -> None:
+    """Ranking must not degrade into "quote something"."""
+    root = tmp_path
+    (root / "gigaforge").mkdir()
+    (root / "gigaforge" / "ladder.py").write_text("L0 = 0\n")
+    (root / "gigaforge" / "unrelated.py").write_text("def nothing():\n    pass\n")
+
+    brief = build_brief("Explain the decision ladder", repo_root=root)
+    assert [p for p, _ in brief.grounding] == ["gigaforge/ladder.py"]

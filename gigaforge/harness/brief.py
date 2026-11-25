@@ -277,6 +277,25 @@ _OUTPUT_SUFFIXES = frozenset(
     {".md", ".markdown", ".mdx", ".rst", ".txt", ".adoc", ".html", ".htm"}
 )
 
+#: Words that appear in every goal and therefore rank every file equally.
+#: Kept deliberately small: a word that is merely common in prose ("write",
+#: "document") still carries subject information when it is rare in the tree,
+#: and the ranking already discounts a word that matches everything.
+_STOPWORDS = frozenset(
+    {
+        "about", "after", "also", "and", "any", "are", "because", "been",
+        "before", "being", "both", "but", "can", "could", "describe", "did",
+        "does", "each", "explain", "for", "from", "have", "here", "how",
+        "into", "its", "just", "like", "make", "more", "most", "must", "need",
+        "not", "now", "only", "other", "our", "out", "over", "please", "same",
+        "should", "some", "such", "than", "that", "the", "their", "them",
+        "then", "there", "these", "they", "this", "those", "through", "under",
+        "use", "used", "using", "very", "was", "were", "what", "when", "where",
+        "which", "while", "who", "why", "will", "with", "would", "write",
+        "your",
+    }
+)
+
 
 def _grounding(
     goal: str, root: Path | None, *, max_files: int = 2, max_chars: int = 6000
@@ -304,14 +323,19 @@ def _grounding(
     if not words:
         return ()
 
-    candidates: list[Path] = []
-
-    # 1. A file whose stem the goal names (``ladder`` -> ``core/ladder.py``).
-    #    This runs FIRST, and that order is the fix for a defect found live: the
-    #    goal named ``docs/design.md`` — the file the run was asked to CREATE —
-    #    and a named-path-first search quoted that (empty, or from a previous
-    #    run) instead of the module the document was about.  The module the goal
-    #    names is the subject; the path it writes to is the output.
+    # Candidate pool: every file whose stem the goal names, plus every path the
+    # goal names.  The pool is then RANKED by how much of the goal's own
+    # vocabulary the file actually contains.
+    #
+    # Why ranking and not "first stem match wins": measured live, the goal
+    # "write a document describing the decision ladder … in the GigaForge agent
+    # harness" matched the stem ``harness`` and quoted ``bench/harness.py``
+    # first — a file that defines no level at all — while ``core/ladder.py``,
+    # the module the document was about, was quoted second and lost in the
+    # noise.  The model then described L0 as "Initial Assessment".  A stem match
+    # is a guess about a filename; the file's own text is evidence about its
+    # subject, and the harness can read it.
+    pool: list[Path] = []
     try:
         for path in sorted(root.rglob("*.py")):
             try:
@@ -325,25 +349,54 @@ def _grounding(
                    for part in relative.parts):
                 continue
             if path.stem.lower() in words:
-                candidates.append(path)
-                if len(candidates) >= max_files:
-                    break
+                pool.append(path)
     except OSError:
         return ()
 
-    # 2. A path the goal names, if it exists and is not the output being
-    #    written.  A path that does not exist is not source; it is the output.
+    # A path the goal names, if it exists and is not the output being written.
+    # A path that does not exist is not source; it is the output.
+    for rel in _named_paths(goal, root=root):
+        target = root / rel
+        try:
+            if target.is_file() and target.suffix.lower() not in _OUTPUT_SUFFIXES:
+                pool.append(target)
+        except OSError:
+            continue
+
+    if not pool:
+        return ()
+
+    # Distinct goal words worth matching: short function words ("the", "and",
+    # "what") match every file and therefore rank nothing.
+    subject_words = {w for w in words if len(w) >= 4 and w not in _STOPWORDS}
+
+    def _score(path: Path) -> tuple[int, int]:
+        """(content hits, stem hit) — content first, filename as a tiebreak."""
+        try:
+            head = path.read_text(encoding="utf-8", errors="replace")[:40_000].lower()
+        except OSError:
+            return (0, 0)
+        hits = 0
+        for word in subject_words:
+            # Prefix match so "escalates" in the goal finds "escalation" in the
+            # source: the goal is prose, the module is code, and they rarely
+            # share an inflection.
+            if word in head or (len(word) >= 5 and word[:5] in head):
+                hits += 1
+        return (hits, 1 if path.stem.lower() in words else 0)
+
+    ranked = sorted(pool, key=lambda p: (_score(p), -len(str(p))), reverse=True)
+    # A file that shares no vocabulary with the goal AND whose name the goal
+    # does not use is not its subject; quoting it would be the same guess the
+    # ranking exists to avoid.  A stem match with no content hits is kept: the
+    # goal naming the file is evidence, just weaker evidence than the file
+    # talking about the goal's subject.
+    candidates = [p for p in ranked if _score(p)[0] > 0 or _score(p)[1] > 0][:max_files]
     if not candidates:
-        for rel in _named_paths(goal, root=root):
-            target = root / rel
-            try:
-                if target.is_file() and target.suffix.lower() not in _OUTPUT_SUFFIXES:
-                    candidates.append(target)
-            except OSError:
-                continue
+        return ()
 
     quoted: list[tuple[str, str]] = []
-    for path in candidates[:max_files]:
+    for path in candidates:
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
