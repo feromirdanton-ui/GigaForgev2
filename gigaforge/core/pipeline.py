@@ -847,8 +847,37 @@ class TaskPipeline:
             ctx.state.note_degraded(
                 what="tool_contract", why=f"{type(exc).__name__}: {exc}", where="prefix"
             )
+        # Skills are procedural knowledge for THIS task class.  Selecting them
+        # here — once, from the classifier's verdict — is what keeps a code-fix
+        # run from paying for the page-section procedure.  A model call to
+        # decide which skill to load would be a call to decide what to tell the
+        # model, and the classifier already knows the answer.
+        skills_text = ""
+        try:
+            from gigaforge.skills import render_skills, select_skills
+
+            kind = ""
+            try:
+                kind = _task_kind_for(self, ctx).kind
+            except Exception:  # noqa: BLE001 - a prefix must not fail a run
+                kind = ""
+            chosen = select_skills(
+                kind=kind, goal=str(ctx.task or ""), budget_tokens=1200
+            )
+            skills_text = render_skills(chosen)
+            self._event(
+                "pipeline.skills",
+                run_id=ctx.run_id,
+                task_kind=kind,
+                selected=[s.name for s in chosen],
+                tokens=sum(s.token_cost for s in chosen),
+            )
+        except Exception as exc:  # noqa: BLE001 - skills are an optimisation
+            ctx.state.note_degraded(
+                what="skills", why=f"{type(exc).__name__}: {exc}", where="prefix"
+            )
         ctx.state.prefix = build_system_prefix(
-            repo_map=repo_map, tool_contract=tool_contract
+            repo_map=repo_map, tool_contract=tool_contract, skills=skills_text
         )
         self._event(
             "pipeline.prefix",

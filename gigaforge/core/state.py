@@ -77,20 +77,30 @@ def build_system_prefix(
     repo_map: str = "",
     tool_contract: str = "",
     model_hint: str = "",
+    skills: str = "",
     extra: Optional[Mapping[str, str]] = None,
 ) -> SystemPrefix:
     """Assemble the stable prefix.
 
-    Order is fixed (persona → rules → tools → repo map → model hint) so that two
-    runs with the same inputs produce byte-identical text.  ``extra`` is sorted
-    by key for the same reason: a dict's insertion order must not leak into the
-    prompt, or the hash would change for no substantive reason.
+    Order is fixed (persona → rules → tools → skills → repo map → model hint) so
+    that two runs with the same inputs produce byte-identical text.  ``extra``
+    is sorted by key for the same reason: a dict's insertion order must not
+    leak into the prompt, or the hash would change for no substantive reason.
+
+    ``skills`` is the rendered skill block for *this* run's task class.  It sits
+    after the tool contract and before the repo map because it is procedural
+    knowledge about the work, while the repo map is data about the tree — and
+    the data is what changes most often, so it goes last, closest to the
+    conversation, where a provider's prefix cache is least likely to be
+    invalidated by it.
     """
     parts: dict[str, str] = {"persona": persona.strip()}
     if rules:
         parts["rules"] = "\n".join(f"{i + 1}. {r.strip()}" for i, r in enumerate(rules))
     if tool_contract:
         parts["tools"] = tool_contract.strip()
+    if skills:
+        parts["skills"] = skills.strip()
     if repo_map:
         parts["repo_map"] = repo_map.strip()
     if model_hint:
