@@ -893,7 +893,16 @@ class TaskPipeline:
                 kind_obj = None
             brief = build_brief(
                 str(ctx.task or ""),
-                repo_root=getattr(ctx, "worktree", None) or getattr(self, "repo_root", None),
+                # ``RunContext`` has no ``worktree`` attribute — it never did.
+                # The brief was therefore always built against ``None``, which
+                # means "no tree": no named-path resolution, no file count, and
+                # no grounding.  Measured live: a document goal about the
+                # decision ladder produced a confident, entirely invented
+                # description of it, and the trace showed a 2 742-character
+                # prefix where the brief and the skills should have been.
+                # ``_repo_root()`` is the one resolver the rest of the pipeline
+                # uses, so the brief now sees the same tree the run writes to.
+                repo_root=self._repo_root(),
                 task_kind=getattr(kind_obj, "kind", "") or "",
                 task_evidence=getattr(kind_obj, "evidence", "") or "",
             )
