@@ -259,7 +259,7 @@ class Ladder:
                 evidence={"deterministic_available": True},
             )
 
-        start = self._starting_level(phase)
+        start = self._starting_level(phase, signals.task_kind)
         level = start
         reasons: list[str] = [f"phase {phase!r} starts at {LEVEL_NAMES[start]}"]
 
@@ -327,7 +327,15 @@ class Ladder:
         )
 
     # ── internals ───────────────────────────────────────────────────────────
-    def _starting_level(self, phase: str) -> Level:
+    def _starting_level(self, phase: str, task_kind: str = "") -> Level:
+        # For an answer goal the ``summarize`` phase is not a summary — it is
+        # the deliverable.  Measured live: "What is 2+2? Answer in chat" went
+        # to the cheap model, which returned an empty string, and the run
+        # reported ``finish_action`` with ``chars: 0`` twice and then
+        # ``needs_attention``.  A phase that writes the product is not a cheap
+        # phase, whatever it is called.
+        if task_kind == "answer" and phase in ("summarize", "answer"):
+            return Level.L2_STRONG
         if phase in self.policy.cheap_phases:
             return Level.L1_CHEAP
         if phase in self.policy.strong_phases:
