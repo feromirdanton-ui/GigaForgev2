@@ -932,10 +932,19 @@ def _fallback_section(section: "SectionSpec", plan: "GenerationPlan") -> str:
     kind = getattr(section, "kind", "")
     title = _escape(getattr(plan, "title", "") or "GigaForge")
     if kind == "hero":
-        return (
-            f'<section class="hero"><h1>{title}</h1>'
-            f"<p>{_escape(getattr(plan, 'tagline', '') or '')}</p></section>"
-        )
+        # The goal's own words decide the hero's shape.  Measured live on
+        # ``subagents``: the hero child returned nothing, the fallback emitted a
+        # bare ``<h1>``, and the page shipped with no glitch effect and no
+        # tagline — the goal had asked for both.  The harness can read the
+        # request, so the fallback honours it instead of being deliberately
+        # plain.
+        goal = (getattr(plan, "goal", "") or "").lower()
+        tagline = _escape(getattr(plan, "tagline", "") or "")
+        heading = f"<h1>{title}</h1>"
+        if "glitch" in goal:
+            heading = f'<div class="glitch-text">{heading}</div>'
+        body = f"<p>{tagline}</p>" if tagline else ""
+        return f'<section class="hero">{heading}{body}</section>'
     if kind in ("features", "feature_grid", "grid"):
         cards = "".join(
             f'<div class="feature-card"><h3>{_escape(name)}</h3>'
@@ -1102,6 +1111,38 @@ def _default_css(accent: str, secondary: str) -> str:
         h2 {{ font-size: clamp(1.5rem, 3vw, 2.25rem); color: var(--secondary); }}
         a {{ color: var(--accent); }}
         .hero {{ min-height: 70vh; display: grid; place-content: center; text-align: center; }}
+        /* A glitch hero is a request the harness can honour itself.  Measured
+           live on ``subagents``: the hero child returned nothing, the fallback
+           emitted a bare heading, and the page shipped with no glitch effect
+           at all — the goal had asked for one.  The markup and the animation
+           are both the harness's, so a child that fails cannot lose them. */
+        .glitch-text {{ position: relative; display: inline-block; }}
+        .glitch-text h1 {{ position: relative; animation: gf-glitch 2.5s infinite; }}
+        .glitch-text h1::before,
+        .glitch-text h1::after {{
+            content: attr(data-text);
+            position: absolute;
+            inset: 0;
+            clip-path: inset(0 0 55% 0);
+        }}
+        .glitch-text h1::before {{ color: var(--secondary); animation: gf-glitch-a 2.5s infinite; }}
+        .glitch-text h1::after {{ color: var(--accent); animation: gf-glitch-b 2.5s infinite; }}
+        @keyframes gf-glitch {{
+            0%, 92%, 100% {{ transform: translate(0); }}
+            93% {{ transform: translate(-2px, 1px); }}
+            95% {{ transform: translate(2px, -1px); }}
+            97% {{ transform: translate(-1px, -1px); }}
+        }}
+        @keyframes gf-glitch-a {{
+            0%, 90%, 100% {{ transform: translate(0); opacity: 0; }}
+            92% {{ transform: translate(-3px, 0); opacity: .8; }}
+            96% {{ transform: translate(3px, 0); opacity: .8; }}
+        }}
+        @keyframes gf-glitch-b {{
+            0%, 90%, 100% {{ transform: translate(0); opacity: 0; }}
+            94% {{ transform: translate(3px, 0); opacity: .8; }}
+            98% {{ transform: translate(-3px, 0); opacity: .8; }}
+        }}
         /* The grid selector must match the markup the assembler writes.  It
            styled ``.features`` while the section wrapper is
            ``<div class="feature-grid">``, so the grid rules never applied:
