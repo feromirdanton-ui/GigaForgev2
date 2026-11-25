@@ -721,12 +721,16 @@ def _without_style_and_script(html: str) -> str:
     return text
 
 
-#: Number words a goal may use instead of digits.  Only the small ones: a goal
-#: that says "twenty cards" is not a landing page, and the 1..24 guard below
-#: would reject it anyway.
+#: Number words a goal may use instead of digits.  The previous version stopped
+#: at twelve, so "a grid with sixteen cards" fell through to the default and the
+#: page shipped three.  The 1..24 guard below still rejects a year or a price.
 _NUMBER_WORDS = {
     "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
     "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16,
+    "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20,
+    "twenty-one": 21, "twenty-two": 22, "twenty-three": 23, "twenty-four": 24,
+    "a dozen": 12, "a couple": 2, "a few": 3,
 }
 
 

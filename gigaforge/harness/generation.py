@@ -173,11 +173,7 @@ def plan_generation(goal: str, existing_html: str = "") -> GenerationPlan:
         for index, kind in enumerate(chosen)
     ]
 
-    palette = tuple(
-        word for word in ("cyan", "magenta", "purple", "violet", "orange", "green",
-                          "red", "blue", "yellow", "pink", "gold")
-        if re.search(rf"\b{word}\b", low)
-    )
+    palette = _palette_from_goal(low)
     if not palette and existing_html:
         # An edit that names no palette keeps the page's own colours rather
         # than repainting it with the default.  The palette is read from the
@@ -261,6 +257,57 @@ def existing_sections(html: str) -> dict[str, str]:
                 end = step.end()
         out[kind] = html[match.start():end].strip()
     return out
+
+
+#: Colour words a goal may name, mapped to the CSS colour the page should use.
+#: A dict rather than a tuple of literals because the previous version was a
+#: hard-coded 11-word list: "teal", "lime", "amber", "crimson" and every other
+#: CSS colour name were silently ignored, and a goal that asked for a teal page
+#: got the default cyan/magenta.  The values are CSS keywords, so a word that is
+#: already a valid colour needs no translation.
+_COLOUR_WORDS: dict[str, str] = {
+    "cyan": "cyan", "magenta": "magenta", "purple": "purple", "violet": "violet",
+    "orange": "orange", "green": "green", "red": "red", "blue": "blue",
+    "yellow": "yellow", "pink": "pink", "gold": "gold", "teal": "teal",
+    "lime": "lime", "amber": "amber", "crimson": "crimson", "indigo": "indigo",
+    "turquoise": "turquoise", "aqua": "aqua", "fuchsia": "fuchsia",
+    "emerald": "emerald", "scarlet": "scarlet", "azure": "azure",
+    "coral": "coral", "salmon": "salmon", "lavender": "lavender",
+    "maroon": "maroon", "navy": "navy", "olive": "olive", "silver": "silver",
+    "bronze": "bronze", "copper": "copper", "neon": "cyan",
+}
+
+#: A hex colour in the goal, e.g. ``#00e5ff``.  A goal that names an exact
+#: colour is more specific than one that names a word, so hex wins.
+_HEX_COLOUR = re.compile(r"#([0-9a-f]{6}|[0-9a-f]{3})\b", re.I)
+
+
+def _palette_from_goal(low: str) -> tuple[str, ...]:
+    """The colours the goal names, in the order it names them.
+
+    Two sources, in priority order:
+
+    * **hex literals** — ``#00e5ff`` is unambiguous and the user chose it;
+    * **colour words** — matched against :data:`_COLOUR_WORDS`, which is a dict
+      so adding a colour is a one-line change rather than an edit to a tuple
+      buried in a function.
+
+    Order is the order of appearance in the goal, not the order of the dict:
+    "magenta and cyan" must produce magenta first, because the first colour is
+    the accent and the second is the secondary.
+    """
+    found: list[tuple[int, str]] = []
+    for match in _HEX_COLOUR.finditer(low):
+        found.append((match.start(), f"#{match.group(1).lower()}"))
+    for word, colour in _COLOUR_WORDS.items():
+        for match in re.finditer(rf"\b{re.escape(word)}\b", low):
+            found.append((match.start(), colour))
+    found.sort(key=lambda item: item[0])
+    ordered: list[str] = []
+    for _position, colour in found:
+        if colour not in ordered:
+            ordered.append(colour)
+    return tuple(ordered)
 
 
 def _palette_of(html: str) -> tuple[str, ...]:
