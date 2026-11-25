@@ -28,6 +28,7 @@ from gigaforge.core.budgets import PHASE_CAP_ATTRS, BudgetTracker
 from .config import CoreConfig, PhaseBudget, PhaseRoute
 from .contracts import RunContext
 from .errors import NoModelForPhaseError, PhaseBudgetExceeded, UnknownPhaseError
+from .ladder import Decision, Ladder, LadderPolicy, Level, Signals
 
 _HARD_REASONING_TYPES = frozenset({"hard_reasoning"})
 _LITE_TYPES = frozenset({"plan", "review", "classify", "summarize"})
@@ -215,6 +216,20 @@ class ModelRouter:
         self._s = settings or get_settings()
         self._budget = budget_tracker or BudgetTracker(settings=self._s)
         self.last_fallback: str | None = None
+        #: The decision ladder.  The router answers "which model for this
+        #: phase"; the ladder answers "how much intelligence may this step
+        #: buy".  They are separate because the second question has an answer
+        #: the first cannot express: *no model call at all* (L0).
+        #:
+        #: The ladder is built with its ceiling open on purpose.  It reports
+        #: what the step *needs*; whether the account may serve a flagship
+        #: model is the router's gate (``GIGAFORGE_ALLOW_MAX``), applied in
+        #: :meth:`_model_for_level`.  Building the ladder with the gate baked in
+        #: made every escalation from an authoring phase a no-op — the ladder
+        #: said "strong" for a step that had already failed twice at strong.
+        self.ladder = Ladder(LadderPolicy(allow_flagship=True))
+        #: The last ladder verdict, for the trace and the ledger.
+        self.last_decision: Optional[Decision] = None
 
     def reconfigure(self, *, config: Optional[CoreConfig] = None,
                     client: Any = _UNSET) -> None:
@@ -262,6 +277,64 @@ class ModelRouter:
                 "exhausted": (tokens_left == 0 or calls_left == 0)}
 
     # ── routing ──────────────────────────────────────────────────────────────
+    def decide_level(
+        self,
+        phase: str,
+        *,
+        attempt: int = 0,
+        repeats: int = 0,
+        contract_rejected: bool = False,
+        files_touched: int = 0,
+        sections: int = 0,
+        task_kind: str = "",
+        deterministic_available: bool = False,
+        forced_level: Optional[Level] = None,
+    ) -> Decision:
+        """Ask the ladder how much intelligence this step may buy.
+
+        The router's own budget counters supply the pressure signal, so a
+        caller does not have to know the phase's remaining allowance to get an
+        honest answer.  The verdict is kept on ``last_decision`` for the trace.
+        """
+        budget = self.config.budget_for(phase)
+        with self._lock:
+            used = self._usage.get(phase)
+            tokens_used = used.total_tokens if used else 0
+        decision = self.ladder.decide(
+            Signals(
+                phase=phase,
+                attempt=attempt,
+                repeats=repeats,
+                contract_rejected=contract_rejected,
+                files_touched=files_touched,
+                sections=sections,
+                tokens_used=tokens_used,
+                tokens_budget=int(budget.max_tokens or 0),
+                task_kind=task_kind,
+                deterministic_available=deterministic_available,
+                forced_level=forced_level,
+            )
+        )
+        self.last_decision = decision
+        return decision
+
+    def _model_for_level(self, phase: str, level: Level) -> Optional[str]:
+        """The model a level maps to, or ``None`` when the level is L0.
+
+        The mapping is deliberately coarse: a level is a *class* of model, and
+        the per-phase route is the operator's choice within that class.  L1
+        takes the cheap model, L2 the phase's configured model, L3 the strong
+        model — and L3 is refused unless the account allows it, which is the
+        router's gate, not the ladder's.
+        """
+        if level is Level.L0_DETERMINISTIC:
+            return None
+        if level is Level.L1_CHEAP:
+            return self.config.cheap_model
+        if level is Level.L3_FLAGSHIP:
+            return self.config.strong_model
+        return None  # L2: the phase's own route decides
+
     def route(
         self,
         phase: str,
@@ -269,6 +342,7 @@ class ModelRouter:
         model: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        level: Optional[Level] = None,
     ) -> Route:
         """Decide the model and parameters for ``phase``, enforcing the budget.
 
@@ -286,6 +360,20 @@ class ModelRouter:
         """
         self.last_fallback = None
         models = self._s.models
+
+        # A level the caller asked for overrides the phase's configured model.
+        # L0 is not a model at all: it means "do not call one", and the caller
+        # must handle it — returning a Route here would silently spend a call
+        # the ladder said not to make.
+        if level is not None:
+            if level is Level.L0_DETERMINISTIC:
+                raise NoModelForPhaseError(
+                    f"phase {phase!r} was decided at L0 (deterministic): no model call",
+                    detail={"level": int(level), "phase": phase},
+                )
+            levelled = self._model_for_level(phase, level)
+            if levelled:
+                model = levelled
 
         spec: Optional[PhaseRoute] = self.config.routes.get(phase)
         if spec is not None and model is None:
@@ -416,6 +504,7 @@ class ModelRouter:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         ctx: Optional[RunContext] = None,
+        level: Optional[Level] = None,
         **kwargs: Any,
     ) -> Any:
         """Route, call the client, and account for the result.
@@ -425,10 +514,16 @@ class ModelRouter:
         before the attempt, and failures still consume a call — a phase that
         errors out has spent the attempt, and pretending otherwise would let a
         permanently broken phase loop forever.
+
+        ``level`` is the ladder's verdict for this step.  It is passed through
+        to :meth:`route`, so a step the ladder raised to L1 is actually served
+        by the cheap model instead of the phase's configured one — a level that
+        only appeared in a log would be a label, not a decision.
         """
         if ctx is not None:
             ctx.raise_if_cancelled()
-        route = self.route(phase, model=model, temperature=temperature, max_tokens=max_tokens)
+        route = self.route(phase, model=model, temperature=temperature,
+                           max_tokens=max_tokens, level=level)
 
         model_sequence = list(route.candidates)
         last_error: Optional[BaseException] = None
