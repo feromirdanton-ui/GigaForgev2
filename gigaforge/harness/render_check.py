@@ -71,6 +71,22 @@ PROBE = """
     h1_color: h1 ? cs(h1).color : null,
     h1_size: h1 ? cs(h1).fontSize : null,
     h1_animation: h1 ? cs(h1).animationName : null,
+    // A glitch effect is almost always built on ::before/::after — the two
+    // offset copies that shift against each other.  Reading only the h1's own
+    // animationName reported "none" for a page that HAS a glitch, which cost a
+    // live goal a whole extra cycle: the contract rejected a correct page and
+    // the model was asked to fix something that was not broken.  The pseudo
+    // elements are part of the element's rendered appearance, so they are read.
+    h1_animation_pseudo: h1 ? (
+      (getComputedStyle(h1, '::before').animationName || '') + ' ' +
+      (getComputedStyle(h1, '::after').animationName || '')
+    ).trim() : null,
+    h1_has_glitch: h1 ? (
+      /glitch/i.test(cs(h1).animationName || '') ||
+      /glitch/i.test(getComputedStyle(h1, '::before').animationName || '') ||
+      /glitch/i.test(getComputedStyle(h1, '::after').animationName || '') ||
+      /glitch/i.test((h1.closest('[class*="glitch"]') || {}).className || '')
+    ) : false,
     body_bg: body ? cs(body).backgroundColor : null,
     grid_display: grid ? cs(grid).display : null,
     grid_columns: grid ? cs(grid).gridTemplateColumns : null,
