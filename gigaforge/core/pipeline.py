@@ -3925,12 +3925,42 @@ class TaskPipeline:
                 output_allowance,
                 configured_output if configured_output > 0 else output_allowance,
             )
+        # The decision ladder answers the question the router does not: should
+        # this step buy a model at all, and if so how expensive one.  It was
+        # built, exported, tested — and never called from the product, so every
+        # phase went to its configured model on the first attempt and a step
+        # that had already failed twice was retried on the model that had just
+        # failed twice.  Asking it here is what makes the ladder a decision
+        # rather than a label.
+        level = None
+        decide = getattr(self.router, "decide_level", None)
+        if callable(decide):
+            try:
+                decision = decide(
+                    phase,
+                    attempt=int(ctx.extras.get("phase_attempts", {}).get(phase, 0)),
+                    repeats=int(ctx.extras.get("phase_repeats", {}).get(phase, 0)),
+                    contract_rejected=bool(ctx.extras.get("contract_unmet")),
+                    files_touched=len(ctx.extras.get("changed_files") or ()),
+                    task_kind=str((ctx.extras.get("task_kind") or {}).get("kind", "")),
+                )
+                level = getattr(decision, "level", None)
+                self._event(
+                    "pipeline.ladder",
+                    run_id=ctx.run_id,
+                    phase=phase,
+                    level=int(level) if level is not None else None,
+                    reason=str(getattr(decision, "reason", ""))[:200],
+                )
+            except Exception as exc:  # noqa: BLE001 - a ladder must not fail a run
+                self._degraded("ladder", exc, "ask")
         result = self.router.complete(
             phase,
             messages,
             ctx=ctx,
             temperature=temperature,
             max_tokens=max_tokens,
+            level=level,
         )
         for attr in ("content", "text"):
             value = getattr(result, attr, None)
