@@ -502,11 +502,27 @@ class Runtime:
             return default_engine(self.store, config=self.core_config, **kwargs)
 
         model = str(kwargs.pop("model", "") or self._selected_model())
+        # ``offline`` is a pipeline concept: it selects the scripted backend for
+        # a *task* run.  The direct chat backend has no such switch — it either
+        # has a client or it does not — so the flag is dropped here rather than
+        # forwarded.  Forwarding it raised ``TypeError: unexpected keyword
+        # argument 'offline'`` on every ``gigaforge chat -m``, the second defect
+        # in the same never-exercised path.
+        kwargs.pop("offline", None)
+        # ``default_model`` may arrive from the caller (the CLI passes the
+        # window's selected model) and is also supplied here from the core
+        # config.  Passing both raised ``TypeError: got multiple values for
+        # keyword argument 'default_model'``.  The caller's value wins: it is
+        # the more specific one.
+        default_model = str(
+            kwargs.pop("default_model", "")
+            or getattr(self.core_config, "default_model", "GigaChat")
+        )
         return direct_engine(
             self.store,
             client=self.client,
             model=model,
-            default_model=getattr(self.core_config, "default_model", "GigaChat"),
+            default_model=default_model,
             **kwargs,
         )
 

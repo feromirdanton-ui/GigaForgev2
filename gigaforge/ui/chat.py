@@ -37,6 +37,7 @@ import shlex
 import threading
 import time
 import uuid
+import inspect
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -254,6 +255,7 @@ class DirectChatBackend(AgentBackend):
         temperature: float = 0.6,
         max_tokens: int = 900,
         window: int = 16,
+        search: Any = None,
     ) -> None:
         self.client = client
         self.model = model
@@ -263,6 +265,16 @@ class DirectChatBackend(AgentBackend):
         self.window = max(2, int(window))
         self.history: list[dict[str, str]] = []
         self.last_result: Mapping[str, Any] = {}
+        #: The web-search tool, or ``None`` to answer from the model alone.
+        #:
+        #: A chat window that cannot search is a chat window that says "I cannot
+        #: search the internet" — which is what the live probe got, and it is
+        #: the one answer a user will not accept from an agent harness.  The
+        #: decision to search is made *deterministically* here (see
+        #: :func:`wants_search`), not by asking the model whether it would like
+        #: a tool: that would be a model call to decide whether to make a model
+        #: call, and the phrase "search the web" is not ambiguous.
+        self.search = search
 
     def set_model(self, model: str) -> None:
         self.model = (model or "").strip()
@@ -297,6 +309,36 @@ class DirectChatBackend(AgentBackend):
         messages = [{"role": "system", "content": self.system}] + self.history[-self.window:]
         yield session.tool("model", {"model": self.model}, text=f"→ {self.model or 'default'}")
 
+        # ── deterministic pre-search ────────────────────────────────────────
+        # The harness decides whether this message needs the web, from the
+        # message alone.  No model call is spent on the decision, and the
+        # search happens *before* the answer call so the model writes from
+        # observations instead of from memory.  A search that fails is
+        # reported to the model as a failed search, not hidden: an answer that
+        # silently pretends to have searched is the worst outcome here.
+        search_note = ""
+        if self.search is not None and wants_search(text):
+            query = search_query(text)
+            yield session.tool("web_search", {"query": query}, text=f"⌕ {query}")
+            try:
+                found = self.search.run({"query": query})
+                if inspect.isawaitable(found):
+                    found = _run_awaitable(found)
+                found = str(found or "").strip()
+            except Exception as exc:  # noqa: BLE001 - surfaced, not swallowed
+                found = f"ERROR: {type(exc).__name__}: {exc}"
+            if found:
+                search_note = (
+                    "## Web search results\n"
+                    f"Query: {query}\n\n{found}\n\n"
+                    "Answer from these results and cite the URLs they contain. "
+                    "Do not invent a URL that is not above."
+                )
+                messages = [
+                    {"role": "system", "content": self.system},
+                    {"role": "system", "content": search_note},
+                ] + self.history[-self.window:]
+
         try:
             result = self.client.complete(
                 messages,
@@ -318,11 +360,109 @@ class DirectChatBackend(AgentBackend):
             "mode": "chat",
             "model": self.model,
             "reply": reply,
+            "searched": bool(search_note),
             "usage": usage if isinstance(usage, dict) else None,
             "tokens": int((usage or {}).get("total_tokens", 0) or 0)
             if isinstance(usage, dict) else 0,
         }
         yield session.say(reply or "(empty reply)")
+
+
+#: Phrases that mean "this message needs the web".  Matched case-insensitively
+#: against the message alone — no model call decides whether to search, because
+#: that would be a call to decide whether to make a call, and "search the web"
+#: is not ambiguous.
+_SEARCH_PHRASES = (
+    "search the web", "search the internet", "search online", "web search",
+    "google ", "look up online", "look it up online", "find online",
+    "latest news", "current news", "what's new in", "whats new in",
+    "as of today", "up to date", "up-to-date", "recent developments",
+    "найди в интернете", "поищи в интернете", "поиск в интернете",
+    "погугли", "посмотри в интернете", "свежие новости", "последние новости",
+    "актуальн", "в интернете",
+)
+
+#: Words that make a message a *question about the world* rather than about the
+#: repository.  Used only together with a search phrase, never alone.
+_WORLD_HINTS = (
+    "trend", "trends", "news", "release", "released", "version", "benchmark",
+    "compare", "comparison", "market", "price", "pricing", "who is", "what is the latest",
+)
+
+
+def wants_search(message: str) -> bool:
+    """Whether this message asks for the web, decided from the text alone.
+
+    Deliberately conservative: a false positive costs one search and a few
+    hundred tokens, a false negative costs the user an answer that says "I
+    cannot search the internet" — which is the failure the live probe found.
+    """
+    low = (message or "").lower()
+    if not low.strip():
+        return False
+    return any(phrase in low for phrase in _SEARCH_PHRASES)
+
+
+def search_query(message: str) -> str:
+    """The query to send, derived from the message without a model call.
+
+    The instruction words are stripped so the search engine sees the subject
+    rather than the request: "Search the web for AI agent framework trends"
+    becomes "AI agent framework trends".  A query that keeps the instruction
+    returns pages about searching, which is the classic pre-search mistake.
+    """
+    text = (message or "").strip()
+    low = text.lower()
+    for phrase in _SEARCH_PHRASES:
+        index = low.find(phrase)
+        if index >= 0:
+            text = text[:index] + " " + text[index + len(phrase):]
+            low = text.lower()
+    for filler in ("for me", "please", "and cite your sources", "cite your sources",
+                   "with sources", "and tell me", "tell me", "can you", "could you"):
+        text = text.replace(filler, " ").replace(filler.title(), " ")
+    text = " ".join(text.split()).strip(" .,:;-—")
+    # A leading preposition is left behind when the instruction is removed
+    # ("Search the web for X" -> "for X", "найди в интернете про X" -> "про X").
+    # A search engine treats it as a term, so it is stripped here.
+    for lead in ("for ", "about ", "on ", "про ", "о ", "об ", "по "):
+        if text.lower().startswith(lead):
+            text = text[len(lead):]
+            break
+    text = " ".join(text.split()).strip(" .,:;-—")
+    return text or (message or "").strip()
+
+
+def _run_awaitable(awaitable: Any) -> Any:
+    """Run a coroutine to completion from synchronous code.
+
+    The search tool's ``run`` is ``async`` because the ReAct loop awaits it.
+    The chat backend is a generator consumed synchronously, so the coroutine is
+    driven here.  A fresh event loop is used when none is running; when one is
+    (a notebook, an async server), the coroutine is run on a worker thread so
+    the caller's loop is not re-entered.
+    """
+    import asyncio
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(awaitable)
+
+    result: dict[str, Any] = {}
+
+    def _worker() -> None:
+        try:
+            result["value"] = asyncio.run(awaitable)
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller
+            result["error"] = exc
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    thread.join()
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
 
 
 DEFAULT_CHAT_SYSTEM = (
@@ -1136,9 +1276,25 @@ def direct_engine(
     prices: Any = None,
     default_model: str = "GigaChat",
     system: str = "",
+    search: Any = None,
 ) -> ChatEngine:
-    """A chat engine that talks to the model without running the pipeline."""
+    """A chat engine that talks to the model without running the pipeline.
+
+    ``search`` is the web-search tool.  When it is ``None`` the engine builds
+    one, because a chat window that cannot search answers "I cannot search the
+    internet" — the one answer a user will not accept from an agent harness.
+    Passing ``search=False`` disables it explicitly (tests, offline use).
+    """
+    if search is None:
+        try:
+            from gigaforge.agents.web_search_tool import WebSearchTool
+
+            search = WebSearchTool()
+        except Exception:  # noqa: BLE001 - chat must still work without search
+            search = None
+    elif search is False:
+        search = None
     session = ChatSession(session_id=session_id, directory=chat_dir)
-    backend = DirectChatBackend(client, model=model, system=system)
+    backend = DirectChatBackend(client, model=model, system=system, search=search)
     return ChatEngine(store, backend=backend, session=session, prices=prices,
                       default_model=default_model)
