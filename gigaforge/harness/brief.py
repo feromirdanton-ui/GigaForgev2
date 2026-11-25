@@ -261,6 +261,14 @@ def _test_command(root: Path) -> str:
     return ""
 
 
+#: Suffixes that are almost always the run's OUTPUT rather than its subject.
+#: A goal that names ``docs/design.md`` is asking for that file to be written;
+#: quoting it as "the source" is quoting the answer instead of the question.
+_OUTPUT_SUFFIXES = frozenset(
+    {".md", ".markdown", ".mdx", ".rst", ".txt", ".adoc", ".html", ".htm"}
+)
+
+
 def _grounding(
     goal: str, root: Path | None, *, max_files: int = 2, max_chars: int = 6000
 ) -> tuple[tuple[str, str], ...]:
@@ -288,28 +296,35 @@ def _grounding(
         return ()
 
     candidates: list[Path] = []
-    # 1. A path the goal names, resolved against the tree.
-    for rel in _named_paths(goal, root=root):
-        target = root / rel
-        try:
-            if target.is_file():
-                candidates.append(target)
-        except OSError:
-            continue
 
-    # 2. A file whose stem the goal names (``ladder`` -> ``core/ladder.py``).
+    # 1. A file whose stem the goal names (``ladder`` -> ``core/ladder.py``).
+    #    This runs FIRST, and that order is the fix for a defect found live: the
+    #    goal named ``docs/design.md`` — the file the run was asked to CREATE —
+    #    and a named-path-first search quoted that (empty, or from a previous
+    #    run) instead of the module the document was about.  The module the goal
+    #    names is the subject; the path it writes to is the output.
+    try:
+        for path in sorted(root.rglob("*.py")):
+            if any(part in {".git", ".venv", "node_modules", "tests"}
+                   for part in path.parts):
+                continue
+            if path.stem.lower() in words:
+                candidates.append(path)
+                if len(candidates) >= max_files:
+                    break
+    except OSError:
+        return ()
+
+    # 2. A path the goal names, if it exists and is not the output being
+    #    written.  A path that does not exist is not source; it is the output.
     if not candidates:
-        try:
-            for path in sorted(root.rglob("*.py")):
-                if any(part in {".git", ".venv", "node_modules", "tests"}
-                       for part in path.parts):
-                    continue
-                if path.stem.lower() in words:
-                    candidates.append(path)
-                    if len(candidates) >= max_files:
-                        break
-        except OSError:
-            return ()
+        for rel in _named_paths(goal, root=root):
+            target = root / rel
+            try:
+                if target.is_file() and target.suffix.lower() not in _OUTPUT_SUFFIXES:
+                    candidates.append(target)
+            except OSError:
+                continue
 
     quoted: list[tuple[str, str]] = []
     for path in candidates[:max_files]:

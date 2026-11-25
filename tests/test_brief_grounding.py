@@ -89,6 +89,33 @@ def test_a_missing_module_is_not_quoted(tree) -> None:
     assert brief.grounding == ()
 
 
+def test_the_output_path_does_not_shadow_the_subject(tree) -> None:
+    """The live defect: the goal named the file it CREATES, not the module.
+
+    "Write a design note to docs/design.md explaining the decision ladder"
+    names two paths: the output (``docs/design.md``) and the subject
+    (``ladder``).  A named-path-first search quoted the output — which is empty
+    or from a previous run — and the model invented the ladder.  The module the
+    goal names is the subject; the path it writes to is the output.
+    """
+    (tree / "docs").mkdir()
+    (tree / "docs" / "design.md").write_text("# stale note from a previous run\n")
+    brief = build_brief(
+        "Write a design note to docs/design.md explaining the decision ladder",
+        repo_root=tree,
+    )
+    paths = [p for p, _ in brief.grounding]
+    assert "gigaforge/core/ladder.py" in paths
+    assert "docs/design.md" not in paths
+
+
+def test_a_markdown_path_is_never_quoted_as_source(tree) -> None:
+    """A ``.md`` path in a goal is the answer being written, not the question."""
+    (tree / "README.md").write_text("# Project\n")
+    brief = build_brief("Summarise README.md in a note", repo_root=tree)
+    assert all(not p.endswith(".md") for p, _ in brief.grounding)
+
+
 def test_the_quote_is_capped(tree) -> None:
     """A brief is context, not a repository dump."""
     (tree / "gigaforge" / "core" / "huge.py").write_text("x = 1\n" * 50_000)
