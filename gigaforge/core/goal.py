@@ -173,6 +173,14 @@ class GoalResult:
     error: str = ""
     workspace_root: str = ""
     published_files: list[str] = field(default_factory=list)
+    #: The reply, when the goal asked for one.  Measured live: "What is 2+2?"
+    #: completed with the answer only inside ``cycles[0].summary``, so a caller
+    #: reading the JSON found ``answer: None`` and had to parse a diff block to
+    #: get a sentence.  A chat goal's output is the answer; it belongs at the
+    #: top level, where a caller looks for it.
+    answer: str = ""
+    answer_citations: list[str] = field(default_factory=list)
+    answer_searched: bool = False
 
     @property
     def ok(self) -> bool:
@@ -193,6 +201,9 @@ class GoalResult:
             "error": self.error,
             "workspace_root": self.workspace_root,
             "published_files": list(self.published_files),
+            "answer": self.answer,
+            "answer_citations": list(self.answer_citations),
+            "answer_searched": self.answer_searched,
         }
 
 
@@ -1310,6 +1321,19 @@ class GoalRunner:
             record.setdefault("cycles", []).append(cycle.to_dict())
             record["active_run_id"] = ""
             record["active_cycle_index"] = 0
+            # A chat goal's output is the answer, and a caller reads it from the
+            # top level of the result — not by parsing a diff block out of a
+            # cycle summary.  Measured live: "What is 2+2?" completed with
+            # ``answer: None`` while the sentence sat inside ``summary``.
+            answer_text = str(getattr(result, "answer", "") or "")
+            if answer_text:
+                record["answer"] = answer_text
+                record["answer_citations"] = list(
+                    getattr(result, "answer_citations", []) or []
+                )
+                record["answer_searched"] = bool(
+                    getattr(result, "answer_searched", False)
+                )
             record["tokens"] = int(record.get("tokens", 0)) + cycle.tokens
             record["calls"] = int(record.get("calls", 0)) + cycle.calls
             record["updated_at"] = _now()
@@ -1585,6 +1609,9 @@ class GoalRunner:
             error=str(record.get("error") or ""),
             workspace_root=str(record.get("workspace_root") or ""),
             published_files=list(record.get("published_files") or []),
+            answer=str(record.get("answer") or ""),
+            answer_citations=list(record.get("answer_citations") or []),
+            answer_searched=bool(record.get("answer_searched")),
         )
 
 

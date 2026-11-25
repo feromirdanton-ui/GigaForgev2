@@ -60,3 +60,36 @@ def test_the_artifact_plan_branch_is_reachable():
 def test_every_ordinary_page_goal_has_sections(goal):
     plan = plan_generation(goal)
     assert plan.kinds(), f"no sections planned for {goal!r}"
+
+
+def test_a_chat_answer_is_at_the_top_level_of_the_result():
+    """A caller reads ``answer``, not a diff block inside a cycle summary.
+
+    Measured live: "What is 2+2? Answer in chat" completed with
+    ``answer: None`` while the sentence sat inside ``cycles[0].summary``.
+    """
+    from gigaforge.core.goal import GoalResult
+
+    result = GoalResult(
+        goal_id="g",
+        goal="What is 2+2?",
+        status="completed",
+        accepted=True,
+        answer="2 + 2 equals 4.",
+        answer_citations=["https://example.com"],
+        answer_searched=True,
+    )
+    payload = result.to_dict()
+    assert payload["answer"] == "2 + 2 equals 4."
+    assert payload["answer_citations"] == ["https://example.com"]
+    assert payload["answer_searched"] is True
+
+
+def test_a_goal_without_an_answer_reports_an_empty_string():
+    from gigaforge.core.goal import GoalResult
+
+    payload = GoalResult(
+        goal_id="g", goal="x", status="completed", accepted=True
+    ).to_dict()
+    assert payload["answer"] == ""
+    assert payload["answer_citations"] == []
