@@ -126,3 +126,42 @@ def test_the_palette_survives_an_inline_style():
     css = _layout_invariants()
     assert "h1 { color: var(--accent) !important; }" in css
     assert "h2 { color: var(--secondary) !important; }" in css
+
+
+def test_every_section_gets_the_anchor_its_name_promises():
+    """A child cannot know its siblings' names, so the harness sets the ids.
+
+    Measured live on ``subagents``: the hero child wrote
+    ``<a href="#features">Discover More</a>`` and the features child wrote
+    ``<section class="features">`` with no ``id``.  The page was rejected with
+    "internal links target missing ids: #features" — correctly, because the
+    link went nowhere.
+    """
+    from gigaforge.harness.generation import _ensure_section_id
+
+    assert 'id="features"' in _ensure_section_id(
+        '<section class="features"><h2>F</h2></section>', "features"
+    )
+    # An id the child chose is kept.
+    assert _ensure_section_id(
+        '<section class="hero" id="hero"><h1>H</h1></section>', "hero"
+    ).count('id="') == 1
+    # A void element is not given an id.
+    assert "id=" not in _ensure_section_id('<img src="a.png">', "hero")
+
+
+def test_assembly_gives_every_planned_section_an_id():
+    from gigaforge.harness.generation import assemble_page, plan_generation
+
+    plan = plan_generation(
+        "Create a single-file index.html: a cyberpunk landing page about "
+        "GigaForge with a hero, a feature grid of four cards, and a footer"
+    )
+    fragments = {
+        s.kind: f'<section class="{s.kind}"><h2>{s.kind}</h2>'
+        f"<p>{'Real content for this section. ' * 8}</p></section>"
+        for s in plan.sections
+    }
+    page = assemble_page(plan, fragments)
+    for section in plan.sections:
+        assert f'id="{section.kind}"' in page, section.kind

@@ -649,6 +649,34 @@ def _added_lines_of(patch: str) -> str:
     return "\n".join(kept).strip()
 
 
+def _ensure_section_id(fragment: str, kind: str) -> str:
+    """Give a section the anchor its own name promises.
+
+    Measured live on ``subagents``: the hero child wrote
+    ``<a href="#features">Discover More</a>`` and the features child wrote
+    ``<section class="features">`` with no ``id``.  The page was rejected with
+    "internal links target missing ids: #features" — correctly, because the
+    link went nowhere.
+
+    The harness knows every section's name, so the anchor is its job, not the
+    child's: a child cannot know what its siblings will be called.  The first
+    element of the fragment gets ``id="<kind>"`` when it has no id of its own.
+    """
+    if not fragment or not kind:
+        return fragment
+    first = re.search(r"<([a-zA-Z][a-zA-Z0-9-]*)\b([^>]*)>", fragment)
+    if not first:
+        return fragment
+    attrs = first.group(2) or ""
+    if re.search(r"\bid\s*=", attrs):
+        return fragment
+    # Do not add an id to a void element or to a comment-only fragment.
+    if first.group(1).lower() in _VOID_TAGS:
+        return fragment
+    start, end = first.span()
+    return f'{fragment[:start]}<{first.group(1)}{attrs} id="{kind}">{fragment[end:]}'
+
+
 def _layout_invariants() -> str:
     """The structural rules the harness owns, emitted after every child's CSS.
 
@@ -801,7 +829,7 @@ def assemble_page(
                 continue
             self_note = f"<!-- {section.kind}: filled by the harness, child returned nothing -->"
             fragment = f"{self_note}\n{fragment}"
-        body_parts.append(f"    {section.anchor}\n    {fragment}")
+        body_parts.append(f"    {section.anchor}\n    {_ensure_section_id(fragment, section.kind)}")
         if reused:
             # The section came from the page being edited: its rules are
             # already in that page's stylesheet, and re-scoping them would

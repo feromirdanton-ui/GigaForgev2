@@ -7,6 +7,7 @@ back to one model call that wrote the whole page.  Measured live:
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -149,7 +150,10 @@ class TestAssembly:
         fragments["footer"] = "```html\n<footer><p>Built by GigaForge.</p></footer>\n```"
         page = assemble_page(plan, fragments)
         assert "```" not in page
-        assert "<footer>" in page
+        # The harness gives every section the anchor its name promises, so the
+        # footer carries ``id="footer"`` — the assertion is on the element, not
+        # on the exact attribute string.
+        assert re.search(r"<footer\b", page)
 
     def test_assembly_is_deterministic(self) -> None:
         plan = plan_generation(SITE_GOAL)
@@ -163,7 +167,7 @@ class TestAssembly:
         fragments.pop("features")
         page = assemble_page(plan, fragments)
         assert audit_html_structure(page).ok
-        assert "<footer>" in page
+        assert re.search(r"<footer\b", page)
 
 
 class TestPipelineWiring:
