@@ -2238,8 +2238,6 @@ class TaskPipeline:
         # that is a computation, not a judgement call.
         episode_diff = self._episode_diff(ctx)
         prefetched = self._subagent_diff(ctx, episode_diff=episode_diff)
-        if episode_diff:
-            prefetched = "\n".join(p for p in (prefetched, episode_diff) if p)
 
         # A page goal is built section by section in every mode, not only under
         # ``--subagents``.  Measured live: ``run`` on the site goal produced a
@@ -2247,19 +2245,43 @@ class TaskPipeline:
         # model call was asked to write a whole page in one shot.  The harness
         # owns the plan and the skeleton; that is true whether or not the user
         # asked for sub-agents.
-        if not prefetched:
-            try:
-                from gigaforge.harness.task_kind import classify_task
+        #
+        # This must be decided **before** the episode's own writes are adopted as
+        # the proposal.  The episode runs first and its ``write_file`` tool often
+        # drops a draft page; appending that draft made ``prefetched`` non-empty,
+        # so the sectional path below was skipped and the draft *became* the
+        # artifact.  Measured live on the cyberpunk landing page: the file went
+        # from the workspace scaffold straight to one model call's output —
+        # ``Feature 1``…``Feature 4`` in inline styles, 1597 bytes, a typo in the
+        # <title> — and every structural check passed, because the page was
+        # valid and merely poor.  For an artifact goal the draft is context, not
+        # the deliverable.
+        artifact_only = False
+        try:
+            from gigaforge.harness.task_kind import classify_task
 
-                kind = classify_task(_original_goal(ctx.state.goal), self._repo_root())
-                ctx.extras["task_kind"] = kind.to_dict()
-                self._event("pipeline.task_kind", run_id=ctx.run_id,
-                            task_kind=kind.kind, evidence=kind.evidence[:300])
-                if kind.is_artifact and not kind.is_code:
-                    prefetched = self._sectional_generation(ctx)
-            except Exception as exc:  # noqa: BLE001 - fall back to the coder
-                self._event("pipeline.generation_plan_error", run_id=ctx.run_id,
-                            error=str(exc)[:300])
+            kind = classify_task(_original_goal(ctx.state.goal), self._repo_root())
+            ctx.extras["task_kind"] = kind.to_dict()
+            self._event("pipeline.task_kind", run_id=ctx.run_id,
+                        task_kind=kind.kind, evidence=kind.evidence[:300])
+            artifact_only = kind.is_artifact and not kind.is_code
+        except Exception as exc:  # noqa: BLE001 - fall back to the coder
+            self._event("pipeline.generation_plan_error", run_id=ctx.run_id,
+                        error=str(exc)[:300])
+
+        if artifact_only:
+            built = self._sectional_generation(ctx)
+            if built:
+                # The harness's assembly is authoritative: it is structurally
+                # valid by construction and every section is present.  The
+                # episode's draft is dropped rather than concatenated onto it.
+                prefetched = built
+                ctx.extras["artifact_draft_discarded"] = bool(episode_diff)
+            elif episode_diff:
+                prefetched = "\n".join(p for p in (prefetched, episode_diff) if p)
+        elif episode_diff:
+            prefetched = "\n".join(p for p in (prefetched, episode_diff) if p)
+
         if prefetched:
             creation_diff = self._ensure_creations(ctx, prefetched, slice_text, ctx)
             if creation_diff:
