@@ -42,13 +42,17 @@ def bench_report(results: list[BenchResult]) -> str:
     calls_w = len("llm_calls")
     tok_w = len("tokens_total")
     lat_w = len("latency_s")
+    cost_w = len("cost_usd")
+    cache_w = len("cache")
 
-    sep = "-" * (name_w + succ_w + tests_w + calls_w + tok_w + lat_w + 6 * 3 + 1)
+    sep = "-" * (name_w + succ_w + tests_w + calls_w + tok_w + lat_w + cost_w
+                 + cache_w + 8 * 3 + 1)
 
     lines: list[str] = []
     lines.append(f"{'task'.ljust(name_w)}   {'success'.ljust(succ_w)}   "
                  f"{'tests_passed'.ljust(tests_w)}   {'llm_calls'.rjust(calls_w)}   "
-                 f"{'tokens_total'.rjust(tok_w)}   {'latency_s'.rjust(lat_w)}")
+                 f"{'tokens_total'.rjust(tok_w)}   {'latency_s'.rjust(lat_w)}   "
+                 f"{'cost_usd'.rjust(cost_w)}   {'cache'.rjust(cache_w)}")
     lines.append(sep)
 
     total_success = 0
@@ -56,6 +60,9 @@ def bench_report(results: list[BenchResult]) -> str:
     total_latency = 0.0
     total_llm_calls = 0
     total_tests_passed = 0
+    total_cost_micros = 0
+    total_cache_hits = 0
+    total_cache_lookups = 0
 
     for r in results:
         row_tokens = r.tokens_in + r.tokens_out
@@ -65,7 +72,9 @@ def bench_report(results: list[BenchResult]) -> str:
             f"{_ok(r.tests_passed_after_apply).ljust(tests_w)}   "
             f"{str(r.llm_calls).rjust(calls_w)}   "
             f"{str(row_tokens).rjust(tok_w)}   "
-            f"{f'{r.latency_s:.3f}'.rjust(lat_w)}"
+            f"{f'{r.latency_s:.3f}'.rjust(lat_w)}   "
+            f"{f'{r.cost_usd:.4f}'.rjust(cost_w)}   "
+            f"{f'{r.cache_hit_rate:.0%}'.rjust(cache_w)}"
         )
         if r.error:
             row_str += f"   err={r.error[:80]}"
@@ -77,16 +86,25 @@ def bench_report(results: list[BenchResult]) -> str:
         total_tokens += row_tokens
         total_latency += r.latency_s
         total_llm_calls += r.llm_calls
+        total_cost_micros += r.cost_micros
+        total_cache_hits += r.cache_hits
+        total_cache_lookups += r.cache_lookups
 
     lines.append(sep)
     success_rate = total_success / len(results) if results else 0.0
     test_rate = total_tests_passed / len(results) if results else 0.0
     avg_tokens = total_tokens / total_success if total_success > 0 else 0
+    cache_rate = (
+        total_cache_hits / total_cache_lookups if total_cache_lookups else 0.0
+    )
     lines.append(
         f"total: {len(results)} task(s) | success: {total_success}/{len(results)} "
         f"({success_rate:.0%}) | tests_passed: {total_tests_passed}/{len(results)} "
         f"({test_rate:.0%}) | llm_calls: {total_llm_calls} | tokens: {total_tokens} "
-        f"(avg {avg_tokens:.0f}/success) | latency: {total_latency:.3f}s"
+        f"(avg {avg_tokens:.0f}/success) | latency: {total_latency:.3f}s | "
+        f"cost: ${total_cost_micros / 1_000_000:.4f} "
+        f"(${total_cost_micros / 1_000_000 / len(results):.4f}/task) | "
+        f"cache: {cache_rate:.0%} of {total_cache_lookups} lookup(s)"
     )
 
     return "\n".join(lines)

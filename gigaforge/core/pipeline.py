@@ -3941,6 +3941,56 @@ class TaskPipeline:
         attempts[phase] = prior + 1
         return prior, int(repeats.get(phase, 0))
 
+    def _with_phase_skills(self, ctx: RunContext, phase: str, prompt: str) -> str:
+        """Prepend the skills that apply to *this phase*, once per run.
+
+        **Why this is not in the prefix.**  The prefix is built once, before any
+        phase runs, so it cannot know the phase — and a skill declared
+        ``phase_only`` (``repair``, which applies to ``fix`` and nothing else)
+        was therefore never selected at all.  Measured: ``select_skills`` was
+        called exactly once, from ``_build_prefix``, with ``phase=""``, so the
+        repair procedure — the one that says "if the same diff failed twice, the
+        third identical attempt will fail identically" — never reached a single
+        repair call.
+
+        It is prepended to the *user* message rather than the system prefix
+        because the prefix must stay byte-identical across the run for the
+        provider's prefix cache to hit.  A phase-specific block in the system
+        message would invalidate that cache on every phase change.
+
+        Each skill is injected at most once per run: a repair loop calls ``fix``
+        five times and the procedure does not become truer with repetition.
+        """
+        try:
+            from gigaforge.skills import render_skills, select_skills
+
+            kind = ""
+            try:
+                kind = _task_kind_for(self, ctx).kind
+            except Exception:  # noqa: BLE001 - a prompt must not fail a run
+                kind = ""
+            chosen = select_skills(
+                kind=kind, phase=phase, goal=_goal_of(ctx), budget_tokens=600
+            )
+            injected = ctx.extras.setdefault("phase_skills_injected", set())
+            fresh = [s for s in chosen if s.name not in injected]
+            if not fresh:
+                return prompt
+            injected.update(s.name for s in fresh)
+            block = render_skills(fresh)
+            if not block:
+                return prompt
+            self._event(
+                "pipeline.phase_skills",
+                run_id=ctx.run_id,
+                phase=phase,
+                selected=[s.name for s in fresh],
+            )
+            return f"{block}\n\n{prompt}"
+        except Exception as exc:  # noqa: BLE001 - a prompt must not fail a run
+            self._degraded("phase_skills", exc, "ask")
+            return prompt
+
     def _ask(self, phase: str, prompt: str, ctx: RunContext,
              *, temperature: Optional[float] = None) -> str:
         """Route a phase call through the router and return the answer text.
@@ -3952,6 +4002,7 @@ class TaskPipeline:
         """
         if self.router is None:
             raise PipelineError("no model client is wired into the pipeline")
+        prompt = self._with_phase_skills(ctx, phase, prompt)
         messages = ctx.state.messages(extra=[{"role": "user", "content": prompt}])
         max_tokens = None
         budget = int(ctx.extras.get("budget_tokens") or 0)

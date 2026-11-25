@@ -660,6 +660,24 @@ class BenchResult:
     #: result built directly (a test, a single ad-hoc run) has no attempt count,
     #: and reporting 0 passes for a successful run would be a lie.
     passes: int = -1
+    #: What this task cost, in micro-USD.  Tokens alone do not answer the
+    #: question a budget owner asks: the same token count on a different model is
+    #: a different bill, and the ladder's whole point is to move between models.
+    cost_micros: int = 0
+    #: Cache lookups and hits for this task.  A bare ``cache_hit`` bool says
+    #: whether the LAST lookup hit; the rate says whether the cache works.
+    cache_hits: int = 0
+    cache_lookups: int = 0
+
+    @property
+    def cost_usd(self) -> float:
+        return self.cost_micros / 1_000_000
+
+    @property
+    def cache_hit_rate(self) -> float:
+        if self.cache_lookups <= 0:
+            return 0.0
+        return self.cache_hits / self.cache_lookups
 
     @property
     def pass_at_k(self) -> float:
@@ -700,6 +718,11 @@ class BenchResult:
             "attempts": self.attempts,
             "passes": self.passes,
             "pass_at_k": round(self.pass_at_k, 4),
+            "cost_micros": self.cost_micros,
+            "cost_usd": round(self.cost_usd, 6),
+            "cache_hits": self.cache_hits,
+            "cache_lookups": self.cache_lookups,
+            "cache_hit_rate": round(self.cache_hit_rate, 4),
             "error": self.error[:200] if self.error else "",
         }
 
@@ -949,5 +972,12 @@ class BenchRunner:
             tests_passed_after_apply=tests_passed or (
                 artifact_ok and bool(fixture.artifact_must_contain)
             ),
+            # Cost and cache come from the run's own accounting, not from a
+            # second estimate: the pipeline already prices every call against
+            # the model it actually used, and re-deriving it here would be a
+            # second source of truth for the same number.
+            cost_micros=int(getattr(result, "cost_micros", 0) or 0),
+            cache_hits=int(getattr(result, "cache_hits", 0) or 0),
+            cache_lookups=int(getattr(result, "cache_lookups", 0) or 0),
             error=verify_error or str(getattr(result, "error", "") or ""),
         )
