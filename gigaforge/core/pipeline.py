@@ -2372,8 +2372,14 @@ class TaskPipeline:
             observed = str(step.get("observation") or "").strip()
             if observed:
                 observations.append(f"- {str(step.get('action') or 'tool')}: {observed[:1500]}")
-        if not observations and not searched:
+        if not observations and not searched and narration.strip():
             return narration
+        # An answer goal with no observations and no narration still needs a
+        # reply.  Measured live: "What is 2+2? Answer in chat" produced an
+        # episode that finished with an empty ``final_text`` and no tool calls,
+        # so this method returned "" and the run reported ``chars: 0`` twice and
+        # then ``needs_attention``.  The question is answerable without any
+        # tool; the only thing missing was asking.
         material = "\n".join(observations[:12]) or "(no tool output)"
         prompt = build_phase_prompt(
             "summarize",
