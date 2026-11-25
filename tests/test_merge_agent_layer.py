@@ -15,7 +15,6 @@ the suite is deterministic and free.
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -23,33 +22,17 @@ from typing import Any
 import pytest
 
 from gigaforge.core.langgraph_runtime import (
-    LANGGRAPH_AVAILABLE,
     graph_state_summary,
     iter_graph_events,
     open_checkpointer,
     thread_config,
 )
 
-# The level-2 agent layer is part of the product, not an optional extra: the
-# goal engine defaults to LangGraph.  Skipping this suite silently when the
-# package is missing is how the whole layer stayed unverified, so the skip is
-# now opt-in — set ``GIGAFORGE_ALLOW_MISSING_LANGGRAPH=1`` to run a bare
-# install, and CI (which installs the ``dev`` extra) fails loudly instead.
-_ALLOW_MISSING = os.environ.get("GIGAFORGE_ALLOW_MISSING_LANGGRAPH") == "1"
-
-pytestmark = pytest.mark.skipif(
-    not LANGGRAPH_AVAILABLE and _ALLOW_MISSING,
-    reason="langgraph is not installed (allowed by GIGAFORGE_ALLOW_MISSING_LANGGRAPH)",
-)
-
-
 def test_langgraph_is_installed() -> None:
-    """A bare install must not silently drop the agent layer's coverage."""
-    assert LANGGRAPH_AVAILABLE, (
-        "langgraph is required for the level-2 agent layer; install the 'dev' "
-        "extra (pip install -e '.[dev]') or set "
-        "GIGAFORGE_ALLOW_MISSING_LANGGRAPH=1 to skip this suite deliberately"
-    )
+    """The base install must include the agent runtime."""
+    from gigaforge.core.langgraph_runtime import require_langgraph
+
+    require_langgraph()
 
 
 # ── fakes ────────────────────────────────────────────────────────────────────
@@ -78,13 +61,30 @@ class FakePipeline:
         self.calls = 0
         self.changed = changed or ["calc.py"]
         self.prompts: list[str] = []
+        self.budgets: list[int] = []
 
     def run(self, prompt: str, **kwargs: Any) -> FakeResult:
         self.calls += 1
         self.prompts.append(prompt)
+        budget = int(kwargs.get("budget_tokens") or 0)
+        self.budgets.append(budget)
+        tokens = min(7, budget) if budget else 7
         if self.calls >= self.accept_on:
-            return FakeResult(accepted=True, changed=self.changed, diff="--- a\n+++ b\n")
-        return FakeResult(accepted=False, error="validator rejected the diff")
+            return FakeResult(
+                accepted=True, changed=self.changed, diff="--- a\n+++ b\n", tokens=tokens
+            )
+        return FakeResult(
+            accepted=False, error="validator rejected the diff", tokens=tokens
+        )
+
+
+class OverBudgetPipeline(FakePipeline):
+    """Reports more usage than the goal budget passed by the graph."""
+
+    def run(self, prompt: str, **kwargs: Any) -> FakeResult:
+        result = super().run(prompt, **kwargs)
+        result.tokens = int(kwargs.get("budget_tokens") or 0) + 1
+        return result
 
 
 class FakeCheck:
@@ -195,18 +195,98 @@ def test_goal_graph_retries_until_verification_passes(tmp_path: Path) -> None:
     assert "Previous cycle feedback" in pipeline.prompts[1]
 
 
-def test_goal_graph_stops_at_cycle_limit(tmp_path: Path) -> None:
+def test_goal_graph_stops_repeating_failed_output_before_cycle_limit(tmp_path: Path) -> None:
     pipeline = FakePipeline(accept_on=99)
     result = _run_goal(tmp_path, pipeline=pipeline, max_cycles=3)
-    assert pipeline.calls == 3
+    assert pipeline.calls == 2
     assert result.status == "needs_attention"
     assert result.accepted is False
+    assert "same output and failure repeated" in result.error
+    assert result.cycles[0].output_fingerprint
+    assert result.cycles[0].output_fingerprint == result.cycles[1].output_fingerprint
+
+
+def test_goal_graph_stops_repeating_verification_failure(tmp_path: Path) -> None:
+    pipeline = FakePipeline()
+    result = _run_goal(
+        tmp_path,
+        pipeline=pipeline,
+        verifier=FakeVerifier([False]),
+        max_cycles=6,
+    )
+
+    assert pipeline.calls == 2
+    assert len(result.cycles) == 2
+    assert result.status == "needs_attention"
+    assert result.cycles[0].output_fingerprint == result.cycles[1].output_fingerprint
+    assert result.cycles[0].verification == result.cycles[1].verification
+
+
+def test_goal_graph_shares_token_budget_across_cycles(tmp_path: Path) -> None:
+    pipeline = FakePipeline(accept_on=99)
+
+    result = _run_goal(
+        tmp_path, pipeline=pipeline, max_cycles=5, budget_tokens=7
+    )
+
+    assert pipeline.calls == 1
+    assert pipeline.budgets == [7]
+    assert result.cycles[0].tokens == result.tokens == result.budget_tokens == 7
+    assert result.status == "blocked"
+    assert "budget exhausted" in result.error
+
+
+def test_goal_graph_blocks_when_pipeline_exceeds_remaining_token_budget(
+    tmp_path: Path,
+) -> None:
+    pipeline = OverBudgetPipeline(accept_on=99)
+    events: list[str] = []
+
+    result = _run_goal(
+        tmp_path,
+        pipeline=pipeline,
+        max_cycles=5,
+        budget_tokens=7,
+        emit=lambda event, _payload: events.append(event),
+    )
+
+    assert pipeline.calls == 1
+    assert result.status == "blocked"
+    assert result.accepted is False
+    assert result.tokens == 8
+    assert result.budget_tokens == 7
+    assert "exceeded the remaining goal token budget" in result.error
+    assert "goal.budget_exceeded" in events
+
+
+def test_goal_graph_resume_keeps_usage_and_accepts_a_larger_total_cap(
+    tmp_path: Path,
+) -> None:
+    pipeline = FakePipeline(accept_on=99)
+    first = _run_goal(
+        tmp_path, pipeline=pipeline, max_cycles=5, budget_tokens=7
+    )
+
+    resumed = _run_goal(
+        tmp_path,
+        pipeline=pipeline,
+        goal_id=first.goal_id,
+        resume=True,
+        max_cycles=5,
+        budget_tokens=14,
+    )
+
+    assert pipeline.budgets == [7, 7]
+    assert resumed.tokens == resumed.budget_tokens == 14
+    assert resumed.status == "needs_attention"
 
 
 def test_goal_graph_blocks_when_verifier_unavailable(tmp_path: Path) -> None:
-    result = _run_goal(tmp_path, verifier=FakeVerifier([None]))
+    pipeline = FakePipeline()
+    result = _run_goal(tmp_path, pipeline=pipeline, verifier=FakeVerifier([None]))
     assert result.status == "blocked"
     assert result.accepted is False
+    assert pipeline.calls == 1
 
 
 def test_goal_graph_records_engine_and_persists(tmp_path: Path) -> None:
@@ -320,10 +400,12 @@ class FakeClient:
     def __init__(self, answers: list[str]) -> None:
         self.answers = list(answers)
         self.calls = 0
+        self.max_tokens: list[int] = []
 
     async def chat(self, model: Any, messages: Any, **kwargs: Any) -> FakeChatResult:
         index = min(self.calls, len(self.answers) - 1)
         self.calls += 1
+        self.max_tokens.append(int(kwargs.get("max_tokens") or 0))
         return FakeChatResult(self.answers[index])
 
 
@@ -335,6 +417,16 @@ class FakeRouter:
 
 
 class FakeBudgets:
+    def __init__(self, remaining: int = 100_000) -> None:
+        self.task_remaining = remaining
+        self.reservations: list[tuple[int, int]] = []
+
+    def remaining(self, phase: str) -> int:
+        return 100_000
+
+    def task_remaining_for(self, task_id: str) -> int:
+        return self.task_remaining
+
     def check(self, *a: Any, **k: Any) -> None:
         return None
 
@@ -345,6 +437,12 @@ class FakeBudgets:
         return None
 
     def reserve(self, *a: Any, **k: Any) -> Any:
+        tokens_in, tokens_out = int(a[1]), int(a[2])
+        if tokens_in + tokens_out > self.task_remaining:
+            from gigaforge.client.errors import BudgetExceeded
+
+            raise BudgetExceeded("test task budget exceeded")
+        self.reservations.append((tokens_in, tokens_out))
         from tests.budget_stubs import NullClaim
 
         return NullClaim()
@@ -357,6 +455,7 @@ class FakeTracer:
 
 class FakeSettings:
     budget_plan_out = 600
+    budget_react_out = 1_800
 
 
 class FakeTool:
@@ -429,6 +528,31 @@ def test_react_graph_runs_a_tool_then_finishes(tmp_path: Path) -> None:
     assert grep.calls == 1
     assert result.finished is True
     assert result.llm_calls == 2
+
+
+def test_react_graph_uses_react_output_cap_and_remaining_task_budget(
+    tmp_path: Path,
+) -> None:
+    from gigaforge.agents.langgraph_react import run_react_graph
+
+    finish = json.dumps({"thought": "done", "action": "finish", "action_input": "[]"})
+    runner = _react_runner([finish], [])
+    runner.guards.install(runner.registry)
+    trajectory = [{
+        "role": "user",
+        "content": runner.compose_initial_prompt("find add", _task_state()),
+    }]
+    trajectory.extend(runner.guards.opening_messages(trajectory))
+    estimated_input = (sum(len(item["content"]) for item in trajectory) + 2) // 3
+    runner._budgets.task_remaining = estimated_input + 700
+
+    result = run_react_graph(
+        runner, "find add", _task_state(), ctx=_react_ctx(tmp_path), thread_id="t-react-budget"
+    )
+
+    assert result.finish_reason == "finish_action"
+    assert runner.client.max_tokens == [700]
+    assert runner.budgets.reservations == [(estimated_input, 700)]
 
 
 def test_react_graph_stops_at_max_steps(tmp_path: Path) -> None:
@@ -524,6 +648,47 @@ def test_subagent_graph_preserves_spawn_order(tmp_path: Path) -> None:
     assert [r["spawn_index"] for r in results] == [0, 1, 2]
 
 
+def test_subagent_graph_respects_configured_concurrency(tmp_path: Path) -> None:
+    import threading
+    import time
+
+    from gigaforge.agents.langgraph_subagents import run_subagents_graph
+    from gigaforge.core.contracts import SubAgentSpec
+
+    class Runner:
+        max_workers = 1
+
+        def __init__(self) -> None:
+            self.active = 0
+            self.peak = 0
+            self.lock = threading.Lock()
+
+        def spawn_one(self, spec: Any, *, parent_ctx: Any, index: int) -> dict[str, Any]:
+            with self.lock:
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+            time.sleep(0.02)
+            with self.lock:
+                self.active -= 1
+            return {"name": spec.name, "spawn_index": index, "ok": True}
+
+    runner = Runner()
+    spawns = [
+        SubAgentSpec(name=f"work-{index}", goal=f"goal {index}")
+        for index in range(3)
+    ]
+
+    results = run_subagents_graph(
+        runner,
+        spawns,
+        lambda *_args: {},
+        thread_id=f"subagent-max-one-{tmp_path.name}",
+    )
+
+    assert runner.peak == 1
+    assert [result.name for result in results] == ["work-0", "work-1", "work-2"]
+
+
 def test_subagent_graph_empty_spawns() -> None:
     from gigaforge.agents.langgraph_subagents import run_subagents_graph
     from gigaforge.agents.subagents import SubAgentRunner
@@ -582,7 +747,8 @@ def test_goal_engine_switch_defaults_to_langgraph(monkeypatch: pytest.MonkeyPatc
     monkeypatch.delenv("GIGAFORGE_GOAL_ENGINE", raising=False)
     assert _langgraph_goal_enabled() is True
     monkeypatch.setenv("GIGAFORGE_GOAL_ENGINE", "classic")
-    assert _langgraph_goal_enabled() is False
+    with pytest.raises(RuntimeError, match="classic is no longer supported"):
+        _langgraph_goal_enabled()
     monkeypatch.setenv("GIGAFORGE_GOAL_ENGINE", "langgraph")
     assert _langgraph_goal_enabled() is True
 

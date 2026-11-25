@@ -9,7 +9,7 @@ observation in the trajectory, which is what pushes a run into compaction.
 The cache is deliberately narrow, because a stale observation is a correctness
 bug and a cache that is wrong is worse than no cache:
 
-* only **read-only** tools are cached (``grep``, ``read_structure``); a tool
+* only **read-only** tools are cached (``grep``, ``read_file``, ``read_structure``); a tool
   that can change the tree is never cached, so a write is always observed;
 * the key includes the tool, its input **and** the mtime/size of every file the
   workspace has touched since the run started — so an edit invalidates the
@@ -34,7 +34,7 @@ __all__ = ["ObservationCache", "CACHEABLE_TOOLS", "READ_ONLY_TOOLS"]
 
 #: Tools whose output is a pure function of the tree.  Anything that can write
 #: is excluded by construction, not by a flag someone can forget to set.
-CACHEABLE_TOOLS = frozenset({"grep", "read_structure"})
+CACHEABLE_TOOLS = frozenset({"grep", "read_file", "read_structure"})
 
 #: Tools that cannot change the tree, and so may run in a parallel batch.
 #:

@@ -66,6 +66,13 @@ if exist "%GF_ROOT%\.venv\Scripts\python.exe" (
         echo   [OK] created venv  !GF_PYTHON!
     )
 )
+!GF_PYTHON! -c "import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)"
+if errorlevel 1 (
+    echo   [X] The selected project interpreter is older than Python 3.11.
+    echo       Recreate .venv with Python 3.11 or newer before starting GigaForge.
+    pause
+    exit /b 1
+)
 
 :: Derive the windowed interpreter from the chosen python by name substitution,
 :: then fall back to a console build if pythonw is genuinely absent.  Guessing a
@@ -94,18 +101,29 @@ if errorlevel 1 (
     echo   [OK] gigaforge importable
 )
 
-:: Check the full declared runtime set. This repairs editable installs created
-:: before a dependency was added to the base package.
-!GF_PYTHON! -c "import httpx, pydantic, typer, rich, tree_sitter, tree_sitter_python, tree_sitter_javascript, requests, playwright, pytest" >nul 2>&1
+:: Check the full declared runtime set, including both checkpoint adapters.
+:: This repairs editable installs created before a dependency was added.
+!GF_PYTHON! -c "import httpx, pydantic, typer, rich, tree_sitter, tree_sitter_python, tree_sitter_javascript, requests, playwright, pytest, langgraph.graph, langgraph.types, langgraph.checkpoint.sqlite, langgraph.checkpoint.sqlite.aio, aiosqlite; from langgraph.checkpoint.sqlite import SqliteSaver; from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver" >nul 2>&1
 if errorlevel 1 (
-    echo   [..] runtime dependency missing - updating GigaForge dependencies
+    echo   [..] required runtime dependency missing - installing GigaForge dependencies
     !GF_PYTHON! -m pip install -e "%GF_ROOT%" --quiet
     if errorlevel 1 (
-        echo   [!] dependency update failed; the app will still open and retry setup at startup
+        echo   [X] required dependency installation failed. GigaForge cannot start.
+        echo       Check network access and Python permissions, then run: python -m pip install -e .
+        pause
+        exit /b 1
     ) else (
         echo   [OK] runtime dependencies installed
     )
 )
+!GF_PYTHON! -c "import langgraph.graph, langgraph.types, langgraph.checkpoint.sqlite, langgraph.checkpoint.sqlite.aio, aiosqlite; from langgraph.checkpoint.sqlite import SqliteSaver; from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver" >nul 2>&1
+if errorlevel 1 (
+    echo   [X] required LangGraph runtime is still unavailable after installation.
+    echo       Check the install output and run: python -m pip install -e .
+    pause
+    exit /b 1
+)
+echo   [OK] LangGraph runtime available
 
 :: --- 4. .env ----------------------------------------------------------
 if exist "%GF_ROOT%\.env" (

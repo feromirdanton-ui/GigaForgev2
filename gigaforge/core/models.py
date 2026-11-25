@@ -22,7 +22,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -242,13 +241,27 @@ def apply_roles(cfg: Any, roles: RoleModels) -> Any:
     )
 
 
-def fetch_models(client: Any, *, path: Optional[Path] = None,
-                 ttl_s: float = CACHE_TTL_S, force: bool = False) -> ModelCatalog:
-    """Ask the provider for its catalogue, using the on-disk cache when fresh."""
+def fetch_models(
+    client: Any,
+    *,
+    path: Optional[Path] = None,
+    ttl_s: float = CACHE_TTL_S,
+    force: bool = False,
+    configured_cheap: str = "",
+    configured_strong: str = "",
+    configured_default: str = "",
+) -> ModelCatalog:
+    """Ask the provider for its catalogue and honor configured model preferences."""
     cache = Path(path) if path else Path(".gigaforge/models.json")
     if not force:
         cached = load_catalog(cache, ttl_s=ttl_s)
         if cached is not None and cached.available:
+            cached.roles = resolve_roles(
+                cached.models,
+                configured_cheap=configured_cheap,
+                configured_strong=configured_strong,
+                configured_default=configured_default,
+            )
             return cached
     models: list[str] = []
     try:
@@ -269,8 +282,17 @@ def fetch_models(client: Any, *, path: Optional[Path] = None,
             return cached
         return ModelCatalog(models=[], roles=RoleModels(), source="configured", error=error)
 
-    catalog = ModelCatalog(models=sorted(set(models)), roles=resolve_roles(models),
-                           fetched_at=time.time(), source="live")
+    catalog = ModelCatalog(
+        models=sorted(set(models)),
+        roles=resolve_roles(
+            models,
+            configured_cheap=configured_cheap,
+            configured_strong=configured_strong,
+            configured_default=configured_default,
+        ),
+        fetched_at=time.time(),
+        source="live",
+    )
     catalog.save(cache)
     return catalog
 

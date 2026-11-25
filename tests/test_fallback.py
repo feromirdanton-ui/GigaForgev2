@@ -132,6 +132,12 @@ def test_the_react_loop_stops_asking_after_three_parse_failures() -> None:
             )
 
     class _Budgets:
+        def remaining(self, phase):
+            return 10**9
+
+        def task_remaining_for(self, task_id):
+            return 10**9
+
         def check(self, *a, **k):
             return None
 

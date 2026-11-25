@@ -50,6 +50,16 @@ _STYLE_BLOCK_RE = re.compile(r"<style\b[^>]*>(.*?)</style\s*>", re.S | re.I)
 _STRAY_STYLE_TAG_RE = re.compile(r"</?style\b[^>]*>", re.I)
 _BODY_RE = re.compile(r"<body\b[^>]*>(.*?)</body\s*>", re.S | re.I)
 _HEAD_RE = re.compile(r"<head\b[^>]*>(.*?)</head\s*>", re.S | re.I)
+_HTML_CLOSE_RE = re.compile(r"</html\s*>", re.I)
+_ID_ATTRIBUTE_RE = re.compile(
+    r"""(?<![\w:-])id\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))""",
+    re.I,
+)
+_TRAILING_STYLE_RE = re.compile(
+    r"\A\s*(?:(?:<!--.*?-->)\s*)*<style\b[^>]*>(.*?)"
+    r"(?:</style\s*>)?\s*(?:(?:<!--.*?-->)\s*)*\Z",
+    re.S | re.I,
+)
 _TEXT_NODE_RE = re.compile(r">([^<>]+)<", re.S)
 
 
@@ -198,6 +208,35 @@ def _text_nodes(html: str) -> list[tuple[int, int, str]]:
 def _known_css(html: str) -> str:
     """The concatenated content of every ``<style>`` block on the page."""
     return "\n".join(match.group(1) for match in _STYLE_BLOCK_RE.finditer(html))
+
+
+def _stray_style_tag_count(html: str) -> int:
+    """Count style tags outside the document head, including after </html>."""
+    head_match = _HEAD_RE.search(html)
+    if not head_match:
+        return len(_STRAY_STYLE_TAG_RE.findall(html))
+    head_start, head_end = head_match.span()
+    return sum(
+        1 for match in _STRAY_STYLE_TAG_RE.finditer(html)
+        if not head_start <= match.start() < head_end
+    )
+
+
+def _duplicate_ids(html: str) -> list[tuple[str, int]]:
+    """Return duplicated, non-empty IDs from markup, ignoring comments and code."""
+    markup = re.sub(r"<!--.*?-->", " ", _strip_opaque(html), flags=re.S)
+    counts: dict[str, int] = {}
+    for tag in re.finditer(r"<[a-z][^>]*>", markup, re.I):
+        match = _ID_ATTRIBUTE_RE.search(tag.group())
+        if not match:
+            continue
+        value = next((group for group in match.groups() if group is not None), "").strip()
+        if value:
+            counts[value] = counts.get(value, 0) + 1
+    return sorted(
+        ((value, count) for value, count in counts.items() if count > 1),
+        key=lambda item: item[0].lower(),
+    )
 
 
 def leaked_css_text(html: str) -> list[str]:
@@ -351,13 +390,7 @@ def duplicate_landmarks(html: str) -> list[tuple[str, int]]:
     """
     found: list[tuple[str, int]] = []
     for role in _SINGLETON_ROLES:
-        count = 0
-        # ``<footer>`` and ``<div class="footer">`` are the same role.
-        count += len(re.findall(rf"<{role}\b", html, re.I))
-        count += len(re.findall(
-            rf'<[a-z][a-z0-9]*\b[^>]*\bclass\s*=\s*["\'][^"\']*\b{role}\b[^"\']*["\']',
-            html, re.I,
-        ))
+        count = len(_landmark_spans(html, role))
         if count > 1:
             found.append((role, count))
     return found
@@ -386,6 +419,8 @@ class StructureReport:
     duplicate_styles: int = 0
     stray_style_tags: int = 0
     duplicate_landmarks: list[tuple[str, int]] = field(default_factory=list)
+    duplicate_ids: list[tuple[str, int]] = field(default_factory=list)
+    duplicate_heads: int = 0
 
     @property
     def ok(self) -> bool:
@@ -395,6 +430,8 @@ class StructureReport:
             or self.duplicate_styles
             or self.stray_style_tags
             or self.duplicate_landmarks
+            or self.duplicate_ids
+            or self.duplicate_heads
         )
 
     def issues(self) -> list[str]:
@@ -415,20 +452,26 @@ class StructureReport:
             out.append(
                 f"{count} {role} landmarks on one page — a page has one {role}"
             )
+        for value, count in self.duplicate_ids:
+            out.append(f"id {value!r} appears {count} times — IDs must be unique")
+        if self.duplicate_heads:
+            out.append(
+                f"{self.duplicate_heads + 1} <head> elements on one page — expected one"
+            )
         return out
 
 
 def audit_html_structure(html: str) -> StructureReport:
     """Report structural defects that a browser would show but tags do not."""
-    body_match = _BODY_RE.search(html)
-    body = body_match.group(1) if body_match else ""
-    stray = len(_STRAY_STYLE_TAG_RE.findall(body)) if body else 0
+    head_count = len(re.findall(r"<head\b", html, re.I))
     return StructureReport(
         leaked_css=leaked_css_text(html),
         duplicate_blocks=duplicate_blocks(html),
         duplicate_styles=duplicate_style_blocks(html),
-        stray_style_tags=stray,
+        stray_style_tags=_stray_style_tag_count(html),
         duplicate_landmarks=duplicate_landmarks(html),
+        duplicate_ids=_duplicate_ids(html),
+        duplicate_heads=max(0, head_count - 1),
     )
 
 
@@ -462,7 +505,49 @@ def repair_html_structure(html: str) -> tuple[str, list[str]]:
     actions: list[str] = []
     out = html
 
-    # 1. Stray style tags in the body.
+    # 1. A stylesheet appended after </html> cannot participate in the page
+    # head. Models commonly do this when an edit misses </style>; move only a
+    # CSS-shaped trailing style block, preserving unrelated trailing comments.
+    html_close = _HTML_CLOSE_RE.search(out)
+    if html_close:
+        trailing = out[html_close.end():]
+        trailing_match = _TRAILING_STYLE_RE.fullmatch(trailing)
+        if trailing_match:
+            extra = trailing_match.group(1).strip()
+            known = _known_css(out)
+            comparable = re.sub(r"/\*.*?\*/", "", extra, flags=re.S).strip()
+            if extra and looks_like_css(comparable, known_css=known):
+                if _normalise(comparable) in _normalise(known):
+                    action = "removed duplicate trailing stylesheet outside </html>"
+                else:
+                    head_match = _HEAD_RE.search(out[:html_close.start()])
+                    if head_match:
+                        head = out[head_match.start():head_match.end()]
+                        style_match = _STYLE_BLOCK_RE.search(head)
+                        if style_match:
+                            insert_at = head_match.start() + style_match.end(1)
+                            out = out[:insert_at] + "\n" + extra + out[insert_at:]
+                        else:
+                            insert_at = head_match.start(1) + len(head_match.group(1))
+                            out = (
+                                out[:insert_at]
+                                + f"\n<style>\n{extra}\n</style>\n"
+                                + out[insert_at:]
+                            )
+                        action = "moved trailing stylesheet rules into <head>"
+                    else:
+                        action = ""
+                if action:
+                    # The tail matched only comments and this style block. Keep
+                    # comments, but remove the stylesheet that was moved/deduped.
+                    new_html_close = _HTML_CLOSE_RE.search(out)
+                    if new_html_close:
+                        comments = re.findall(r"<!--.*?-->", trailing, re.S)
+                        cleaned_tail = "".join(f"\n{comment}" for comment in comments)
+                        out = out[:new_html_close.end()] + cleaned_tail
+                        actions.append(action)
+
+    # 2. Stray style tags in the body.
     body_match = _BODY_RE.search(out)
     if body_match:
         body = body_match.group(1)
@@ -471,7 +556,7 @@ def repair_html_structure(html: str) -> tuple[str, list[str]]:
             out = out[: body_match.start(1)] + cleaned + out[body_match.end(1):]
             actions.append("removed stray <style> tag(s) from <body>")
 
-    # 2. Stylesheet text sitting in the body.
+    # 3. Stylesheet text sitting in the body.
     leaked = leaked_css_text(out)
     if leaked:
         existing = " ".join(
@@ -516,7 +601,7 @@ def repair_html_structure(html: str) -> tuple[str, list[str]]:
                     )
                     actions.append("created <style> for leaked stylesheet rules")
 
-    # 3. Duplicate <style> blocks.
+    # 4. Duplicate <style> blocks.
     seen_styles: set[str] = set()
     style_spans: list[tuple[int, int]] = []
     for match in _STYLE_BLOCK_RE.finditer(out):
@@ -530,7 +615,7 @@ def repair_html_structure(html: str) -> tuple[str, list[str]]:
         out = _remove_spans(out, style_spans)
         actions.append(f"removed {len(style_spans)} duplicate <style> block(s)")
 
-    # 4. Duplicate block elements.
+    # 5. Duplicate block elements.
     for tag in _BLOCK_TAGS:
         seen_blocks: set[str] = set()
         spans: list[tuple[int, int]] = []
@@ -545,7 +630,7 @@ def repair_html_structure(html: str) -> tuple[str, list[str]]:
             out = _remove_spans(out, spans)
             actions.append(f"removed {len(spans)} duplicate <{tag}> block(s)")
 
-    # 5. Duplicate landmarks.  A page has one footer and one header; a second
+    # 6. Duplicate landmarks.  A page has one footer and one header; a second
     # one is the section-by-section generator's characteristic defect (two
     # children both closing the page).  The *first* one is kept: the assembler
     # writes the sections in plan order, so the first footer is the one the

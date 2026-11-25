@@ -201,10 +201,13 @@ tests there, then publishes only verified changed files with atomic file
 replacement. If the
 destination changed while the goal was running, publication pauses with a
 conflict report and keeps the workspace for resume. Successful runs remove the
-large project copy while retaining the goal report. The application installs
-its Goal parser/test dependencies and Playwright as core dependencies, checks
-Chromium on startup, and provisions its browser binary automatically if it is
-missing:
+large project copy while retaining the goal report. LangGraph and its SQLite
+checkpointers are required base dependencies for Goal, ReAct, chat, and
+sub-agents. The Windows launcher and runtime verify/install missing declared
+dependencies at startup and stop with an actionable error if setup fails;
+there is no legacy-engine fallback. Playwright is also a core dependency. The
+application checks Chromium on startup and provisions its browser binary
+automatically if it is missing:
 
 ```bash
 gigaforge goal "Build a game ..." --max-cycles 4 --json

@@ -327,6 +327,10 @@ def run_subagents_graph(
         runner, agent_factory, checkpointer=checkpointer, parent_ctx=parent_ctx
     )
     config = thread_config(thread_id)
+    concurrency = getattr(runner, "max_workers", None)
+    if concurrency is None:
+        concurrency = getattr(getattr(runner, "settings", None), "max_parallel", len(spawns))
+    config["max_concurrency"] = max(1, min(len(spawns), int(concurrency or 1)))
     initial: SubAgentGraphState = {
         "spawns": [normalise_spawn(spawn) for spawn in spawns],
         "results": [],

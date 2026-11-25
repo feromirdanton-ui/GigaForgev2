@@ -32,6 +32,7 @@ nothing ends it immediately rather than burning the budget on no-op repairs.
 from __future__ import annotations
 
 import builtins
+import logging
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -46,6 +47,8 @@ from .config import FirewallConfig
 from .diff import Applier, ApplyResult, ParsedDiff, parse
 from .errors import DiffParseError
 
+log = logging.getLogger(__name__)
+
 #: A repair callback receives ``(attempt, feedback, previous)`` and returns a new
 #: diff text (or ``None`` to stop the loop).
 RetryFn = Callable[[int, "RepairRequest", str], Optional[str]]
@@ -53,6 +56,32 @@ RetryFn = Callable[[int, "RepairRequest", str], Optional[str]]
 #: Language builtins are never "missing symbols": ``ValueError("x")`` is a call
 #: the symbol index can never resolve, and reporting it would be pure noise.
 _BUILTINS = frozenset(dir(builtins))
+log = logging.getLogger(__name__)
+
+
+def _add_hinted_file_headers(diff_text: str, path_hint: str) -> str:
+    """Make an accepted bare hunk a portable unified diff."""
+    text = str(diff_text or "")
+    path = str(path_hint or "").strip().replace("\\", "/")
+    if not text or not path or path.startswith("/") or ":" in path:
+        return text
+    if path.startswith("./"):
+        path = path[2:]
+
+    lines = text.splitlines()
+    if any(line.startswith(("diff --git ", "--- ", "+++ ")) for line in lines):
+        return text
+    hunk_index = next(
+        (index for index, line in enumerate(lines) if line.startswith("@@")),
+        None,
+    )
+    if hunk_index is None:
+        return text
+    lines[hunk_index:hunk_index] = [f"--- a/{path}", f"+++ b/{path}"]
+    result = "\n".join(lines)
+    if text.endswith(("\n", "\r")):
+        result += "\n"
+    return result
 
 
 # ── reporting ────────────────────────────────────────────────────────────
@@ -308,7 +337,7 @@ class DiffValidator:
             max_retries=budget,
             reason="not attempted",
         )
-        current = diff_text
+        current = _add_hinted_file_headers(diff_text, path_hint)
 
         for index in range(budget + 1):
             attempt = self._run_once(current, index + 1, dry_run=dry_run,
@@ -680,16 +709,23 @@ class DiffValidator:
             target = self.root / rel
             if not target.is_file():
                 continue
-            for args, label in ((["check", "--fix", "--quiet", str(target)], "fix"),
-                                (["format", "--quiet", str(target)], "format")):
+            changed = False
+            for args in (["check", "--fix", "--quiet", str(target)],
+                         ["format", "--quiet", str(target)]):
                 try:
-                    proc = subprocess.run([ruff, *args], capture_output=True, text=True,
-                                          timeout=90)
+                    before = target.read_bytes()
+                    subprocess.run([ruff, *args], capture_output=True, text=True, timeout=90)
+                    changed = target.read_bytes() != before or changed
                 except Exception:  # noqa: BLE001 - formatting is best effort
                     continue
-                if proc.returncode == 0 and label == "fix":
-                    notes.append(f"{rel}: auto-fixed by ruff")
+            if changed:
+                notes.append(f"{rel}: auto-fixed by ruff")
         return notes
+
+    @staticmethod
+    def _log_autofix(note: str) -> None:
+
+        log.info("diff validator auto-fix: %s", note)
 
     def _restore(self, snapshot: Mapping[str, str]) -> bool:
         """Put every snapshotted file back exactly as it was.

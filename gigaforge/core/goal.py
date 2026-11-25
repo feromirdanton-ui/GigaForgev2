@@ -12,6 +12,8 @@ applications unless the caller explicitly chooses static-only verification.
 """
 from __future__ import annotations
 
+import ast
+import hashlib
 import importlib.util
 import json
 import os
@@ -21,13 +23,14 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from html.parser import HTMLParser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Optional, Protocol, Sequence
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 from .cancellation import CancellationToken
 from .goal_workspace import GoalWorkspace
@@ -135,6 +138,7 @@ class GoalCycle:
     calls: int = 0
     duration_ms: float = 0.0
     error: str = ""
+    output_fingerprint: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -148,6 +152,7 @@ class GoalCycle:
             "calls": self.calls,
             "duration_ms": round(self.duration_ms, 3),
             "error": self.error,
+            "output_fingerprint": self.output_fingerprint,
         }
 
 
@@ -161,6 +166,7 @@ class GoalResult:
     accepted: bool
     cycles: list[GoalCycle] = field(default_factory=list)
     tokens: int = 0
+    budget_tokens: int = 0
     calls: int = 0
     started_at: str = ""
     updated_at: str = ""
@@ -180,6 +186,7 @@ class GoalResult:
             "accepted": self.accepted,
             "cycles": [cycle.to_dict() for cycle in self.cycles],
             "tokens": self.tokens,
+            "budget_tokens": self.budget_tokens,
             "calls": self.calls,
             "started_at": self.started_at,
             "updated_at": self.updated_at,
@@ -287,6 +294,7 @@ class _HtmlAudit(HTMLParser):
         self.html_count = 0
         self.body_count = 0
         self.ids: set[str] = set()
+        self.internal_targets: set[str] = set()
         self.duplicate_ids: set[str] = set()
         self.script_srcs: list[str] = []
         self.duplicate_scripts: set[str] = set()
@@ -304,6 +312,9 @@ class _HtmlAudit(HTMLParser):
             if element_id in self.ids:
                 self.duplicate_ids.add(element_id)
             self.ids.add(element_id)
+        href = values.get("href", "").strip()
+        if href.startswith("#") and len(href) > 1:
+            self.internal_targets.add(unquote(href[1:]))
         if name == "script" and values.get("src"):
             source = values["src"].strip()
             if source in self.script_srcs:
@@ -343,6 +354,9 @@ class WorkspaceVerifier:
             checks.append(self._command_check(
                 "Python syntax", [sys.executable, "-m", "py_compile", *map(str, python_files)], root
             ))
+            api_check = self._python_api_check(python_files, goal)
+            if api_check is not None:
+                checks.append(api_check)
             if self._has_python_tests(root):
                 if importlib.util.find_spec("pytest") is None:
                     checks.append(VerificationCheck(
@@ -386,6 +400,120 @@ class WorkspaceVerifier:
         return VerificationReport(checks)
 
     @staticmethod
+    def _python_api_check(
+        python_files: Sequence[Path], goal: str
+    ) -> VerificationCheck | None:
+        """Check explicitly requested public functions and duplicate definitions."""
+        started = time.monotonic()
+        required = list(dict.fromkeys(re.findall(
+            r"\b(?:public\s+)?(?:function|method)\s+([A-Za-z_]\w*)\s*\(",
+            goal,
+            re.I,
+        )))
+        modules: dict[Path, tuple[str, list[str], dict[str, Any]]] = {}
+        issues: list[str] = []
+        for path in python_files:
+            try:
+                source = path.read_text(encoding="utf-8")
+                tree = ast.parse(source, filename=str(path))
+            except (OSError, UnicodeError, SyntaxError) as exc:
+                issues.append(
+                    f"{path.name}: Python API could not be inspected ({type(exc).__name__})"
+                )
+                continue
+            definitions = [
+                node for node in tree.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            ]
+            names = [node.name for node in definitions]
+            modules[path] = (
+                source,
+                names,
+                {node.name: node for node in definitions},
+            )
+            for name in sorted(set(names)):
+                if not name.startswith("_") and names.count(name) > 1:
+                    issues.append(
+                        f"{path.name}: public function {name!r} is defined more than once"
+                    )
+
+        def tokens(name: str) -> set[str]:
+            return {
+                part.lower()
+                for part in re.split(r"[^A-Za-z0-9]+|_", name)
+                if part and part.lower() not in {"to", "from", "and"}
+            }
+
+        for name in required:
+            present = {
+                path: values[2][name]
+                for path, values in modules.items()
+                if name in values[2]
+            }
+            requested_tokens = tokens(name)
+            scores: list[tuple[float, Path]] = []
+            for path, (_source, names, _by_name) in modules.items():
+                score = max(
+                    (
+                        len(requested_tokens & tokens(existing))
+                        / max(1, len(requested_tokens | tokens(existing)))
+                        for existing in names
+                        if existing != name and not existing.startswith("_")
+                    ),
+                    default=0.0,
+                )
+                if score > 0:
+                    scores.append((score, path))
+            scores.sort(key=lambda item: (-item[0], item[1].as_posix()))
+            owner = None
+            if scores and scores[0][0] >= 0.5 and (
+                len(scores) == 1 or scores[0][0] > scores[1][0]
+            ):
+                owner = scores[0][1]
+
+            if owner is not None:
+                if owner not in present:
+                    issues.append(f"{owner.name}: requested function {name!r} is missing")
+                misplaced = sorted(path.name for path in present if path != owner)
+                if misplaced:
+                    issues.append(
+                        f"{name!r} belongs with the related API in {owner.name}, "
+                        f"not {', '.join(misplaced)}"
+                    )
+            elif len(present) != 1:
+                issues.append(
+                    f"expected exactly one definition of requested function {name!r} "
+                    f"across changed Python files, found {len(present)}"
+                )
+
+            strict_hms = name == "hms_to_seconds" and bool(re.search(
+                r"\bstrict\b[\s\S]{0,40}\bHH:MM:SS\b|\bHH:MM:SS\b[\s\S]{0,40}\bstrict\b",
+                goal,
+                re.I,
+            ))
+            if strict_hms and present:
+                source = modules[next(iter(present))][0]
+                body = ast.get_source_segment(source, next(iter(present.values()))) or ""
+                fixed_width = bool(
+                    re.search(r"(?:\\d|\[0-9\])\{2\}", body)
+                    or re.search(r"len\(\s*hms\s*\)\s*(?:!=|==)\s*8", body)
+                    or re.search(r"len\(\s*part\s*\)\s*(?:!=|==)\s*2", body)
+                )
+                if not fixed_width:
+                    issues.append(
+                        "hms_to_seconds does not enforce two-digit HH:MM:SS fields"
+                    )
+
+        if not required and not any("defined more than once" in issue for issue in issues):
+            return None
+        return VerificationCheck(
+            "Python API contract",
+            "failed" if issues else "passed",
+            "; ".join(issues) if issues else "requested public functions are present and unique",
+            time.monotonic() - started,
+        )
+
+    @staticmethod
     def _changed_paths(root: Path, changed_files: Sequence[str]) -> list[Path]:
         paths: list[Path] = []
         for raw in changed_files:
@@ -414,7 +542,13 @@ class WorkspaceVerifier:
         except FileNotFoundError as exc:
             return VerificationCheck(name, "unavailable", _safe_excerpt(str(exc)), time.monotonic() - started)
         except subprocess.TimeoutExpired as exc:
-            excerpt = _safe_excerpt((exc.stdout or "") + "\n" + (exc.stderr or ""))
+            stdout = exc.stdout or ""
+            stderr = exc.stderr or ""
+            if isinstance(stdout, bytes):
+                stdout = stdout.decode("utf-8", errors="replace")
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode("utf-8", errors="replace")
+            excerpt = _safe_excerpt(stdout + "\n" + stderr)
             return VerificationCheck(
                 name, "failed", f"timed out after {self.timeout_s}s. {excerpt}".strip(),
                 time.monotonic() - started,
@@ -451,6 +585,12 @@ class WorkspaceVerifier:
             issues.append(f"multiple <body> elements ({parser.body_count})")
         if parser.duplicate_ids:
             issues.append("duplicate id values: " + ", ".join(sorted(parser.duplicate_ids)[:8]))
+        missing_targets = parser.internal_targets - parser.ids
+        if missing_targets:
+            issues.append(
+                "internal links target missing ids: "
+                + ", ".join(f"#{target}" for target in sorted(missing_targets)[:8])
+            )
         if parser.duplicate_scripts:
             issues.append("scripts loaded more than once: " + ", ".join(sorted(parser.duplicate_scripts)[:5]))
         # Structural defects a browser shows but the tag counters above cannot
@@ -694,7 +834,12 @@ class WorkspaceVerifier:
             issues.append("best score is not persisted in local storage")
 
         game_over_dialogs: list[str] = []
-        page.on("dialog", lambda dialog: (game_over_dialogs.append(dialog.message), dialog.accept()))
+
+        def _accept_dialog(dialog: Any) -> None:
+            game_over_dialogs.append(dialog.message)
+            dialog.accept()
+
+        page.on("dialog", _accept_dialog)
         try:
             visible_width = page.evaluate("document.documentElement.scrollWidth <= innerWidth")
             if not visible_width:
@@ -840,6 +985,8 @@ class GoalRunner:
         files: Sequence[str] = (),
         symbols: Sequence[str] = (),
         budget_tokens: int = 0,
+        conversation_context: str = "",
+        additional_context: str = "",
         approve: Optional[Callable[[str], bool]] = None,
         cancellation: Optional[CancellationToken] = None,
     ) -> GoalResult:
@@ -849,6 +996,9 @@ class GoalRunner:
             raise ValueError("max_cycles must be between 1 and 20")
         if max_fix_iterations < 1:
             raise ValueError("max_fix_iterations must be at least 1")
+        budget_tokens = int(budget_tokens)
+        if budget_tokens < 0:
+            raise ValueError("budget_tokens cannot be negative")
 
         if resume:
             if not goal_id:
@@ -866,6 +1016,10 @@ class GoalRunner:
                     goal_id=goal_id, resumed=True,
                 )
                 return self._result(record)
+            # A zero budget on resume means "keep the saved limit", not
+            # "remove the cap". Pass a larger total allowance to extend it.
+            budget_tokens = budget_tokens or int(record.get("budget_tokens") or 0)
+            record["budget_tokens"] = budget_tokens
         else:
             goal = str(goal or "").strip()
             if not goal:
@@ -884,12 +1038,21 @@ class GoalRunner:
                 "active_run_id": "",
                 "active_cycle_index": 0,
                 "tokens": 0,
+                "budget_tokens": budget_tokens,
+                "conversation_context": "",
                 "calls": 0,
                 "started_at": stamp,
                 "updated_at": stamp,
                 "error": "",
             }
             self.store.save(record)
+
+        record["conversation_context"] = _merge_conversation_context(
+            str(record.get("conversation_context") or ""),
+            conversation_context,
+            additional_context,
+        )
+        self.store.save(record)
 
         assert goal_id is not None
         if self.workspace is not None:
@@ -926,35 +1089,35 @@ class GoalRunner:
                     status="Проверяю сохранённый результат", goal_id=goal_id,
                     cycle_index=int(previous.get("index") or len(record["cycles"])),
                 )
-                report = self.verifier.verify(
+                resume_report = self.verifier.verify(
                     self.repo_root, previous.get("changed_files") or [], goal
                 )
-                previous["verification"] = report.to_dict()
+                previous["verification"] = resume_report.to_dict()
                 self._emit_goal_event(
                     "goal.verify_finish", node="Повторная проверка",
-                    status=("Проверка пройдена" if report.passed is True else
-                            "Проверка недоступна" if report.passed is None else
+                    status=("Проверка пройдена" if resume_report.passed is True else
+                            "Проверка недоступна" if resume_report.passed is None else
                             "Проверка нашла ошибки"),
                     goal_id=goal_id,
                     cycle_index=int(previous.get("index") or len(record["cycles"])),
-                    summary=_safe_excerpt(report.feedback(), limit=700),
+                    summary=_safe_excerpt(resume_report.feedback(), limit=700),
                 )
                 self._set_status(record, "running", error="")
-                if report.passed is True:
+                if resume_report.passed is True:
                     self._complete(record)
                     self._emit_goal_event(
                         "goal.finish", node="Goal", status="Цель завершена",
                         goal_id=goal_id, summary="Сохранённый результат прошёл проверку.",
                     )
                     return self._result(record)
-                if report.passed is None:
+                if resume_report.passed is None:
                     self._set_status(record, "blocked", accepted=False,
-                                     error=report.feedback() or "required verifier is unavailable")
+                                     error=resume_report.feedback() or "required verifier is unavailable")
                     self.store.save(record)
                     self._emit_goal_event(
                         "goal.finish", node="Goal", status="Цель заблокирована",
                         goal_id=goal_id, goal_status="blocked",
-                        summary=_safe_excerpt(report.feedback(), limit=700),
+                        summary=_safe_excerpt(resume_report.feedback(), limit=700),
                     )
                     return self._result(record)
                 self.store.save(record)
@@ -963,6 +1126,24 @@ class GoalRunner:
         for _ in range(max_cycles):
             if cancel.cancelled:
                 self._set_status(record, "cancelled", error=cancel.reason or "cancelled")
+                break
+
+            tokens_used = max(0, int(record.get("tokens") or 0))
+            budget_remaining = _remaining_goal_budget(budget_tokens, tokens_used)
+            if budget_tokens and budget_remaining == 0:
+                message = (
+                    f"Goal token budget exhausted ({tokens_used}/{budget_tokens}); "
+                    "increase budget_tokens to resume."
+                )
+                self._set_status(record, "blocked", accepted=False, error=message)
+                self.store.save(record)
+                self._emit_goal_event(
+                    "goal.budget_exhausted",
+                    node=f"Цикл {len(record.get('cycles') or []) + 1}",
+                    status="Остановлено: исчерпан бюджет токенов",
+                    goal_id=goal_id, tokens_used=tokens_used,
+                    budget_tokens=budget_tokens,
+                )
                 break
 
             pending_run_id = str(record.get("active_run_id") or "") if resume else ""
@@ -990,7 +1171,7 @@ class GoalRunner:
                     run_id=run_id,
                     files=files,
                     symbols=symbols,
-                    budget_tokens=budget_tokens,
+                    budget_tokens=budget_remaining,
                     use_cache=False,
                     dry_run=False,
                     use_subagents=use_subagents,
@@ -999,6 +1180,7 @@ class GoalRunner:
                     approve=approve,
                     cancellation=cancel,
                     resume=bool(pending_run_id),
+                    conversation_context=str(record.get("conversation_context") or ""),
                 )
             except Exception as exc:  # noqa: BLE001 - preserve a resumable failure record
                 record["active_run_id"] = ""
@@ -1123,6 +1305,7 @@ class GoalRunner:
                 calls=int(getattr(result, "calls", 0) or 0),
                 duration_ms=float(getattr(result, "duration_ms", 0.0) or 0.0),
                 error=error[:900],
+                output_fingerprint=_fingerprint_changed_files(self.repo_root, changed),
             )
             record.setdefault("cycles", []).append(cycle.to_dict())
             record["active_run_id"] = ""
@@ -1130,6 +1313,21 @@ class GoalRunner:
             record["tokens"] = int(record.get("tokens", 0)) + cycle.tokens
             record["calls"] = int(record.get("calls", 0)) + cycle.calls
             record["updated_at"] = _now()
+
+            if budget_tokens and cycle.tokens > budget_remaining:
+                message = (
+                    "Pipeline exceeded the remaining goal token budget "
+                    f"({cycle.tokens}>{budget_remaining}); review usage accounting."
+                )
+                self._set_status(record, "blocked", accepted=False, error=message)
+                self.store.save(record)
+                self._emit_goal_event(
+                    "goal.budget_exceeded", node=f"Цикл {cycle_index}",
+                    status="Pipeline превысил оставшийся бюджет",
+                    goal_id=goal_id, cycle_index=cycle_index,
+                    cycle_tokens=cycle.tokens, budget_remaining=budget_remaining,
+                )
+                break
 
             self._emit_goal_event(
                 "goal.cycle_finish", node=f"Цикл {cycle_index} из {max_cycles}",
@@ -1142,6 +1340,22 @@ class GoalRunner:
                 summary=(_safe_excerpt(report.feedback(), limit=700) if report
                          else _safe_excerpt(error, limit=700)),
             )
+
+            previous_cycle = record["cycles"][-2] if len(record["cycles"]) >= 2 else {}
+            if _repeated_failed_goal_output(cycle.to_dict(), previous_cycle):
+                message = (
+                    "Goal stopped after the same output and failure repeated; "
+                    "review the saved workspace or change the task."
+                )
+                self._set_status(record, "needs_attention", accepted=False, error=message)
+                self.store.save(record)
+                self._emit_goal_event(
+                    "goal.no_progress", node=f"Цикл {cycle_index}",
+                    status="Остановлено: результат не изменился",
+                    goal_id=goal_id, cycle_index=cycle_index,
+                    output_fingerprint=cycle.output_fingerprint,
+                )
+                break
 
             if accepted and report is not None:
                 if report.passed is True:
@@ -1364,6 +1578,7 @@ class GoalRunner:
             accepted=bool(record.get("accepted")),
             cycles=cycles,
             tokens=int(record.get("tokens", 0) or 0),
+            budget_tokens=int(record.get("budget_tokens", 0) or 0),
             calls=int(record.get("calls", 0) or 0),
             started_at=str(record.get("started_at") or ""),
             updated_at=str(record.get("updated_at") or ""),
@@ -1400,6 +1615,84 @@ def _is_transient_provider_error(error: str) -> bool:
     )
 
 
+def _fingerprint_changed_files(root: Path, changed_files: Sequence[str]) -> str:
+    """Hash the current contents of the changed paths without following escapes.
+
+    Goal cycles share one workspace.  Comparing only the model summary or diff
+    text misses cases where different diffs produce the same tree; hashing the
+    resulting files gives the no-progress guard a stable, content-based signal.
+    """
+    root = Path(root).resolve()
+    digest = hashlib.sha256()
+    paths = sorted(
+        {str(raw).strip().replace("\\", "/") for raw in changed_files if str(raw).strip()}
+    )
+    for rel in paths:
+        digest.update(rel.encode("utf-8", errors="replace"))
+        digest.update(b"\0")
+        relative = Path(rel)
+        if relative.is_absolute() or ".." in relative.parts:
+            digest.update(b"<unsafe-path>\0")
+            continue
+        candidate = root / relative
+        try:
+            resolved = candidate.resolve()
+            resolved.relative_to(root)
+        except (OSError, ValueError):
+            digest.update(b"<outside-workspace>\0")
+            continue
+        if candidate.is_symlink():
+            digest.update(b"<symlink>\0")
+            continue
+        if not resolved.is_file():
+            digest.update(b"<missing>\0")
+            continue
+        try:
+            with resolved.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            digest.update(b"<unreadable>\0")
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _remaining_goal_budget(budget_tokens: int, tokens_used: int) -> int:
+    """Return this goal's remaining allowance, keeping zero as "unlimited"."""
+    budget_tokens = max(0, int(budget_tokens))
+    if budget_tokens == 0:
+        return 0
+    return max(0, budget_tokens - max(0, int(tokens_used)))
+
+
+def _repeated_failed_goal_output(
+    current: Mapping[str, Any], previous: Mapping[str, Any]
+) -> bool:
+    """Whether two adjacent cycles produced the same failed workspace result.
+
+    An unavailable verifier is not a failed result: callers should block or
+    resume after provisioning it, rather than treating the missing tool as
+    evidence that another model cycle cannot help.
+    """
+    def failed(cycle: Mapping[str, Any]) -> bool:
+        if not bool(cycle.get("pipeline_accepted")):
+            return True
+        verification = cycle.get("verification")
+        return isinstance(verification, dict) and verification.get("passed") is False
+
+    fingerprint = str(current.get("output_fingerprint") or "")
+    return bool(
+        failed(current)
+        and failed(previous)
+        and fingerprint
+        and fingerprint == previous.get("output_fingerprint")
+        and bool(current.get("pipeline_accepted"))
+        == bool(previous.get("pipeline_accepted"))
+        and current.get("verification") == previous.get("verification")
+        and str(current.get("error") or "") == str(previous.get("error") or "")
+    )
+
+
 def _wait_or_cancel(cancel: Any, delay: float) -> bool:
     """Sleep for *delay* seconds, returning True if the run was cancelled.
 
@@ -1414,6 +1707,27 @@ def _wait_or_cancel(cancel: Any, delay: float) -> bool:
         time.sleep(step)
         remaining -= step
     return bool(getattr(cancel, "cancelled", False))
+
+
+def _merge_conversation_context(
+    existing: str,
+    conversation_context: str = "",
+    additional_context: str = "",
+    *,
+    limit: int = 8000,
+) -> str:
+    """Keep earlier context and explicit clarifications bounded across resumes."""
+    parts = [str(existing or "").strip()]
+    for label, value in (
+        ("Earlier conversation", conversation_context),
+        ("User clarification", additional_context),
+    ):
+        text = str(value or "").strip()
+        if text and not any(text == part or text in part for part in parts if part):
+            parts.append(f"{label}:\n{text}")
+    combined = "\n\n".join(part for part in parts if part)
+    limit = max(0, int(limit))
+    return combined[-limit:] if limit else ""
 
 
 def _safe_excerpt(value: str, *, limit: int = 900) -> str:

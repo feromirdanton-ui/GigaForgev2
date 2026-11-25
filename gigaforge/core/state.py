@@ -348,14 +348,18 @@ class TaskState:
         )
         for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
             bucket[key] = bucket.get(key, 0) + int(usage.get(key, 0) or 0)
-        bucket["calls"] = bucket.get("calls", 0) + 1
+        bucket["calls"] = bucket.get("calls", 0) + max(
+            0, int(usage.get("calls", 1) or 0)
+        )
         # Cost is accumulated here because this is the ONE place every model
         # call passes through.  Tokens alone do not answer what a run cost: the
         # same token count on a different model is a different bill, and a
         # report that only shows tokens cannot tell a cheap run from an
         # expensive one.
         model = str(usage.get("model") or "")
-        if model:
+        if "cost_micros" in usage:
+            micros = max(0, int(usage.get("cost_micros", 0) or 0))
+        elif model:
             try:
                 from gigaforge.core.cost import PriceTable
 
@@ -378,6 +382,9 @@ class TaskState:
                 )
             except Exception:  # noqa: BLE001 - pricing must not fail a run
                 micros = 0
+        else:
+            micros = 0
+        if micros:
             bucket["cost_micros"] = bucket.get("cost_micros", 0) + micros
             self.cost_micros += micros
             self.phase_cost_micros[phase] = self.phase_cost_micros.get(phase, 0) + micros

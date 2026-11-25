@@ -254,6 +254,12 @@ def test_react_runner_uses_the_guards(tmp_path: Path) -> None:
             raise AssertionError("no routing expected")
 
     class _Budgets:
+        def remaining(self, phase: str) -> int:
+            return 10**9
+
+        def task_remaining_for(self, task_id: str) -> int:
+            return 10**9
+
         def check(self, *a: Any, **k: Any) -> None:
             return None
 
@@ -282,7 +288,6 @@ def test_react_runner_uses_the_guards(tmp_path: Path) -> None:
 # ── V1: no asyncio.run inside graph nodes ────────────────────────────────────
 def test_subagent_graph_runs_inside_a_live_event_loop(tmp_path: Path) -> None:
     """``asyncio.run`` in the child node raised under a running loop."""
-    pytest.importorskip("langgraph", reason="the LangGraph extra is not installed")
     from gigaforge.agents.langgraph_subagents import run_subagents_graph
     from gigaforge.agents.subagents import SubAgentRunner, SubAgentSpawn
 
@@ -301,34 +306,36 @@ def test_subagent_graph_runs_inside_a_live_event_loop(tmp_path: Path) -> None:
 
 # ── V2: the graphs are reachable from the product ────────────────────────────
 def test_engine_dispatch_defaults_to_langgraph(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The graph is the default engine; ``classic`` is the bare-install fallback.
+    """LangGraph is the only supported ReAct and sub-agent engine.
 
     The old default was ``classic``, which meant the LangGraph layer — the whole
     point of level 2 of the merge — never ran in a default deployment.  The
     review called that out as the systemic defect: features that exist, are
     tested, and are unreachable.
     """
-    from gigaforge.agents.engine import _langgraph_ok, react_engine, subagent_engine
+    from gigaforge.agents.engine import react_engine, subagent_engine
 
     monkeypatch.delenv("GIGAFORGE_REACT_ENGINE", raising=False)
     monkeypatch.delenv("GIGAFORGE_SUBAGENT_ENGINE", raising=False)
-    expected = "langgraph" if _langgraph_ok() else "classic"
-    assert react_engine() == expected
-    assert subagent_engine() == expected
+    assert react_engine() == "langgraph"
+    assert subagent_engine() == "langgraph"
 
 
-def test_engine_dispatch_honours_an_explicit_classic(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A deployment can still pin the hand-written loop."""
+def test_engine_dispatch_rejects_legacy_loop_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale classic setting must fail rather than route around the graph."""
     from gigaforge.agents.engine import react_engine, subagent_engine
 
     monkeypatch.setenv("GIGAFORGE_REACT_ENGINE", "classic")
     monkeypatch.setenv("GIGAFORGE_SUBAGENT_ENGINE", "classic")
-    assert react_engine() == "classic"
-    assert subagent_engine() == "classic"
+    with pytest.raises(RuntimeError, match="LangGraph is required"):
+        react_engine()
+    with pytest.raises(RuntimeError, match="LangGraph is required"):
+        subagent_engine()
 
 
 def test_engine_dispatch_honours_the_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    pytest.importorskip("langgraph", reason="the LangGraph extra is not installed")
     from gigaforge.agents.engine import react_engine, subagent_engine
 
     monkeypatch.setenv("GIGAFORGE_REACT_ENGINE", "langgraph")

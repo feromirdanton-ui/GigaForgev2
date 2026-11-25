@@ -16,7 +16,9 @@ GigaForge exposes two distinct execution contracts:
 2. Before the first model call, Goal provisions and checks its parser, test, and
    browser runtimes. An independent workspace verifier then checks changed file
    types: Python compilation and an existing pytest suite, JavaScript syntax,
-   HTML structure, and a headless browser smoke run for HTML apps.
+   HTML structure, and a headless browser smoke run for HTML apps. Explicit
+   word and character counts in the request are also checked against the
+   produced artifact before it can be accepted.
 3. A code failure is summarized and included in the next cycle's prompt so the
    model repairs the current result. Passing verification sends only reported
    changed files through the destination writer. The writer checks that the
@@ -28,11 +30,45 @@ GigaForge exposes two distinct execution contracts:
    startup and retries setup from the verifier when needed. If setup cannot
    complete (for example, while offline), the goal remains resumable; restore
    connectivity and resume it.
-5. A maximum cycle count bounds work per invocation. Progress is atomically
-   saved under `.gigaforge/goals/<goal-id>.json` after each cycle and can be
-   continued with `gigaforge goal --resume <goal-id>`.
-6. After publication, the large project copy is removed. The goal report and
+5. A maximum cycle count bounds work per invocation. If two adjacent failed
+   cycles produce the same changed-file contents and the same failure, Goal
+   stops early with `needs_attention` rather than spending the remaining cycles
+   on an unchanged result. A missing verifier is reported as `blocked`, not
+   mistaken for repeated model failure.
+6. A nonzero `--budget` is a lifetime token cap shared by all cycles. Goal
+   passes only the remaining allowance to each pipeline run and blocks before
+   starting another cycle when the cap is spent. Parallel sub-agent caps are
+   divided from the remaining run allowance, and their reported usage is added
+   back to the parent run. With sub-agents enabled, planning is read-only:
+   only file/search observations are allowed; writes, REPL execution, and test
+   commands are rejected. Only successful mutations count as episode output,
+   so a rejected write attempt cannot suppress fan-out. When two or three
+   explicit independent code files are identified, GigaForge uses a
+   deterministic delegation plan instead of spending model calls on redundant
+   parent planning. Independent child worktrees therefore start from the same
+   base as the final merge; if planning has actually changed code, fan-out is
+   skipped rather than applying stale child diffs. Resuming with no `--budget`
+   keeps the saved cap; pass a larger total cap to extend it.
+
+   Python Goals also verify explicitly requested public function names, reject
+   duplicate public definitions in changed modules, and enforce fixed-width
+   `HH:MM:SS` input when the goal requires that format. Sub-agent fan-out
+   assigns a requested function to its related module and rejects additions
+   that leak the symbol into sibling files.
+7. ReAct executes its tool loop inside the plan node, so it has a separate
+   `GF_CORE__REACT_TIMEOUT` wall-clock limit (480 seconds by default); the
+   overall pipeline deadline and Goal token budget still bound the run.
+8. Progress is atomically saved under `.gigaforge/goals/<goal-id>.json` after
+   each cycle and can be continued with `gigaforge goal --resume <goal-id>`.
+9. After publication, the large project copy is removed. The goal report and
    workspace manifest remain under `.gigaforge`.
+
+In the desktop chat, Agent runs receive a bounded transcript of earlier user
+and assistant turns, so requests to refine existing work retain their context.
+If a Goal is paused and the user sends a different message in the same session,
+the saved objective is resumed and that message is stored as a clarification;
+the original objective remains unchanged. This context is limited to 8,000
+characters and is passed to the LangGraph goal engine.
 
 The desktop **Settings → file changes** control has two persisted modes. **Ask**
 shows one approval for the complete diff (all files together) at each edit cycle;

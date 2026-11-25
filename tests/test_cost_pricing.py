@@ -44,6 +44,12 @@ class TestTheTableReadsItsConfiguration:
         monkeypatch.setenv("GF_CORE__PRICES__GigaChat__prompt_per_million", "9.99")
         assert PriceTable.from_env().price_for("GigaChat").prompt_per_million == 9.99
 
+    def test_from_env_accepts_windows_normalized_keys(self) -> None:
+        table = PriceTable.from_env(
+            {"GF_CORE__PRICES__GIGACHAT__PROMPT_PER_MILLION": "9.99"}
+        )
+        assert table.price_for("GigaChat").prompt_per_million == 9.99
+
     def test_the_bare_constructor_does_not_read_the_environment(self, monkeypatch) -> None:
         """This is why the state must call ``from_env``, not ``PriceTable()``."""
         monkeypatch.setenv("GF_CORE__PRICES__GigaChat__prompt_per_million", "9.99")

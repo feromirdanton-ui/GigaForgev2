@@ -155,6 +155,12 @@ def test_budget_exhaustion_salvages_the_plan_before_raising() -> None:
     from gigaforge.client.errors import BudgetExceeded
 
     class _Budgets:
+        def remaining(self, phase: str) -> int:
+            return 10**9
+
+        def task_remaining_for(self, task_id: str) -> int:
+            return 10**9
+
         def check(self, *a: object, **k: object) -> None:
             """The pre-call claim passes; settling it is what fails."""
 

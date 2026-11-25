@@ -386,10 +386,18 @@ class Runtime:
                 "no model provider is configured: set GIGAFORGE_AUTH_KEY "
                 "or configure an OpenAI-compatible provider"
             )
-        from gigaforge.core.goal import GoalRunner, GoalStore
+        from gigaforge.core.goal import GoalStore
         from gigaforge.core.goal_workspace import GoalWorkspace
 
         verifier = kwargs.pop("verifier", None)
+        requested_engine = str(kwargs.pop("engine", "") or "").strip().lower()
+        if requested_engine in {"classic", "legacy", "loop"}:
+            raise RuntimeError(
+                f"Goal engine {requested_engine!r} is no longer supported; LangGraph is required"
+            )
+        if requested_engine and requested_engine not in {"langgraph", "graph"}:
+            raise ValueError(f"unsupported Goal engine {requested_engine!r}")
+        _langgraph_goal_enabled()
         destination = Path(self.core_config.repo_root).resolve()
         resume = bool(kwargs.get("resume", False))
         goal_id = str(kwargs.get("goal_id") or "").strip()
@@ -405,11 +413,16 @@ class Runtime:
         if resume:
             saved = goal_store.load(goal_id)
             if saved.get("status") == "completed":
-                return GoalRunner(
+                from gigaforge.core.langgraph_goal import run_goal_graph
+
+                return run_goal_graph(
                     self.pipeline,
                     repo_root=destination,
+                    goal="",
                     store=goal_store,
-                ).run(goal_id=goal_id, resume=True)
+                    goal_id=goal_id,
+                    resume=True,
+                )
         else:
             try:
                 goal_store.load(goal_id)
@@ -447,28 +460,23 @@ class Runtime:
             raise RuntimeError("the isolated goal runtime could not reuse the configured model provider")
         try:
             engine = str(kwargs.pop("engine", "") or "").strip().lower()
-            if not engine:
-                engine = "langgraph" if _langgraph_goal_enabled() else "classic"
-            if engine == "langgraph":
-                from gigaforge.core.langgraph_goal import run_goal_graph
-
-                return run_goal_graph(
-                    isolated_runtime.pipeline,
-                    repo_root=workspace_root,
-                    goal=goal,
-                    verifier=verifier,
-                    store=goal_store,
-                    workspace=workspace,
-                    emit=_trace_emitter(isolated_runtime.pipeline),
-                    **kwargs,
+            if engine in {"classic", "legacy", "loop"}:
+                raise RuntimeError(
+                    "classic Goal execution is disabled; GigaForge requires LangGraph"
                 )
-            return GoalRunner(
+            _langgraph_goal_enabled()
+            from gigaforge.core.langgraph_goal import run_goal_graph
+
+            return run_goal_graph(
                 isolated_runtime.pipeline,
                 repo_root=workspace_root,
+                goal=goal,
                 verifier=verifier,
                 store=goal_store,
                 workspace=workspace,
-            ).run(goal, **kwargs)
+                emit=_trace_emitter(isolated_runtime.pipeline),
+                **kwargs,
+            )
         finally:
             isolated_runtime.aclose()
 
@@ -713,25 +721,20 @@ class Runtime:
 
 
 def _langgraph_goal_enabled() -> bool:
-    """Whether goal mode should run on the LangGraph engine.
-
-    Default is on when the package is installed; ``GIGAFORGE_GOAL_ENGINE=classic``
-    pins the hand-rolled loop (useful for bisecting a regression), and
-    ``=langgraph`` forces the graph even if detection is ambiguous.
-    """
+    """Validate settings and dependencies for the mandatory LangGraph goal engine."""
     import os as _os
 
     choice = (_os.environ.get("GIGAFORGE_GOAL_ENGINE") or "").strip().lower()
     if choice in {"classic", "legacy", "loop"}:
-        return False
-    if choice in {"langgraph", "graph"}:
-        return True
-    try:
-        from gigaforge.core.langgraph_runtime import langgraph_available
+        raise RuntimeError(
+            "GIGAFORGE_GOAL_ENGINE=classic is no longer supported; LangGraph is required"
+        )
+    if choice and choice not in {"langgraph", "graph"}:
+        raise ValueError(f"GIGAFORGE_GOAL_ENGINE must be 'langgraph' when set, not {choice!r}")
+    from gigaforge.core.langgraph_runtime import require_langgraph
 
-        return langgraph_available()
-    except Exception:  # noqa: BLE001 - a missing optional dep means classic
-        return False
+    require_langgraph()
+    return True
 
 
 def _trace_emitter(pipeline: Any) -> Any:
@@ -765,13 +768,23 @@ def build_runtime(
     isolate_storage: bool = False,
     telemetry_root: Optional[str | Path] = None,
 ) -> Runtime:
-    """Assemble the runtime.  Never touches the network; may build offline.
+    """Assemble the runtime after ensuring the mandatory agent dependencies.
 
     ``require_provider=True`` turns a missing credential into a
     :class:`RuntimeError` with the setup instruction.  The default is
     ``False`` so read-only front ends (the desktop window, ``gigaforge report``,
-    ``gigaforge web``) start on a machine with no key.
+    ``gigaforge web``) start on a machine with no key. The required LangGraph
+    runtime is installed on first start if possible; failure is fatal.
     """
+    from gigaforge.runtime_dependencies import ensure_agent_runtime
+
+    agent_runtime = ensure_agent_runtime()
+    if not agent_runtime.available:
+        raise RuntimeError(
+            "Required LangGraph runtime is unavailable; GigaForge cannot start. "
+            "Install the project dependencies with `python -m pip install -e .`. "
+            + agent_runtime.detail
+        )
     s = settings or get_settings()
     cfg = core_config or CoreConfig.from_env()
     notes: list[str] = []
@@ -908,7 +921,25 @@ def build_runtime(
             if env_skip_probe():
                 notes.append("model probe skipped (GIGAFORGE_SKIP_MODEL_PROBE)")
             else:
-                catalog = fetch_models(client, path=Path(cfg.db_path).parent / "models.json")
+                catalog = fetch_models(
+                    client,
+                    path=Path(cfg.db_path).parent / "models.json",
+                    configured_cheap=(
+                        _os.environ.get("GF_CORE__CHEAP_MODEL", "").strip()
+                        or s.models.get("plan", "")
+                        or cfg.cheap_model
+                    ),
+                    configured_strong=(
+                        _os.environ.get("GF_CORE__STRONG_MODEL", "").strip()
+                        or s.models.get("code", "")
+                        or cfg.strong_model
+                    ),
+                    configured_default=(
+                        _os.environ.get("GF_CORE__DEFAULT_MODEL", "").strip()
+                        or s.models.get("explain", "")
+                        or cfg.default_model
+                    ),
+                )
                 if catalog.available:
                     cfg = apply_roles(cfg, catalog.roles)
                     missing = catalog.missing(

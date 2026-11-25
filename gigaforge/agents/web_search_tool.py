@@ -32,18 +32,19 @@ from __future__ import annotations
 
 import html as _html
 import os
-import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from typing import Any
 
 __all__ = ["WebSearchTool", "SearchBudget", "SearchCache", "SEARCH_CACHE"]
 
 #: Default endpoint.  ``{query}`` is replaced with the URL-encoded query.
 DEFAULT_SEARCH_URL = "https://html.duckduckgo.com/html/?q={query}"
+DEFAULT_LITE_SEARCH_URL = "https://lite.duckduckgo.com/lite/?q={query}"
 
 #: How many results are kept.  More than this is tokens the model will not read.
 MAX_RESULTS = 5
@@ -130,25 +131,78 @@ class SearchCache:
 SEARCH_CACHE = SearchCache()
 
 
-def _endpoint(query: str) -> str:
-    template = os.environ.get("GIGAFORGE_SEARCH_URL", "") or DEFAULT_SEARCH_URL
-    return template.replace("{query}", urllib.parse.quote_plus(query))
+def _search_endpoints(query: str) -> list[str]:
+    configured = os.environ.get("GIGAFORGE_SEARCH_URL", "").strip()
+    if configured:
+        return [configured.replace("{query}", urllib.parse.quote_plus(query))]
+    encoded = urllib.parse.quote_plus(query)
+    return [
+        DEFAULT_SEARCH_URL.replace("{query}", encoded),
+        DEFAULT_LITE_SEARCH_URL.replace("{query}", encoded),
+    ]
 
 
-_RESULT_RE = re.compile(
-    r'<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
-    re.S | re.I,
-)
-_SNIPPET_RE = re.compile(
-    r'<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>', re.S | re.I
-)
-_TAG_RE = re.compile(r"<[^>]+>")
+class _ResultParser(HTMLParser):
+    _VOID_TAGS = frozenset({
+        "area", "base", "br", "col", "embed", "hr", "img", "input",
+        "link", "meta", "param", "source", "track", "wbr",
+    })
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.results: list[tuple[str, str, str]] = []
+        self._capture: str | None = None
+        self._capture_depth = 0
+        self._capture_parts: list[str] = []
+        self._capture_href = ""
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if self._capture is not None:
+            if tag not in self._VOID_TAGS:
+                self._capture_depth += 1
+            return
+
+        attributes = dict(attrs)
+        classes = set((attributes.get("class") or "").split())
+        if tag == "a" and classes.intersection({"result__a", "result-link"}):
+            self._start_capture("title", attributes.get("href") or "")
+        elif tag in {"a", "td", "div"} and classes.intersection(
+            {"result__snippet", "result-snippet"}
+        ):
+            self._start_capture("snippet")
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        return
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._capture is None or tag in self._VOID_TAGS:
+            return
+        self._capture_depth -= 1
+        if self._capture_depth <= 0:
+            value = " ".join(" ".join(self._capture_parts).split())
+            if self._capture == "title":
+                self.results.append((value, self._capture_href, ""))
+            elif self.results and not self.results[-1][2]:
+                title, url, _ = self.results[-1]
+                self.results[-1] = (title, url, value)
+            self._capture = None
+            self._capture_depth = 0
+            self._capture_parts = []
+            self._capture_href = ""
+
+    def handle_data(self, data: str) -> None:
+        if self._capture is not None:
+            self._capture_parts.append(data)
+
+    def _start_capture(self, kind: str, href: str = "") -> None:
+        self._capture = kind
+        self._capture_depth = 1
+        self._capture_parts = []
+        self._capture_href = href
 
 
 def _clean(fragment: str) -> str:
-    text = _TAG_RE.sub(" ", fragment or "")
-    text = _html.unescape(text)
-    return " ".join(text.split())
+    return " ".join(_html.unescape(fragment or "").split())
 
 
 def parse_results(page: str, *, limit: int = MAX_RESULTS) -> list[tuple[str, str, str]]:
@@ -158,10 +212,10 @@ def parse_results(page: str, *, limit: int = MAX_RESULTS) -> list[tuple[str, str
     exception.  The caller reports "no results" only when the page really had
     none.
     """
-    titles = _RESULT_RE.findall(page or "")
-    snippets = [_clean(s) for s in _SNIPPET_RE.findall(page or "")]
+    parser = _ResultParser()
+    parser.feed(page or "")
     out: list[tuple[str, str, str]] = []
-    for index, (href, raw_title) in enumerate(titles[:limit]):
+    for raw_title, href, snippet in parser.results[:limit]:
         url = _html.unescape(href)
         # DuckDuckGo wraps links in a redirect; unwrap when possible.
         if "uddg=" in url:
@@ -171,8 +225,11 @@ def parse_results(page: str, *, limit: int = MAX_RESULTS) -> list[tuple[str, str
                 )
             except (KeyError, IndexError, ValueError):
                 pass
-        snippet = snippets[index][:MAX_SNIPPET] if index < len(snippets) else ""
-        out.append((_clean(raw_title)[:160], url, snippet))
+        out.append((
+            _clean(raw_title)[:160],
+            url,
+            _clean(snippet)[:MAX_SNIPPET],
+        ))
     return out
 
 
@@ -241,20 +298,43 @@ class WebSearchTool:
                 "not ask again."
             )
 
-        try:
-            page = self._opener(_endpoint(query), self.timeout)
-        except urllib.error.HTTPError as exc:
-            return f"ERROR: web_search unavailable (HTTP {exc.code}); continue without it."
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        pages: list[str] = []
+        errors: list[Exception] = []
+        for endpoint in _search_endpoints(query):
+            try:
+                page = self._opener(endpoint, self.timeout)
+            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as exc:
+                errors.append(exc)
+                continue
+            except Exception as exc:  # noqa: BLE001 - a tool must not kill the loop
+                return f"ERROR: web_search failed ({str(exc)[:120]}); continue without it."
+
+            pages.append(page)
+            results = parse_results(page)
+            if results:
+                text = format_results(query, results)
+                self.cache.put(query, text)
+                return text
+
+        if pages and any(
+            marker in page.lower()
+            for page in pages
+            for marker in ("no results found", "no results for", "class=\"no-results")
+        ):
+            text = format_results(query, [])
+        elif errors and not pages:
+            exc = errors[-1]
+            if isinstance(exc, urllib.error.HTTPError):
+                return f"ERROR: web_search unavailable (HTTP {exc.code}); continue without it."
             return (
                 "ERROR: web_search unavailable (network: "
                 f"{str(exc)[:120]}); continue without it."
             )
-        except Exception as exc:  # noqa: BLE001 - a tool must not kill the loop
-            return f"ERROR: web_search failed ({str(exc)[:120]}); continue without it."
-
-        results = parse_results(page)
-        text = format_results(query, results)
+        else:
+            return (
+                "ERROR: web_search unavailable (search provider returned no parseable "
+                "results); continue without it."
+            )
         self.cache.put(query, text)
         return text
 

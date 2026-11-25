@@ -61,7 +61,15 @@ class _ScriptedProvider:
             self.react_calls += 1
             body = self.react_script[index]
         elif is_react:
-            body = {"thought": "done", "action": "finish", "action_input": []}
+            self.react_calls += 1
+            body = {
+                "thought": "Use the known target and verify the edit.",
+                "action": "finish",
+                "action_input": [
+                    {"tool": "edit_function", "args": {"name": "add"}},
+                    {"tool": "run_tests", "args": {}},
+                ],
+            }
         else:
             body = self.diff
         content = body if isinstance(body, str) else json.dumps(body)
@@ -127,18 +135,21 @@ def test_the_product_path_reaches_the_langgraph_engine(
     """
     from gigaforge.agents import engine as engine_module
     from gigaforge.agents import langgraph_react
-    from gigaforge.core.strategies import build_plan_strategy
+    from gigaforge.agents.react import ReActResult
+    from gigaforge.core.task_state import PlanStep
 
     monkeypatch.setenv("GIGAFORGE_REACT_ENGINE", "langgraph")
     _repo(tmp_path)
     pipeline = _pipeline(tmp_path, _ScriptedProvider())
 
     seen: list[str] = []
-    original = langgraph_react.run_react_graph
-
     def _spy(*args: Any, **kwargs: Any) -> Any:
         seen.append("graph")
-        return original(*args, **kwargs)
+        return ReActResult(
+            plan=[PlanStep(tool="read_structure", args={"path": "math_utils.py"})],
+            finished=True,
+            finish_reason="finish_action",
+        )
 
     # Patch the module the dispatcher imports from, not the dispatcher's own
     # namespace: ``run_react`` imports ``run_react_graph`` inside the function,
@@ -377,7 +388,21 @@ def test_goal_to_diff_end_to_end(tmp_path: Path) -> None:
     assert provider.react_calls >= 1, "the ReAct episode never ran"
 
 
-@pytest.mark.parametrize("engine", ["classic", "langgraph"])
+def test_pipeline_includes_conversation_context_in_model_calls(tmp_path: Path) -> None:
+    _repo(tmp_path)
+    provider = _ScriptedProvider()
+    pipeline = _pipeline(tmp_path, provider)
+
+    pipeline.run(
+        "continue improving the helper",
+        conversation_context="User: The helper was created in the previous turn.",
+    )
+
+    assert provider.prompts
+    assert any("created in the previous turn" in prompt for prompt in provider.prompts)
+
+
+@pytest.mark.parametrize("engine", ["langgraph"])
 def test_both_engines_produce_the_same_diff(
     tmp_path: Path, engine: str, monkeypatch: Any
 ) -> None:

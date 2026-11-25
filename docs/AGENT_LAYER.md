@@ -55,6 +55,11 @@ new. Two ported components are finally wired in:
   rebuilt from the recorded steps (`_breaker_view`), because the wire
   trajectory is plain role/content while the breaker's signatures expect
   assistant `tool_calls` + `tool` results.
+* `write_file` may create a new path directly, but replacing an existing file
+  requires the complete `read_file` result to reach the model verbatim in the
+  current run; otherwise use `edit_file`.
+  After a full-file write, the agent must read the new version before replacing
+  it again.
 
 Every nudge is a **HumanMessage** (`LoopSignal.message()` →
 `providers.messages.nudge`). GigaChat rejects a system message that is not
@@ -108,27 +113,17 @@ base dependency, and `GigaChatSDKProvider` is only imported when that extra is
 installed. The legacy `httpx` client stays the default, so a base install has
 exactly one HTTP stack. Do not add `gigachat` to the base dependencies.
 
-### 3. Python 3.12 floor
+## Required runtime
 
-`deepagents` 0.7.x itself declares `>=3.11`, but the **harness profile** it is
-borrowed from (`ai-forever/deepagents-gigachat`) requires 3.12+, and
-`langchain` 1.x / `langgraph` 1.2 target 3.12.
+LangGraph and both SQLite checkpoint adapters are base dependencies, not extras.
+`build_runtime()` verifies the imports and attempts a bounded installation when
+the environment is incomplete; if installation fails, startup stops with an
+actionable error. `start.bat` checks the same runtime before opening the desktop.
 
-**Handling:** `requires-python = ">=3.12"` and `target-version = "py312"`.
-This is a deliberate floor, not an accident — do not lower it to make an old
-environment install.
-
-## Graceful degradation
-
-`langgraph` is optional. `core/langgraph_runtime.py` imports it behind a guard
-and exposes `LANGGRAPH_AVAILABLE`; when it is missing:
-
-* `runtime.run_goal` falls back to `GoalRunner` (the classic loop);
-* `ui.chat.default_engine` falls back to `PipelineBackend`;
-* importing any `langgraph_*` module still succeeds.
-
-`GIGAFORGE_GOAL_ENGINE=classic` pins the old loop even when LangGraph is
-installed — useful for bisecting a regression. `=langgraph` forces the graph.
+Goal, ReAct, chat Goal mode, and sub-agent entry points all require LangGraph.
+They do not route to classic loops when an import, graph run, or engine
+selection fails. `GIGAFORGE_*_ENGINE=classic` is rejected; use `langgraph` or
+leave the setting unset. The project supports Python 3.11 and newer.
 
 ## Tests
 

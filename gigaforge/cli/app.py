@@ -292,7 +292,7 @@ def goal(
     goal_id: Annotated[Optional[str], typer.Option("--goal-id", help="Choose an ID for this new goal.")] = None,
     max_cycles: Annotated[int, typer.Option("--max-cycles", min=1, max=20, help="Author/verify cycles per invocation.")] = 8,
     max_fix_iterations: Annotated[int, typer.Option("--max-fix-iterations", min=1, max=10, help="In-cycle repair attempts.")] = 2,
-    budget_tokens: Annotated[int, typer.Option("--budget", help="Context trimming budget per model cycle (0 = default). ")] = 0,
+    budget_tokens: Annotated[int, typer.Option("--budget", help="Lifetime token cap across goal cycles (0 = unlimited). ")] = 0,
     files: Annotated[Optional[list[str]], typer.Option("--file", "-f", help="Focus on these files.")] = None,
     use_subagents: Annotated[bool, typer.Option("--subagents/--no-subagents", help="Delegate implementation into isolated sub-agent worktrees.")] = False,
     static_only: Annotated[bool, typer.Option("--static-only", help="Allow HTML goals to complete without a browser runtime.")] = False,
@@ -855,22 +855,13 @@ def stack() -> None:
 @app.command()
 def models(verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False) -> None:
     """List available GigaChat models (live API call)."""
-    import asyncio
-
     from gigaforge.client.errors import AuthError, UpstreamError
     from gigaforge.runtime import build_runtime
 
-    async def _go() -> None:
-        rt = build_runtime()
-        try:
-            ms = await rt.client.list_models()
-        finally:
-            await rt.aclose()
-        for m in ms:
-            typer.echo(f"{m.get('id')}\t{m.get('owned_by', 'GigaChat')}")
-
+    rt = None
     try:
-        asyncio.run(_go())
+        rt = build_runtime(require_provider=True)
+        ms = rt.client.list_models()
     except UpstreamError as e:
         typer.echo(f"upstream error: {e}", err=True)
         raise typer.Exit(1) from e
@@ -880,42 +871,41 @@ def models(verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False) ->
     except Exception as e:
         typer.echo(f"error[{type(e).__name__}]: {e}", err=True)
         raise typer.Exit(1) from e
+    finally:
+        if rt is not None:
+            rt.aclose()
+
+    for m in ms:
+        typer.echo(f"{m.get('id')}\t{m.get('owned_by', 'GigaChat')}")
 
 
 @app.command()
 def smoke(verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False) -> None:
     """Live connectivity smoke test against GigaChat (OAuth + models + 1 chat)."""
-    import asyncio
-
     from gigaforge.client.errors import AuthError, UpstreamError
     from gigaforge.runtime import build_runtime
 
-    async def _go() -> int:
-        rt = build_runtime()
-        try:
-            tok = await rt.token_provider.get_token()
-            typer.echo(f"[1/3] OAuth ok: token ...{tok[-8:]} (fetch_count={rt.token_provider.fetch_count})")
-
-            ms = await rt.client.list_models()
-            typer.echo(f"[2/3] models: {len(ms)} available")
-            for m in ms[:5]:
-                typer.echo(f"      - {m.get('id')}")
-
-            res = await rt.client.chat(
-                model=rt.router.route("summarize"),
-                messages=[{"role": "user", "content": "Say 'pong' and nothing else."}],
-                temperature=0.0,
-                max_tokens=10,
-                task_id="smoke",
-                phase="summarize",
-            )
-            typer.echo(f"[3/3] chat ok: {res.content!r} usage={res.usage}")
-            return 0
-        finally:
-            await rt.aclose()
-
+    rt = None
     try:
-        code = asyncio.run(_go())
+        rt = build_runtime(require_provider=True)
+        rt.token_provider.get_token()
+        typer.echo("[1/3] OAuth ok")
+
+        ms = rt.client.list_models()
+        typer.echo(f"[2/3] models: {len(ms)} available")
+        for m in ms[:5]:
+            typer.echo(f"      - {m.get('id')}")
+
+        route = rt.pipeline.router.route("summarize")
+        res = rt.client.complete(
+            [{"role": "user", "content": "Say 'pong' and nothing else."}],
+            model=route.model,
+            temperature=0.0,
+            max_tokens=10,
+            task_id="smoke",
+            phase="summarize",
+        )
+        typer.echo(f"[3/3] chat ok: {res.content!r} usage={res.usage}")
     except AuthError as e:
         typer.echo(
             f"auth error: {e}\n"
@@ -930,8 +920,11 @@ def smoke(verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False) -> 
     except Exception as e:
         typer.echo(f"error[{type(e).__name__}]: {e}", err=True)
         raise typer.Exit(1) from e
-    else:
-        raise typer.Exit(code)
+    finally:
+        if rt is not None:
+            rt.aclose()
+
+    raise typer.Exit(0)
 
 
 @app.command()

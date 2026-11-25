@@ -111,20 +111,19 @@ def test_plan_guard_runs_on_the_harness_path(monkeypatch: pytest.MonkeyPatch) ->
     assert guard["dropped_unknown"] == ["totally_unknown_tool"]
 
 
-def test_an_unactionable_plan_falls_back_instead_of_executing(
+def test_an_unactionable_plan_fails_instead_of_executing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When the guard rejects every step, the linear plan runs — not garbage."""
+    """When the guard rejects every step, the graph path fails explicitly."""
     plan = [_Step("totally_unknown_tool"), _Step("edit_function")]
     _patch_harness(monkeypatch, plan)
     strategy = _strategy_with(plan)
     strategy.bind_run("run-d1a")
 
-    outcome, _ = strategy.plan_under_harness(
-        "goal", "", ask=lambda *a, **k: "- fallback", parse=lambda t: [t]
-    )
-
-    assert outcome.steps == ["- fallback"]
+    with pytest.raises(RuntimeError, match="did not produce an executable plan"):
+        strategy.plan_under_harness(
+            "goal", "", ask=lambda *a, **k: "- fallback", parse=lambda t: [t]
+        )
 
 
 def test_plan_guard_verdict_is_recorded_on_the_harness_path(

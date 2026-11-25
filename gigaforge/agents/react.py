@@ -9,7 +9,8 @@ structure, run tests) and *reasons* about what to do next. Each step:
    the tool name; ``action_input`` is the structured arguments dict (or a string
    the tool interprets).
 2. **Act** — the runner looks up ``action`` in its Tool registry and invokes it.
-   Tools are bounded: ``grep``, ``read_structure``, ``run_tests``, ``finish``.
+   Tools are bounded: repository reads, exact-fragment edits, file writes,
+   tests, and web search.
 3. **Observe** — the tool's raw output is routed through the Firewall
    (``compress(...)``) so the next reasoning step never sees raw 5000-line
    pytest output. The compressed observation is appended to the trajectory.
@@ -69,6 +70,9 @@ __all__ = [
     "Tool",
     "ToolRegistry",
     "ToolResult",
+    "ReadFileTool",
+    "WriteFileTool",
+    "EditFileTool",
     "DEFAULT_REACT_MAX_STEPS",
     "FINISH_ACTION",
 ]
@@ -132,11 +136,20 @@ _REACT_PROMPT = (
     '{"thought":"...","action":"<tool>","action_input":"<str>"}\n'
     "Доступные инструменты (action):\n"
     '- "grep"      — поиск по репозиторию; action_input — регулярное выражение.\n'
-    '- "read_structure" — скелет файла; action_input — относительный путь.\n'
+    '- "read_file" — содержимое текстового файла; action_input — относительный путь. '
+    "Для HTML, Markdown, TXT, CSS и JSON сначала используй read_file.\n"
+    '- "read_structure" — сигнатуры и скелет исходного кода; action_input — относительный путь.\n'
     '- "run_tests" — запустить pytest; action_input — аргументы (или пустая строка).\n'
     '- "write_file" — записать файл. action_input = JSON-строка вида\n'
     '  \'{"path":"index.html","content":"<!DOCTYPE html>..."}\'.\n'
-    '  ЭТО ЕДИНСТВЕННЫЙ правильный способ создать файл: тело экранируется ОДИН раз.\n'
+    '  Используй только для новых файлов или полной замены, когда она действительно нужна.\n'
+    '  Для существующего файла полное содержимое должно быть прочитано и показано '
+    'без сокращения; иначе используй edit_file.\n'
+    '- "edit_file" — точечно заменить уникальный фрагмент существующего файла. '
+    'action_input = JSON-строка вида\n'
+    '  \'{"path":"index.html","old_string":"<старый фрагмент>","new_string":"<новый фрагмент>"}\'.\n'
+    '  Сначала прочитай файл через read_file. Для существующего файла предпочитай edit_file,\n'
+    '  чтобы сохранить остальное содержимое; old_string должен встретиться ровно один раз.\n'
     '  Не вкладывай содержимое файла в план finish — там оно экранируется трижды и ломается.\n'
     '- "web_search" — поиск в интернете; action_input — поисковый запрос.\n'
     '  Бюджет ограничен (по умолчанию 3 вызова на прогон), результаты кэшируются.\n'
@@ -146,8 +159,8 @@ _REACT_PROMPT = (
     '  \'[{"tool":"edit_function","args":{"name":"<symbol>"}}]\'.\n'
     '- "parallel"  — выполнить НЕСКОЛЬКО независимых read-only вызовов за один шаг.\n'
     '  action_input = JSON-строка вида\n'
-    '  \'[{"tool":"grep","args":"<regex>"},{"tool":"read_structure","args":"<path>"}]\'.\n'
-    '  Разрешены только read-only инструменты (grep, read_structure); вызов с\n'
+    '  \'[{"tool":"grep","args":"<regex>"},{"tool":"read_file","args":"<path>"}]\'.\n'
+    '  Разрешены только read-only инструменты (grep, read_file, read_structure); вызов с\n'
     '  инструментом, меняющим файлы, будет отклонён. Максимум 4 вызова.\n'
     "Поле \"thought\" — короткое рассуждение (≤1 предложения).\n"
     "Не пиши ничего вне JSON. Никакого markdown. Только JSON."
@@ -188,6 +201,42 @@ class ReActContext:
     worktree: Path
     index: L0Index
     sandbox: Any  # SandboxExecutor — typed loosely to avoid circular import
+    cancellation: Any = None
+    allow_file_writes: bool = True
+    read_files: set[str] = field(default_factory=set)
+
+
+def read_only_tool_error(action: str, ctx: ReActContext) -> str | None:
+    """Reject every tool that is not explicitly safe during planning."""
+    if getattr(ctx, "allow_file_writes", True):
+        return None
+    from gigaforge.agents.observation_cache import READ_ONLY_TOOLS
+
+    if action not in READ_ONLY_TOOLS:
+        return f"ERROR: tool {action!r} is disabled during read-only planning"
+    return None
+
+
+async def _await_with_cancellation(awaitable: Any, cancellation: Any) -> Any:
+    if cancellation is None:
+        return await awaitable
+
+    cancellation.raise_if_cancelled()
+    task = asyncio.ensure_future(awaitable)
+    try:
+        while not task.done():
+            if cancellation.cancelled:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                cancellation.raise_if_cancelled()
+            await asyncio.wait({task}, timeout=0.05)
+        cancellation.raise_if_cancelled()
+        return task.result()
+    except BaseException:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        raise
 
 
 @dataclass
@@ -229,6 +278,29 @@ def _clean_pattern(raw: str) -> str:
             text = text[1:-1].strip()
             break
     return text
+
+
+def _remember_file_read(
+    ctx: ReActContext,
+    path: str,
+    raw_observation: str,
+    visible_observation: str,
+) -> None:
+    """Track reads only when the model received the complete current file."""
+    if (
+        raw_observation != visible_observation
+        or raw_observation.startswith("ERROR:")
+        or "\n[truncated: showing " in raw_observation
+    ):
+        return
+    root = ctx.worktree.resolve()
+    target = (root / path).resolve()
+    try:
+        relative = target.relative_to(root)
+    except ValueError:
+        return
+    if target.is_file():
+        ctx.read_files.add(relative.as_posix().casefold())
 
 
 class GrepTool:
@@ -276,11 +348,16 @@ class GrepTool:
 
         if shutil.which("rg"):
             try:
+                args = [
+                    "rg", "-n", "--no-heading", "--smart-case",
+                    "--max-filesize", f"{self._MAX_BYTES}",
+                ]
+                # Keep ripgrep traversal aligned with the Python fallback.
+                for directory in sorted(self._SKIP_DIRS):
+                    args.extend(("--glob", f"!**/{directory}/**"))
+                args.extend((pattern, str(ctx.worktree)))
                 proc = await asyncio.create_subprocess_exec(
-                    # ``--smart-case``: a model that asks for "TODO" means the
-                    # marker, not the exact byte sequence.
-                    "rg", "-n", "--no-heading", "--smart-case", pattern,
-                    str(ctx.worktree),
+                    *args,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -296,6 +373,8 @@ class GrepTool:
 
     def _py_grep(self, pattern: str, root: Path, re_module: Any) -> str:
         """Pure-Python grep. Case-insensitive, honouring the skip list."""
+        import os
+
         try:
             rx = re_module.compile(pattern, re_module.IGNORECASE)
         except re_module.error:
@@ -303,23 +382,26 @@ class GrepTool:
             rx = re_module.compile(re_module.escape(pattern), re_module.IGNORECASE)
 
         hits: list[str] = []
-        for path in root.rglob("*"):
-            if len(hits) >= 200:
-                hits.append("... (truncated at 200 matches)")
-                break
-            if not path.is_file():
-                continue
-            if any(part in self._SKIP_DIRS for part in path.parts):
-                continue
-            try:
-                if path.stat().st_size > self._MAX_BYTES:
+        for current, dirs, filenames in os.walk(root):
+            # Prune before descending.  Filtering files after rglob still walks
+            # every entry in node_modules and other large generated trees.
+            dirs[:] = sorted(name for name in dirs if name not in self._SKIP_DIRS)
+            for filename in sorted(filenames):
+                if len(hits) >= 200:
+                    hits.append("... (truncated at 200 matches)")
+                    return "\n".join(hits)
+                path = Path(current) / filename
+                if any(part in self._SKIP_DIRS for part in path.parts):
                     continue
-                text = path.read_text(encoding="utf-8", errors="ignore")
-            except (OSError, ValueError):
-                continue
-            for lineno, line in enumerate(text.splitlines(), start=1):
-                if rx.search(line):
-                    hits.append(f"{path.relative_to(root)}:{lineno}:{line[:300]}")
+                try:
+                    if path.stat().st_size > self._MAX_BYTES:
+                        continue
+                    text = path.read_text(encoding="utf-8", errors="ignore")
+                except (OSError, ValueError):
+                    continue
+                for lineno, line in enumerate(text.splitlines(), start=1):
+                    if rx.search(line):
+                        hits.append(f"{path.relative_to(root)}:{lineno}:{line[:300]}")
 
         if not hits:
             return f"(no matches for {pattern!r} under {root})"
@@ -350,6 +432,34 @@ class ReadStructureTool:
         for s in skel:
             lines.append(f"{s.start_line:4d} {s.kind:8s} {s.qname}  ::  {s.signature}")
         return "\n".join(lines)
+
+
+class ReadFileTool:
+    """Read a bounded text file from the active worktree."""
+
+    name = "read_file"
+    max_chars = 20_000
+
+    async def run(self, action_input: str, *, ctx: ReActContext) -> str:
+        rel = str(action_input or "").strip()
+        if not rel:
+            return "ERROR: read_file needs a relative file path"
+        root = ctx.worktree.resolve()
+        target = (root / rel).resolve()
+        if root not in target.parents:
+            return f"ERROR: refusing to read outside the worktree: {rel}"
+        if not target.is_file():
+            return f"ERROR: file not found: {rel}"
+        try:
+            content = target.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return f"ERROR: read_file failed: {exc}"
+        if len(content) > self.max_chars:
+            return (
+                content[: self.max_chars]
+                + f"\n[truncated: showing {self.max_chars} of {len(content)} characters]"
+            )
+        return content
 
 
 class RunTestsTool:
@@ -389,6 +499,8 @@ class WriteFileTool:
     name = "write_file"
 
     async def run(self, action_input: str, *, ctx: ReActContext) -> str:
+        if not ctx.allow_file_writes:
+            return "ERROR: file writes are disabled during read-only planning"
         try:
             data = json.loads(action_input)
         except json.JSONDecodeError:
@@ -414,14 +526,83 @@ class WriteFileTool:
         # A path that escapes the worktree is a bug or an attack, never a task.
         if root not in target.parents and target != root:
             return f"ERROR: refusing to write outside the worktree: {rel}"
+        relative = target.relative_to(root).as_posix().casefold()
+        existed = target.exists()
+        if existed and relative not in ctx.read_files:
+            return (
+                "ERROR: refusing to overwrite an existing file before successful "
+                f"full read_file observation in this run: {rel}. If the read was "
+                "truncated or compressed, use edit_file with a unique existing fragment."
+            )
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            existed = target.exists()
             target.write_text(content, encoding="utf-8")
         except OSError as exc:
             return f"ERROR: write_file failed: {exc}"
+        ctx.read_files.discard(relative)
         verb = "updated" if existed else "created"
         return f"{verb} {rel} ({len(content)} bytes, {content.count(chr(10)) + 1} lines)"
+
+
+class EditFileTool:
+    """Replace one unique text fragment in a file inside the worktree."""
+
+    name = "edit_file"
+
+    async def run(self, action_input: str, *, ctx: ReActContext) -> str:
+        if not ctx.allow_file_writes:
+            return "ERROR: file edits are disabled during read-only planning"
+        try:
+            data = json.loads(action_input)
+        except json.JSONDecodeError:
+            try:
+                data = json.loads(json_repair(action_input))
+            except json.JSONDecodeError:
+                return (
+                    "ERROR: edit_file needs JSON with 'path', 'old_string', "
+                    "and 'new_string'"
+                )
+        if not isinstance(data, dict):
+            return "ERROR: edit_file needs a JSON object"
+        rel = str(data.get("path") or data.get("file") or data.get("location") or "").strip()
+        old = data.get("old_string")
+        new = data.get("new_string")
+        if not rel:
+            return "ERROR: edit_file needs a 'path'"
+        if not isinstance(old, str) or not old:
+            return "ERROR: edit_file needs a non-empty 'old_string'"
+        if not isinstance(new, str):
+            return "ERROR: edit_file needs a string 'new_string'"
+
+        root = ctx.worktree.resolve()
+        target = (root / rel).resolve()
+        if root not in target.parents:
+            return f"ERROR: refusing to edit outside the worktree: {rel}"
+        if not target.is_file():
+            return f"ERROR: file not found: {rel}"
+        try:
+            content = target.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            return f"ERROR: edit_file could not read {rel}: {exc}"
+
+        matches = content.count(old)
+        if matches == 0:
+            return f"ERROR: old_string not found in {rel}; reread the file and use an exact fragment"
+        replace_all = data.get("replace_all") is True
+        if matches > 1 and not replace_all:
+            return (
+                f"ERROR: old_string occurs {matches} times in {rel}; "
+                "use a more specific fragment or set replace_all to true"
+            )
+        updated = content.replace(old, new, -1 if replace_all else 1)
+        try:
+            target.write_text(updated, encoding="utf-8")
+        except OSError as exc:
+            return f"ERROR: edit_file failed: {exc}"
+        return (
+            f"updated {rel} ({matches if replace_all else 1} replacement"
+            f"{'s' if (matches if replace_all else 1) != 1 else ''})"
+        )
 
 
 class FinishTool:
@@ -437,7 +618,7 @@ class FinishTool:
 class ToolRegistry:
     """Bounded registry of tools available to ReAct.
 
-    Built-in tools (grep, read_structure, run_tests) are pre-registered.
+    Built-in tools are pre-registered by :meth:`install_defaults`.
     The ADAPT agent's PluginRegistry, when it lands, can be plugged in here
     via :meth:`register` — TODO integration with ADAPT.
     """
@@ -457,14 +638,15 @@ class ToolRegistry:
         return sorted(self._tools.keys())
 
     def install_defaults(self, *, sandbox: Any) -> None:
-        """Install the built-in grep/read_structure/run_tests/repl tools."""
+        """Install the built-in repository tools."""
         self._sandbox = sandbox
         self.register(GrepTool())
+        self.register(ReadFileTool())
         self.register(ReadStructureTool())
         self.register(RunTestsTool())
-        # Writing is a first-class harness operation, not something the model
-        # smuggles through a plan payload.  See WriteFileTool's docstring.
+        # File changes are explicit tools, not payloads smuggled through a plan.
         self.register(WriteFileTool())
+        self.register(EditFileTool())
         # The REPL is the harness's own execution surface: it reuses the
         # sandbox executor (allowlist, worktree cwd, timeout) and the Firewall,
         # so a probe costs one bounded observation instead of a new dependency.
@@ -479,7 +661,6 @@ class ToolRegistry:
 
         self.register(WebSearchTool())
         self.register(FinishTool())
-
 
 # --- The runner -------------------------------------------------------------
 
@@ -604,9 +785,15 @@ class ReActRunner:
         task: str,
         state: Any,
         bootstrap_hint: str | None = None,
+        *,
+        read_only: bool | None = None,
     ) -> str:
         """Public wrapper over the opening prompt builder."""
-        return self._compose_initial_prompt(task, state, bootstrap_hint)
+        if read_only is None:
+            read_only = not getattr(getattr(self, "ctx", None), "allow_file_writes", True)
+        return self._compose_initial_prompt(
+            task, state, bootstrap_hint, read_only=read_only
+        )
 
     @property
     def guards(self) -> Any:
@@ -736,7 +923,12 @@ class ReActRunner:
 
         result = ReActResult()
         trajectory: list[dict[str, str]] = []  # role-tagged messages for the LLM
-        base_user = self._compose_initial_prompt(task, state, bootstrap_hint)
+        base_user = self._compose_initial_prompt(
+            task,
+            state,
+            bootstrap_hint,
+            read_only=not getattr(ctx, "allow_file_writes", True),
+        )
         trajectory.append({"role": "user", "content": base_user})
         # ToolContract: tell the model which tools exist, exactly once.
         trajectory.extend(self.guards.opening_messages(trajectory))
@@ -773,8 +965,11 @@ class ReActRunner:
         self._obs_cache = ObservationCache(
             root=getattr(ctx, "worktree", None) or getattr(ctx, "repo_root", None)
         )
+        cancellation = getattr(ctx, "cancellation", None)
 
         for step_idx in range(self._max_steps):
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
             compacted_this_step = False
             # ContextWindowGuard: compact before the request, not after a 422.
             # Detection alone used to *end* the run; a long episode died at 80%
@@ -800,24 +995,47 @@ class ReActRunner:
                 compacted_this_step = True
 
             # Pre-budget check. Phase = "react" (its own cap, not the planner's).
-            est_in = sum(len(m["content"]) for m in trajectory) // 4
-            est_out = max(self._react_out() // 3, 200)
+            est_in = (sum(len(m["content"]) for m in trajectory) + 2) // 3
+            task_remaining = self._budgets.task_remaining_for(state.task_id)
+            max_tokens = min(self._react_out(), max(0, task_remaining - est_in))
+            if max_tokens <= 0:
+                result.finished = True
+                result.finish_reason = "budget_exceeded"
+                result.llm_calls = step_idx
+                salvaged = self._synthesize_plan(trajectory)
+                if salvaged:
+                    result.plan = salvaged
+                    result.localization = self._extract_localization(salvaged, "")
+                self._tracer.trace(
+                    state.task_id,
+                    step=f"react_step_{step_idx}_budget_exhausted",
+                    kind="decision",
+                    detail={
+                        "step_idx": step_idx,
+                        "task_tokens_remaining": task_remaining,
+                        "estimated_input_tokens": est_in,
+                    },
+                )
+                return self._carry_trajectory(result, trajectory)
             # Atomic claim: the sectional path runs several episodes in a
             # ThreadPoolExecutor, and check-then-commit let all of them pass the
             # same remaining balance (measured: 3.7x the configured cap).
-            claim = self._budgets.reserve(_REACT_PHASE, est_in, est_out,
+            claim = self._budgets.reserve(_REACT_PHASE, est_in, max_tokens,
                                           task_id=state.task_id)
 
             # Reason — one LLM call.
             started = time.monotonic()
             try:
-                chat_result: ChatResult = await self._client.chat(
-                    self._router.route(_REACT_PHASE),
-                    trajectory,
-                    temperature=0.1,
-                    max_tokens=self._react_out(),
-                    task_id=state.task_id,
-                    phase=_REACT_PHASE,
+                chat_result: ChatResult = await _await_with_cancellation(
+                    self._client.chat(
+                        self._router.route(_REACT_PHASE),
+                        trajectory,
+                        temperature=0.1,
+                        max_tokens=max_tokens,
+                        task_id=state.task_id,
+                        phase=_REACT_PHASE,
+                    ),
+                    cancellation,
                 )
             except BaseException:
                 claim.cancel()
@@ -931,6 +1149,10 @@ class ReActRunner:
                         observation = compress(
                             kind, raw_obs, limit_tokens=_OBS_TOKEN_BUDGET
                         ).text
+                        if decision.action == "read_file":
+                            _remember_file_read(
+                                ctx, decision.action_input, raw_obs, observation
+                            )
                         trajectory.append(
                             {
                                 "role": "user",
@@ -1117,7 +1339,9 @@ class ReActRunner:
             # ShellSafety: screen the call before it reaches the sandbox.  A
             # blocked command becomes an observation, so the model can correct
             # course instead of the harness executing it.
-            blocked = self.guards.screen_tool_call(action, action_input)
+            blocked = read_only_tool_error(action, ctx)
+            if blocked is None:
+                blocked = self.guards.screen_tool_call(action, action_input)
             if blocked is not None:
                 kind = _kind_for_tool(action)
                 compressed = compress(kind, blocked, limit_tokens=_OBS_TOKEN_BUDGET)
@@ -1175,12 +1399,17 @@ class ReActRunner:
                 # Cap the observation text (belt-and-braces).
                 if estimate_tokens(observation) > _OBS_TOKEN_BUDGET:
                     observation = observation[: _OBS_TOKEN_BUDGET * 4] + "\n[truncated]"
+            if action == "read_file":
+                _remember_file_read(ctx, action_input, raw_obs, observation)
 
             trajectory.append({"role": "assistant", "content": text})
             # A successful write is the episode's real output.  Record the path
             # so the pipeline can compute its diff: the coder is asked for a
             # diff, and a file that already exists on disk is invisible to it.
-            if action == "write_file" and not str(raw_obs).startswith("ERROR"):
+            if (
+                action in {"write_file", "edit_file"}
+                and not str(raw_obs).lstrip().startswith("ERROR:")
+            ):
                 try:
                     _payload = json.loads(action_input)
                     _rel = str(
@@ -1500,7 +1729,7 @@ class ReActRunner:
     # ----------------------------------------------------------- internals
 
     def _compose_initial_prompt(
-        self, task: str, state: TaskState, hint: str | None
+        self, task: str, state: TaskState, hint: str | None, *, read_only: bool = False
     ) -> str:
         prefix = state.serialize_prefix()
         # The harness prompt (ported from ai-forever/deepagents-gigachat) is
@@ -1533,6 +1762,13 @@ class ReActRunner:
             "\"action_input\": \"[{\\\"tool\\\": \\\"edit_function\\\", \\\"args\\\": {...}}]\"} "
             "with whatever you have learned \u2014 an empty plan is a failed episode.",
         ]
+        if read_only:
+            parts.append(
+                "Read-only planning episode: only grep, read_file, read_structure, and "
+                "web_search are allowed; write_file, edit_file, repl, and run_tests are "
+                "rejected. Return the concise executable plan with finish; do not try "
+                "to modify files or execute programs."
+            )
         if hint:
             parts.append(f"Hint: {hint}")
         return "\n\n".join(parts)
@@ -1644,6 +1880,8 @@ class ReActRunner:
                 observation = raw
             else:
                 observation = compress(kind, raw, limit_tokens=_OBS_TOKEN_BUDGET).text
+            if item["tool"] == "read_file":
+                _remember_file_read(ctx, item["action_input"], raw, observation)
             records.append({**item, "kind": kind, "observation": observation})
         self._tracer.trace(
             state.task_id,

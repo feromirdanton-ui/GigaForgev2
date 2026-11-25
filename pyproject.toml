@@ -22,6 +22,11 @@ dependencies = [
     "playwright>=1.45",
     # Goal runs existing project suites when present.
     "pytest>=8.0",
+    # Goal, ReAct, chat, and sub-agents are implemented on LangGraph. This is a
+    # required runtime dependency; the product must never silently use legacy loops.
+    "langgraph>=1.2,<2",
+    "langgraph-checkpoint-sqlite>=2.0",
+    "aiosqlite>=0.21",
 ]
 
 [project.optional-dependencies]
@@ -47,14 +52,7 @@ languages = [
 # ``gigachat>=0.3`` resolves to nothing on PyPI and made this extra
 # uninstallable.
 gigachat = ["gigachat==0.3.0a1"]
-# Level-2 agent runtime: goal mode, chat, ReAct and sub-agents on LangGraph.
-# Optional so a bare install keeps the deterministic core working; the classic
-# GoalRunner/ReActRunner loops are used when it is absent.
-langgraph = [
-    "langgraph>=1.2,<2",
-    "langgraph-checkpoint-sqlite>=2.0",
-]
-# Everything the level-2 runtime needs, in one extra.
+# Everything the agent runtime needs is in the base install.
 #
 # ``deepagents`` and ``langchain-gigachat`` used to be listed here and were
 # never imported anywhere in the package.  They are not needed:
@@ -70,10 +68,6 @@ langgraph = [
 #
 # An extra that installs nothing the code imports is a false statement in the
 # package metadata, and it already cost one review round.
-agent = [
-    "langgraph>=1.2,<2",
-    "langgraph-checkpoint-sqlite>=2.0",
-]
 # Backward-compatible extra; Playwright is now included in the core install.
 browser = []
 # Local lint/build tooling. Pytest is a core runtime dependency because Goal mode
@@ -81,10 +75,6 @@ browser = []
 dev = [
     "ruff>=0.4",
     "pillow>=10.0",
-    # The level-2 agent layer is part of the product, so its tests must run in
-    # the default dev install instead of being skipped for a missing package.
-    "langgraph>=1.2,<2",
-    "langgraph-checkpoint-sqlite>=2.0",
 ]
 
 [project.scripts]

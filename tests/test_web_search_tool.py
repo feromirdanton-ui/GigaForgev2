@@ -37,6 +37,14 @@ PAGE = """
 </body></html>
 """
 
+LITE_PAGE = """
+<html><body>
+<a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa&amp;rut=abc"
+   class='result-link'>First <b>Lite</b> Result</a>
+<td class='result-snippet'>A <b>lite</b> snippet &amp; detail.</td>
+</body></html>
+"""
+
 
 def _run(tool: WebSearchTool, query: str) -> str:
     return asyncio.run(tool.run(query))
@@ -56,6 +64,12 @@ class TestParsing:
             'https%3A%2F%2Freal.example%2Fx">T</a>'
         )
         assert parse_results(page)[0][1] == "https://real.example/x"
+
+    def test_parses_duckduckgo_lite_markup(self) -> None:
+        results = parse_results(LITE_PAGE)
+        assert results == [
+            ("First Lite Result", "https://example.com/a", "A lite snippet & detail.")
+        ]
 
     def test_a_changed_page_yields_no_results_not_an_exception(self) -> None:
         assert parse_results("<html><body>nothing here</body></html>") == []
@@ -204,6 +218,35 @@ class TestHonestDegradation:
         assert _run(tool, "q").startswith("ERROR")
         state["fail"] = False
         assert "Search results" in _run(tool, "q")
+
+    def test_default_search_falls_back_to_lite_when_primary_is_blocked(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("GIGAFORGE_SEARCH_URL", raising=False)
+        calls: list[str] = []
+
+        def opener(url: str, timeout: float) -> str:
+            calls.append(url)
+            return "<html>challenge page</html>" if "html.duckduckgo.com" in url else LITE_PAGE
+
+        tool = WebSearchTool(cache=SearchCache(), opener=opener)
+        out = _run(tool, "lite fallback")
+        assert "First Lite Result" in out
+        assert len(calls) == 2
+        assert "lite.duckduckgo.com" in calls[1]
+
+    def test_custom_search_endpoint_is_not_overridden(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GIGAFORGE_SEARCH_URL", "https://search.example/?q={query}")
+        calls: list[str] = []
+        tool = WebSearchTool(
+            cache=SearchCache(),
+            opener=lambda url, timeout: calls.append(url) or "<html>unparseable</html>",
+        )
+        out = _run(tool, "custom")
+        assert out.startswith("ERROR: web_search unavailable")
+        assert calls == ["https://search.example/?q=custom"]
 
 
 class TestRegistration:

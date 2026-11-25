@@ -72,6 +72,8 @@ class ReplTool:
         exception.  A tool that raised on a failing program would turn every
         debugging step into a harness error.
         """
+        if not getattr(ctx, "allow_file_writes", True):
+            return "ERROR: repl is disabled during read-only planning"
         code = (action_input or "").strip()
         if not code:
             return "ERROR: repl needs a program"

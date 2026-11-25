@@ -54,6 +54,7 @@ class BudgetTracker:
         self._phase_used: dict[str, dict[str, int]] = {}
         # task_id -> {"in": int, "out": int}
         self._task_used: dict[str, dict[str, int]] = {}
+        self._task_caps: dict[str, int] = {}
         # task_id -> fix-loop iteration count
         self._fixloop_count: dict[str, int] = {}
         # Outstanding reservations, keyed by reservation id.  A reservation is
@@ -62,6 +63,40 @@ class BudgetTracker:
         # concurrent callers cannot both be told "there is room".
         self._reserved: dict[int, dict[str, Any]] = {}
         self._reservation_seq = 0
+
+    def set_task_cap(self, task_id: str, cap: int) -> None:
+        """Set a finite per-task cap without mutating shared global settings."""
+        task_id = str(task_id or "").strip()
+        cap = int(cap)
+        if not task_id:
+            raise ValueError("task_id is required for a task-specific budget")
+        if cap <= 0:
+            raise ValueError("task cap must be positive")
+        with self._lock:
+            self._task_caps[task_id] = cap
+
+    def clear_task_cap(self, task_id: str) -> None:
+        """Remove a task-specific cap after that task has finished."""
+        with self._lock:
+            self._task_caps.pop(str(task_id or ""), None)
+
+    def reset_phase_usage(self) -> None:
+        """Start a fresh phase-budget window when the pipeline begins a run."""
+        with self._lock:
+            if self._reserved:
+                raise RuntimeError(
+                    "cannot reset phase budgets while LLM reservations are active"
+                )
+            self._phase_used.clear()
+
+    def task_remaining_for(self, task_id: str) -> int:
+        """Return this task's cap minus committed and in-flight tokens."""
+        task_id = str(task_id or "")
+        with self._lock:
+            used = self._task_used.get(task_id, {"in": 0, "out": 0})
+            reserved = self._reserved_totals_for_task(task_id)
+            cap = self._task_caps.get(task_id, int(self._s.budget_task_cap))
+            return max(0, cap - used["in"] - used["out"] - reserved)
 
     # --- internal helpers ------------------------------------------------
 
@@ -138,10 +173,11 @@ class BudgetTracker:
             tg = self._task_used_in(task_id)
             task_reserved = self._reserved_totals_for_task(task_id)
             task_used = tg["in"] + tg["out"] + task_reserved
-            if task_used + tokens_in + tokens_out > int(self._s.budget_task_cap):
+            task_cap = self._task_caps.get(task_id, int(self._s.budget_task_cap))
+            if task_used + tokens_in + tokens_out > task_cap:
                 raise BudgetExceeded(
                     f"per-task cap exceeded for task {task_id!r}: "
-                    f"{task_used} + {tokens_in + tokens_out} > {self._s.budget_task_cap}"
+                    f"{task_used} + {tokens_in + tokens_out} > {task_cap}"
                 )
             self._reservation_seq += 1
             res_id = self._reservation_seq
@@ -240,10 +276,11 @@ class BudgetTracker:
             # CRIT-02: per-task cap is isolated by task_id, not summed globally.
             tg = self._task_used_in(task_id)
             task_used = tg["in"] + tg["out"]
-            if task_used + tokens_in + tokens_out > int(self._s.budget_task_cap):
+            task_cap = self._task_caps.get(task_id, int(self._s.budget_task_cap))
+            if task_used + tokens_in + tokens_out > task_cap:
                 raise BudgetExceeded(
                     f"per-task cap exceeded for task {task_id!r}: "
-                    f"{task_used} + {tokens_in + tokens_out} > {self._s.budget_task_cap}"
+                    f"{task_used} + {tokens_in + tokens_out} > {task_cap}"
                 )
 
     def commit(
@@ -305,10 +342,11 @@ class BudgetTracker:
                 )
             tg = self._task_used_in(task_id)
             task_used = tg["in"] + tg["out"]
-            if task_used > int(self._s.budget_task_cap):
+            task_cap = self._task_caps.get(task_id, int(self._s.budget_task_cap))
+            if task_used > task_cap:
                 raise BudgetExceeded(
                     f"per-task cap OVERSHOT for task {task_id!r}: "
-                    f"{task_used} > {self._s.budget_task_cap}"
+                    f"{task_used} > {task_cap}"
                 )
 
     def remaining(self, phase: str) -> int:
@@ -379,6 +417,7 @@ class BudgetTracker:
                     for phase, attrs in PHASE_CAP_ATTRS.items()
                 },
                 "task_cap": int(self._s.budget_task_cap),
+                "task_caps": dict(self._task_caps),
                 "fixloop_iters_cap": int(self._s.budget_fixloop_iters),
             }
 

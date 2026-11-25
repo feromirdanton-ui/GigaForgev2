@@ -8,13 +8,15 @@ could not run in a real pipeline.
 The fix is :class:`gigaforge.core.strategies.ReActPlan`: a plan strategy that
 builds a ``ReActRunner`` from the pipeline's own collaborators and runs it
 through :func:`gigaforge.agents.engine.run_react`, which dispatches to the
-classic loop or the LangGraph graph.
+required LangGraph graph.
 
 These tests pin the wiring, not the model: no GigaChat key, no network.
 """
 from __future__ import annotations
 
 from typing import Any
+
+import pytest
 
 
 # ── the strategy is selectable ───────────────────────────────────────────────
@@ -48,8 +50,7 @@ def test_react_plan_runs_through_the_engine_dispatch(monkeypatch: Any) -> None:
     """``ReActPlan.plan`` must call ``run_react`` — the product seam.
 
     A stub runner stands in for the real one; the assertion is that the strategy
-    goes through the engine dispatcher (which is what makes both the classic
-    loop and the LangGraph graph reachable) rather than calling a prompt.
+    goes through the engine dispatcher rather than calling a prompt directly.
     """
     from gigaforge.agents import engine
     from gigaforge.core.strategies import ReActPlan
@@ -88,23 +89,21 @@ def test_react_plan_runs_through_the_engine_dispatch(monkeypatch: Any) -> None:
     assert outcome.steps == ["edit the function"]
 
 
-def test_react_plan_degrades_without_a_runner() -> None:
-    """No runner means the one-shot plan, not a failed run."""
+def test_react_plan_fails_without_a_runner() -> None:
+    """A missing graph runner must stop the run, not switch to a one-shot plan."""
     from gigaforge.core.strategies import ReActPlan
 
     strategy = ReActPlan(runner_factory=None)
-    outcome = strategy.plan(
-        "goal",
-        "slice",
-        ask=lambda *a, **k: "- step one",
-        parse=lambda text: [line.strip("- ") for line in text.splitlines() if line.strip()],
-    )
-    assert outcome.strategy == "react->linear"
-    assert outcome.steps == ["step one"]
+    with pytest.raises(RuntimeError, match="runner could not be constructed"):
+        strategy.plan(
+            "goal",
+            "slice",
+            ask=lambda *a, **k: "- step one",
+            parse=lambda text: [line.strip("- ") for line in text.splitlines() if line.strip()],
+        )
 
-
-def test_react_plan_degrades_when_the_engine_raises(monkeypatch: Any) -> None:
-    """An exploration failure must not take the run down."""
+def test_react_plan_surfaces_engine_failure(monkeypatch: Any) -> None:
+    """A graph failure must not be hidden by a handwritten planner."""
     from gigaforge.agents import engine
     from gigaforge.core.strategies import ReActPlan
 
@@ -117,14 +116,13 @@ def test_react_plan_degrades_when_the_engine_raises(monkeypatch: Any) -> None:
 
     monkeypatch.setattr(engine, "run_react", _boom)
     strategy = ReActPlan(runner_factory=lambda goal="": _Runner())
-    outcome = strategy.plan(
-        "goal",
-        "",
-        ask=lambda *a, **k: "- fallback step",
-        parse=lambda text: [line.strip("- ") for line in text.splitlines() if line.strip()],
-    )
-    assert outcome.strategy == "react->linear"
-    assert outcome.steps == ["fallback step"]
+    with pytest.raises(RuntimeError, match="exploration exploded"):
+        strategy.plan(
+            "goal",
+            "",
+            ask=lambda *a, **k: "- fallback step",
+            parse=lambda text: [line.strip("- ") for line in text.splitlines() if line.strip()],
+        )
 
 
 # ── the pipeline wires the factory ───────────────────────────────────────────
@@ -137,3 +135,13 @@ def test_pipeline_exposes_the_react_runner_factory() -> None:
     assert hasattr(TaskPipeline, "_build_react_runner")
     source = inspect.getsource(TaskPipeline.__init__)
     assert "react_runner_factory" in source
+
+
+def test_langgraph_only_reports_successful_file_mutations() -> None:
+    from gigaforge.agents.langgraph_react import _written_path
+
+    payload = '{"path":"temperature.py"}'
+
+    assert _written_path("edit_file", payload, "ERROR: file edits are disabled") == ""
+    assert _written_path("edit_file", payload, "updated temperature.py") == "temperature.py"
+    assert _written_path("read_file", payload, "file contents") == ""

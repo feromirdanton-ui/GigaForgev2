@@ -50,13 +50,19 @@ from pathlib import Path
 _SECTION_CATALOGUE: tuple[tuple[str, tuple[str, ...], str], ...] = (
     ("nav", ("nav", "navigation", "menu", "navbar"), "Navigation"),
     ("hero", ("hero", "headline", "banner", "above the fold"), "Hero"),
-    ("features", ("feature", "features", "grid", "benefit", "benefits"), "Features"),
+    (
+        "features",
+        ("feature", "features", "grid", "benefit", "benefits", "model", "models",
+         "card", "cards", "spotlight"),
+        "Features",
+    ),
+    ("events", ("event", "events", "community"), "Events and community"),
     ("how", ("how it works", "workflow", "pipeline", "steps", "process"), "How it works"),
     ("stats", ("stats", "metrics", "numbers", "benchmark"), "Numbers"),
     ("pricing", ("pricing", "plans", "tiers"), "Pricing"),
     ("testimonials", ("testimonial", "quote", "review"), "Testimonials"),
     ("faq", ("faq", "questions"), "FAQ"),
-    ("contact", ("contact", "get in touch", "reach us"), "Contact"),
+    ("contact", ("contact", "get in touch", "reach us", "membership", "form"), "Contact"),
     ("cta", ("call to action", "cta", "get started", "sign up"), "Call to action"),
     ("footer", ("footer",), "Footer"),
 )

@@ -14,6 +14,7 @@ from pathlib import Path
 
 __all__ = [
     "RuntimeDependencyStatus",
+    "ensure_agent_runtime",
     "ensure_browser_runtime",
     "ensure_goal_support_packages",
     "ensure_qt_quick_runtime",
@@ -23,6 +24,80 @@ log = logging.getLogger("gigaforge.runtime_dependencies")
 _LOCK = threading.Lock()
 _CORE_LOCK = threading.Lock()
 _READY: RuntimeDependencyStatus | None = None
+
+
+def ensure_agent_runtime(
+    *, auto_install: bool = True, timeout_s: int = 600
+) -> RuntimeDependencyStatus:
+    """Require the complete LangGraph runtime before the product starts."""
+    requirements = (
+        "langgraph>=1.2,<2",
+        "langgraph-checkpoint-sqlite>=2.0",
+        "aiosqlite>=0.21",
+    )
+    with _CORE_LOCK:
+        initial = _probe_agent_runtime()
+        if initial.available or not auto_install:
+            return initial
+
+        failure = _install(
+            [_python_executable(), "-m", "pip", "install",
+             *requirements],
+            timeout_s,
+        )
+        if (
+            failure
+            and sys.prefix == sys.base_prefix
+            and any(
+                marker in failure.lower()
+                for marker in (
+                    "externally-managed", "permission denied", "access is denied",
+                    "operation not permitted",
+                )
+            )
+        ):
+            failure = _install(
+                [
+                    _python_executable(), "-m", "pip", "install", "--user",
+                    *requirements,
+                ],
+                timeout_s,
+            )
+        if failure:
+            return RuntimeDependencyStatus(False, failure)
+
+        importlib.invalidate_caches()
+        cached_runtime = sys.modules.get("gigaforge.core.langgraph_runtime")
+        if cached_runtime is not None and not cached_runtime.langgraph_available():
+            importlib.reload(cached_runtime)
+        installed = _probe_agent_runtime()
+        if installed.available:
+            return RuntimeDependencyStatus(True, installed.detail, installed=True)
+        return RuntimeDependencyStatus(
+            False,
+            "LangGraph installation completed but the required runtime cannot be imported: "
+            + installed.detail,
+            installed=True,
+        )
+
+
+def _probe_agent_runtime() -> RuntimeDependencyStatus:
+    modules = (
+        "langgraph.graph",
+        "langgraph.types",
+        "langgraph.checkpoint.memory",
+        "langgraph.checkpoint.sqlite",
+        "langgraph.checkpoint.sqlite.aio",
+        "aiosqlite",
+    )
+    for module in modules:
+        try:
+            importlib.import_module(module)
+        except (ImportError, OSError, RuntimeError) as exc:
+            return RuntimeDependencyStatus(
+                False, f"required module {module!r} is unavailable: {_excerpt(str(exc))}"
+            )
+    return RuntimeDependencyStatus(True, "LangGraph runtime and SQLite checkpointers are ready")
 
 
 @dataclass(frozen=True)

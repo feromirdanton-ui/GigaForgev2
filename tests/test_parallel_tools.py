@@ -35,11 +35,20 @@ from pathlib import Path
 from gigaforge.agents.react import (
     MAX_PARALLEL_CALLS,
     PARALLEL_ACTION,
+    ReadFileTool,
+    ReActContext,
     ReActRunner,
+    WriteFileTool,
 )
 
 
 class _Budgets:
+    def remaining(self, phase):
+        return 10**9
+
+    def task_remaining_for(self, task_id):
+        return 10**9
+
     def check(self, *a, **k):
         return None
 
@@ -123,7 +132,7 @@ def _runner(client, tracer, *, max_steps: int = 4) -> ReActRunner:
     )
 
 
-def _client_scripted(actions: list[dict]):
+def _client_scripted(actions: list[dict], before_call=None):
     """A client that emits the given actions in order, then finishes."""
 
     class _Client:
@@ -134,6 +143,8 @@ def _client_scripted(actions: list[dict]):
             from gigaforge.client.giga_client import ChatResult
 
             self.calls += 1
+            if before_call is not None:
+                before_call(self.calls)
             if self.calls <= len(actions):
                 body = json.dumps(actions[self.calls - 1])
             else:
@@ -418,3 +429,94 @@ def test_a_tool_error_survives_a_compressing_kind(tmp_path: Path) -> None:
     assert "matches" not in step["observation"], (
         "the error was turned into a grep envelope"
     )
+
+
+def _assert_cached_read_allows_write(tmp_path: Path, actions: list[dict]) -> None:
+    target = tmp_path / "existing.txt"
+    target.write_text("before", encoding="utf-8")
+    ctx = ReActContext(
+        repo_root=tmp_path.resolve(),
+        worktree=tmp_path.resolve(),
+        index=None,
+        sandbox=None,
+    )
+    client = _client_scripted(
+        actions,
+        before_call=lambda call: ctx.read_files.clear() if call == 2 else None,
+    )
+    runner = _runner(client, _Tracer(), max_steps=4)
+    runner._registry.register(ReadFileTool())
+    runner._registry.register(WriteFileTool())
+
+    asyncio.run(runner.run("inspect existing file", _State(), ctx=ctx))
+
+    assert runner._obs_cache.hits >= 1
+    result = asyncio.run(
+        WriteFileTool().run(
+            json.dumps({"path": "existing.txt", "content": "after"}),
+            ctx=ctx,
+        )
+    )
+    assert "updated existing.txt" in result
+    assert target.read_text(encoding="utf-8") == "after"
+
+
+def test_serial_read_cache_hit_counts_as_a_successful_read(tmp_path: Path) -> None:
+    _assert_cached_read_allows_write(
+        tmp_path,
+        [
+            {"thought": "read", "action": "read_file", "action_input": "existing.txt"},
+            {"thought": "read again", "action": "read_file", "action_input": "existing.txt"},
+        ],
+    )
+
+
+def test_parallel_read_cache_hit_counts_as_a_successful_read(tmp_path: Path) -> None:
+    _assert_cached_read_allows_write(
+        tmp_path,
+        [
+            {"thought": "read", "action": "read_file", "action_input": "existing.txt"},
+            {
+                "thought": "read in parallel",
+                "action": PARALLEL_ACTION,
+                "action_input": json.dumps(
+                    [{"tool": "read_file", "args": "existing.txt"}]
+                ),
+            },
+        ],
+    )
+
+
+def test_compressed_read_does_not_authorize_a_full_file_replacement(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "existing.txt"
+    original = "large file content\n" * 800
+    target.write_text(original, encoding="utf-8")
+    ctx = ReActContext(
+        repo_root=tmp_path.resolve(),
+        worktree=tmp_path.resolve(),
+        index=None,
+        sandbox=None,
+    )
+    runner = _runner(
+        _client_scripted(
+            [{"thought": "read", "action": "read_file", "action_input": "existing.txt"}]
+        ),
+        _Tracer(),
+        max_steps=2,
+    )
+    runner._registry.register(ReadFileTool())
+    runner._registry.register(WriteFileTool())
+
+    asyncio.run(runner.run("inspect existing file", _State(), ctx=ctx))
+
+    assert not ctx.read_files
+    result = asyncio.run(
+        WriteFileTool().run(
+            json.dumps({"path": "existing.txt", "content": "replacement"}),
+            ctx=ctx,
+        )
+    )
+    assert "refusing to overwrite an existing file" in result
+    assert target.read_text(encoding="utf-8") == original

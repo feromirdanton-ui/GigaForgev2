@@ -2625,6 +2625,8 @@ def _make_bridge_types(qt: tuple[Any, Any, Any, Any, Any, Any]) -> type:
             resume_goal_id = self._pending_goal_resume_id if self._mode == "goal" else ""
             self._pending_goal_resume_id = ""
             use_saved_goal_prompt = bool(resume_goal_id and self._last_goal_prompt_is_stored)
+            goal_additional_context = ""
+            goal_override = ""
             try:
                 project_files: tuple[str, ...] = ()
                 if attachments:
@@ -2642,6 +2644,17 @@ def _make_bridge_types(qt: tuple[Any, Any, Any, Any, Any, Any]) -> type:
                         Path(self.projectPath),
                         tracker,
                     )
+                if (
+                    self._mode == "goal"
+                    and not resume_goal_id
+                    and self.canResumeGoal
+                    and self._last_goal_prompt_is_stored
+                    and prompt.strip() != self._last_goal_prompt.strip()
+                ):
+                    resume_goal_id = self._last_goal_id
+                    goal_additional_context = prompt
+                    goal_override = ""
+                    use_saved_goal_prompt = True
                 if self._mode in {"agent", "goal"} and not use_saved_goal_prompt:
                     profile = self._selected_agent_profile()
                     if profile is not None:
@@ -2658,8 +2671,13 @@ def _make_bridge_types(qt: tuple[Any, Any, Any, Any, Any, Any]) -> type:
                         goal_kwargs["files"] = project_files
                         goal_kwargs.pop("goal_id", None)
                         goal_kwargs.pop("resume", None)
+                        goal_kwargs.pop("additional_context", None)
+                        goal_kwargs.pop("goal_override", None)
                         if resume_goal_id:
                             goal_kwargs.update(goal_id=resume_goal_id, resume=True)
+                            if goal_additional_context:
+                                goal_kwargs["additional_context"] = goal_additional_context
+                                goal_kwargs["goal_override"] = goal_override
                         else:
                             from gigaforge.core.goal import GoalStore
 
@@ -2751,22 +2769,15 @@ def _make_bridge_types(qt: tuple[Any, Any, Any, Any, Any, Any]) -> type:
                     engine = self.ctx.chat_engine(**kwargs)
                 engine._gigaforge_mode = mode
                 self._session_id = str(getattr(engine.session, "session_id", self._session_id))
-                backend = getattr(engine, "backend", None)
-                history = getattr(backend, "history", None)
-                if mode == "chat" and isinstance(history, list) and not history:
-                    restored: list[dict[str, str]] = []
-                    for event in getattr(engine.session, "events", []):
-                        kind = str(getattr(event, "kind", ""))
-                        text = str(getattr(event, "text", "") or "").strip()
-                        data = getattr(event, "data", {}) or {}
-                        if kind == "command" and isinstance(data, dict) and data.get("role") == "user" and text:
-                            restored.append({"role": "user", "content": text})
-                        elif kind in {"say", "assistant", "text"} and text:
-                            restored.append({"role": "assistant", "content": text})
-                    window = max(2, int(getattr(backend, "window", 16)))
-                    backend.history = restored[-window:]
                 self._engines[mode] = engine
                 self._sync_approval(engine, mode)
+            refresh_session = getattr(getattr(engine, "session", None), "reload", None)
+            if callable(refresh_session):
+                refresh_session()
+            backend = getattr(engine, "backend", None)
+            restore_history = getattr(backend, "restore_history", None)
+            if mode == "chat" and callable(restore_history):
+                restore_history(getattr(engine.session, "events", []))
             self._events = [event.to_dict() for event in getattr(engine.session, "events", [])][-250:]
             return engine
 
@@ -2881,6 +2892,7 @@ def _make_bridge_types(qt: tuple[Any, Any, Any, Any, Any, Any]) -> type:
                 self._last_goal_id = goal_id
             if status:
                 self._last_goal_status = status
+                self._last_goal_prompt_is_stored = bool(self._last_goal_prompt)
             if not self._last_goal_id:
                 return
             if self._last_goal_status == "completed":

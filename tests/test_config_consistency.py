@@ -68,6 +68,33 @@ def test_the_react_phase_routes_to_a_real_model() -> None:
     assert route.temperature <= 0.2, "exploration should stay near-deterministic"
 
 
+def test_react_episode_timeout_is_independently_configurable() -> None:
+    from gigaforge.core.config import CoreConfig
+
+    default = CoreConfig()
+    configured = CoreConfig.from_env({"GF_CORE__REACT_TIMEOUT": "333"})
+
+    assert default.react_timeout == 480.0
+    assert configured.react_timeout == 333.0
+    assert configured.to_dict()["react_timeout"] == 333.0
+
+
+def test_react_plan_node_uses_its_episode_timeout(tmp_path) -> None:
+    from gigaforge.core.config import CoreConfig
+    from gigaforge.core.pipeline import TaskPipeline
+
+    pipeline = TaskPipeline(config=CoreConfig(
+        repo_root=str(tmp_path),
+        db_path=str(tmp_path / "core.sqlite3"),
+        trace_path=str(tmp_path / "traces" / "core.jsonl"),
+        react_timeout=333.0,
+    ))
+    try:
+        assert pipeline.build().nodes["plan"].timeout == 333.0
+    finally:
+        pipeline.close()
+
+
 @pytest.mark.parametrize("phase", ["plan", "code", "review", "react"])
 def test_a_phase_resolves_to_a_non_empty_budget(phase: str) -> None:
     from gigaforge.core.config import CoreConfig

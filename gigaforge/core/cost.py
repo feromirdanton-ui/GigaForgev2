@@ -144,14 +144,20 @@ class PriceTable:
         """
         source = os.environ if env is None else env
         prefix = "GF_CORE__PRICES__"
+        prefix_folded = prefix.casefold()
+        known_models = {name.casefold(): name for name in DEFAULT_PRICES}
         overrides: dict[str, ModelPrice] = {}
         for raw_key, value in source.items():
-            if not raw_key.startswith(prefix):
+            # Windows normalizes environment variable names to uppercase.  The
+            # prefix and model portion therefore need case-insensitive parsing;
+            # known model names are restored to their catalogue spelling below.
+            if not raw_key.casefold().startswith(prefix_folded):
                 continue
             parts = raw_key[len(prefix):].split("__")
             if len(parts) != 2:
                 continue
-            model, knob = parts[0], parts[1].lower()
+            model, knob = parts[0], parts[1].casefold()
+            model = known_models.get(model.casefold(), model)
             current = overrides.get(model) or DEFAULT_PRICES.get(model) or ModelPrice(model)
             if knob == "prompt_per_million":
                 overrides[model] = ModelPrice(

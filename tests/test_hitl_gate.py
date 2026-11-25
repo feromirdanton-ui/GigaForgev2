@@ -34,9 +34,6 @@ from gigaforge.core.approval import (
     ApprovalResult,
 )
 
-pytest.importorskip("langgraph")
-
-
 class _Report:
     def __init__(self, passed: bool | None) -> None:
         self.passed = passed

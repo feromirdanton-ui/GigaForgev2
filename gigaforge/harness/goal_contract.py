@@ -108,6 +108,32 @@ _SELF_CONTAINED = (
     "standalone",
 )
 
+_NAMED_LIST_RE = re.compile(
+    r"\b(?:cards?|models?|libraries|resources?)\b[^()]{0,80}\(([^()]{2,240})\)",
+    re.I,
+)
+_SOURCE_COUNT_RE = re.compile(
+    r"\b(?P<count>\d[\d,]*)\s+(?:(?:official|reputable|credible)\s+)?sources?\b",
+    re.I,
+)
+_WORD_UNIT = r"(?:words?|слов(?:о|а|ей)?)"
+_CHAR_UNIT = r"(?:characters?|chars?|символ(?:а|ов)?|знак(?:а|ов)?)"
+_EXACT_COUNT_RE = re.compile(
+    rf"\b(?:exactly|precisely|ровно)\s+"
+    rf"(?P<count>\d[\d,]*)\s*(?P<unit>{_WORD_UNIT}|{_CHAR_UNIT})\b",
+    re.I,
+)
+_COUNT_RANGE_RE = re.compile(
+    rf"\b(?P<minimum>\d[\d,]*)\s*[-\u2013\u2014]\s*"
+    rf"(?P<maximum>\d[\d,]*)\s*(?P<unit>{_WORD_UNIT}|{_CHAR_UNIT})\b",
+    re.I,
+)
+_MIN_COUNT_RE = re.compile(
+    rf"\b(?:at\s+least|minimum(?:\s+of)?|no\s+fewer\s+than|not\s+less\s+than)"
+    rf"\s+(?P<count>\d[\d,]*)\s*(?P<unit>{_WORD_UNIT}|{_CHAR_UNIT})\b",
+    re.I,
+)
+
 #: A page smaller than this cannot plausibly satisfy a multi-part design brief.
 _MIN_ARTIFACT_BYTES = 1200
 
@@ -140,6 +166,9 @@ _PLACEHOLDER_PATTERNS = (
     r"\bsample\s+text\b",
     r"\bexample\s+content\b",
     r"\binsert\s+.{0,20}\s+here\b",
+    r"\b(?:detailed\s+)?(?:explanation|details|content)\s+continues?\s+in\s+"
+    r"(?:the\s+)?(?:following|subsequent)\s+sections?\b",
+    r"\b(?:to\s+be\s+continued|more\s+content\s+to\s+follow)\b",
     # Meta-copy: a sentence that describes the page instead of being the page.
     # Measured live: a feature card read "This is where we showcase our
     # cutting-edge AI technology" — a description of what the card would say,
@@ -231,7 +260,8 @@ def visible_text(text: str) -> str:
     useful, while searching the rendered text catches exactly the skeleton the
     live run produced.
     """
-    body = _SCRIPT_STYLE_RE.sub(" ", text)
+    body = _HTML_COMMENT.sub(" ", text)
+    body = _SCRIPT_STYLE_RE.sub(" ", body)
     body = _TAG_RE.sub(" ", body)
     return re.sub(r"\s+", " ", body).strip()
 
@@ -246,16 +276,47 @@ def find_placeholders(text: str) -> list[str]:
     return seen
 
 
+def _numbered_source_entries(text: str) -> list[str]:
+    lines = text.splitlines()
+    starts = [
+        index
+        for index, line in enumerate(lines)
+        if re.match(r"\s*\d+[.)]\s+\S", line)
+    ]
+    return [
+        "\n".join(lines[start : starts[pos + 1] if pos + 1 < len(starts) else len(lines)])
+        for pos, start in enumerate(starts)
+    ]
+
+
 @dataclass(frozen=True)
 class Requirement:
     """One explicit, machine-checkable thing the goal asked for."""
 
-    kind: str  # "colour" | "section" | "self_contained" | "min_size"
+    kind: str  # "colour" | "section" | "self_contained" | "min_size" | ...
     label: str
     needles: tuple[str, ...] = ()
+    minimum: int | None = None
+    maximum: int | None = None
 
     def satisfied_by(self, text: str) -> bool:
         low = strip_comments(resolve_css_variables(text)).lower()
+        if self.kind in {"word_count", "char_count"}:
+            count = (
+                len(re.findall(r"\b[\w'-]+\b", visible_text(text)))
+                if self.kind == "word_count"
+                else len(text)
+            )
+            return (
+                (self.minimum is None or count >= self.minimum)
+                and (self.maximum is None or count <= self.maximum)
+            )
+        if self.kind == "source_count":
+            entries = _numbered_source_entries(text)
+            return (
+                len(entries) == self.minimum
+                and all(re.search(r"https?://\S+", entry) for entry in entries)
+            )
         if self.kind == "self_contained":
             # Any absolute URL in a src/href is an external asset.
             return not re.search(r'(?:src|href)\s*=\s*["\']https?://', low)
@@ -268,6 +329,103 @@ class Requirement:
             if find_placeholders(text):
                 return False
             return len(visible_text(text)) >= _MIN_VISIBLE_TEXT_CHARS
+        if self.kind == "named_item":
+            return bool(self.needles) and all(needle in low for needle in self.needles)
+        if self.kind == "reduced_motion":
+            return bool(
+                re.search(
+                    r"@media\s*\(\s*prefers-reduced-motion\s*:",
+                    low,
+                )
+            )
+        if self.kind == "interactive_form":
+            has_form = bool(re.search(r"<form\b", low))
+            has_validation = bool(
+                re.search(r"\brequired\b|checkvalidity\s*\(|reportvalidity\s*\(", low)
+            )
+            has_submit_handler = bool(
+                re.search(
+                    r"addEventListener\s*\(\s*['\"]submit['\"]|onsubmit\s*=",
+                    low,
+                    re.I,
+                )
+            )
+            has_success_state = any(
+                phrase in low
+                for phrase in (
+                    "success",
+                    "thank you",
+                    "you're in",
+                    "you are in",
+                    "успешно",
+                    "спасибо",
+                    "вы присоединились",
+                    "заявка отправлена",
+                    "регистрация завершена",
+                )
+            )
+            needs_live_region = "aria-live" in self.needles
+            return (
+                has_form
+                and has_validation
+                and has_submit_handler
+                and has_success_state
+                and (not needs_live_region or "aria-live" in low)
+            )
+        if self.kind == "responsive_navigation":
+            nav_match = re.search(r"<nav\b[^>]*>.*?</nav\s*>", low, re.S)
+            if not nav_match or "@media" not in low:
+                return False
+            controlled_menu = False
+            for button in re.findall(r"<button\b[^>]*>", low, re.S):
+                if "aria-expanded" not in button:
+                    continue
+                controls = re.search(r"\baria-controls\s*=\s*['\"]([^'\"]+)['\"]", button)
+                if controls and re.search(
+                    rf"\bid\s*=\s*['\"]{re.escape(controls.group(1))}['\"]",
+                    nav_match.group(),
+                ):
+                    controlled_menu = True
+                    break
+            has_click_handler = bool(
+                re.search(
+                    r"addEventListener\s*\(\s*['\"]click['\"]|onclick\s*=",
+                    low,
+                    re.I,
+                )
+            )
+            updates_expanded = bool(
+                re.search(
+                    r"setAttribute\s*\(\s*['\"]aria-expanded['\"]|\.ariaexpanded\s*=",
+                    low,
+                    re.I,
+                )
+            )
+            changes_menu_state = bool(
+                re.search(
+                    r"classList\.(?:toggle|add|remove)\s*\(|"
+                    r"\.hidden\s*=|\.style\.(?:display|visibility)\s*=",
+                    low,
+                )
+            )
+            return (
+                controlled_menu
+                and has_click_handler
+                and updates_expanded
+                and changes_menu_state
+            )
+        if self.kind == "section_heading":
+            sections = re.findall(r"<section\b[^>]*>(.*?)</section\s*>", low, re.S)
+            for section in sections:
+                headings = re.findall(r"<h[1-6]\b[^>]*>(.*?)</h[1-6]\s*>", section, re.S)
+                heading_text = " ".join(_TAG_RE.sub(" ", heading) for heading in headings)
+                if all(needle in heading_text for needle in self.needles):
+                    return True
+            return False
+        if self.kind == "internal_links":
+            targets = set(re.findall(r"\bhref\s*=\s*['\"]#([^'\"]+)['\"]", low))
+            ids = set(re.findall(r"\bid\s*=\s*['\"]([^'\"]+)['\"]", low))
+            return bool(targets) and targets.issubset(ids)
         if self.kind == "colour":
             # The colour must sit in a CSS *declaration*: the needle has to
             # appear after a ``:`` on a line that also names a colour property.
@@ -357,8 +515,9 @@ class ContractVerdict:
             lines.extend(f"- {m}" for m in self.met)
         lines.append("")
         lines.append(
-            "Use write_file to rewrite the file with the missing pieces, "
-            "then finish."
+            "For an existing file, use read_file then edit_file to preserve "
+            "the content that already passes. Use write_file only for a new "
+            "file or a necessary full rewrite, then finish."
         )
         return "\n".join(lines)
 
@@ -373,6 +532,59 @@ def extract_requirements(goal: str) -> list[Requirement]:
     low = goal.lower()
     reqs: list[Requirement] = []
 
+    for match in _EXACT_COUNT_RE.finditer(goal):
+        count = int(match.group("count").replace(",", ""))
+        unit = match.group("unit").lower()
+        kind = "word_count" if re.search(_WORD_UNIT, unit, re.I) else "char_count"
+        unit_name = "words" if kind == "word_count" else "characters"
+        reqs.append(
+            Requirement(
+                kind,
+                f"exactly {count} {unit_name}",
+                minimum=count,
+                maximum=count,
+            )
+        )
+
+    for match in _SOURCE_COUNT_RE.finditer(goal):
+        count = int(match.group("count").replace(",", ""))
+        reqs.append(
+            Requirement(
+                "source_count",
+                f"exactly {count} numbered sources with URLs",
+                minimum=count,
+                maximum=count,
+            )
+        )
+
+    for match in _COUNT_RANGE_RE.finditer(goal):
+        minimum = int(match.group("minimum").replace(",", ""))
+        maximum = int(match.group("maximum").replace(",", ""))
+        unit = match.group("unit").lower()
+        kind = "word_count" if re.search(_WORD_UNIT, unit, re.I) else "char_count"
+        unit_name = "words" if kind == "word_count" else "characters"
+        reqs.append(
+            Requirement(
+                kind,
+                f"between {minimum} and {maximum} {unit_name}",
+                minimum=minimum,
+                maximum=maximum,
+            )
+        )
+
+    for match in _MIN_COUNT_RE.finditer(goal):
+        minimum = int(match.group("count").replace(",", ""))
+        unit = match.group("unit").lower()
+        kind = "word_count" if re.search(_WORD_UNIT, unit, re.I) else "char_count"
+        unit_name = "words" if kind == "word_count" else "characters"
+        reqs.append(
+            Requirement(
+                kind,
+                f"at least {minimum} {unit_name}",
+                minimum=minimum,
+            )
+        )
+
     for word, needles in _COLOUR_WORDS.items():
         if re.search(rf"\b{word}\b", low):
             reqs.append(Requirement("colour", f"colour '{word}'", needles))
@@ -380,6 +592,56 @@ def extract_requirements(goal: str) -> list[Requirement]:
     for word, needles in _SECTION_WORDS.items():
         if re.search(rf"\b{word}\b", low):
             reqs.append(Requirement("section", f"section '{word}'", needles))
+
+    for match in _NAMED_LIST_RE.finditer(goal):
+        names = [
+            item.strip(" \t\r\n.,;:()[]{}'\"")
+            for item in re.split(r",|;|\band\b", match.group(1), flags=re.I)
+        ]
+        if len(names) >= 2:
+            reqs.extend(
+                Requirement("named_item", f"include '{name}'", (name.lower(),))
+                for name in names
+                if name
+            )
+
+    if re.search(r"\breduced[- ]motion\b", low):
+        reqs.append(Requirement("reduced_motion", "reduced-motion support"))
+
+    if "form" in low and any(word in low for word in ("validation", "success state")):
+        form_needles = ("aria-live",) if "aria-live" in low else ()
+        reqs.append(
+            Requirement(
+                "interactive_form",
+                "a working form with validation and a success state",
+                form_needles,
+            )
+        )
+
+    if "navigation" in low and "mobile" in low:
+        reqs.append(
+            Requirement(
+                "responsive_navigation",
+                "working responsive mobile navigation",
+            )
+        )
+
+    if re.search(r"\b(?:events?\s*(?:/|and)\s*learning|learning\s+resources)\s+section\b", low):
+        reqs.append(
+            Requirement(
+                "section_heading",
+                "an events/learning content section",
+                ("event", "learning"),
+            )
+        )
+
+    if "href" in low and ("target" in low or "internal link" in low):
+        reqs.append(
+            Requirement(
+                "internal_links",
+                "all internal link targets exist",
+            )
+        )
 
     if any(p in low for p in _SELF_CONTAINED):
         reqs.append(Requirement("self_contained", "no external assets"))
@@ -581,8 +843,84 @@ def check_artifacts(
         return verdict
 
     texts = {p: p.read_text(encoding="utf-8", errors="replace") for p in targets}
+    size_constrained = any(req.kind in {"word_count", "char_count"} for req in requirements)
+    if size_constrained and not any(req.kind == "substance" for req in requirements):
+        placeholders = list(dict.fromkeys(
+            phrase for text in texts.values() for phrase in find_placeholders(text)
+        ))
+        if placeholders:
+            verdict.unmet.append(
+                "complete text — replace placeholder phrases: "
+                + ", ".join(f"'{phrase}'" for phrase in placeholders[:5])
+            )
     for req in requirements:
         verdict.checked.append(req.label)
+        if req.kind in {"word_count", "char_count"}:
+            unit = "words" if req.kind == "word_count" else "characters"
+            counts = [
+                (
+                    path,
+                    len(re.findall(r"\b[\w'-]+\b", visible_text(text)))
+                    if req.kind == "word_count"
+                    else len(text),
+                )
+                for path, text in texts.items()
+            ]
+            if any(
+                (req.minimum is None or count >= req.minimum)
+                and (req.maximum is None or count <= req.maximum)
+                for _path, count in counts
+            ):
+                verdict.met.append(req.label)
+            else:
+                path, count = min(
+                    counts,
+                    key=lambda item: (
+                        max(0, (req.minimum or 0) - item[1])
+                        + max(0, item[1] - (req.maximum or item[1])),
+                        -len(texts[item[0]]),
+                    ),
+                )
+                if (
+                    req.minimum is not None
+                    and req.maximum == req.minimum
+                    and count != req.minimum
+                ):
+                    difference = abs(req.minimum - count)
+                    direction = "add" if count < req.minimum else "remove"
+                    quantity_unit = unit[:-1] if difference == 1 else unit
+                    correction = (
+                        f"{direction} exactly {difference} {quantity_unit} to reach "
+                        f"{req.minimum}; make no other length-changing edits"
+                    )
+                elif req.minimum is not None and count < req.minimum:
+                    shortage = req.minimum - count
+                    if req.maximum is not None:
+                        target = (req.minimum + req.maximum) // 2
+                        correction = (
+                            f"rewrite/expand toward about {target} {unit}, "
+                            f"within {req.minimum}-{req.maximum}; add at least "
+                            f"{shortage} complete {unit}"
+                        )
+                    else:
+                        correction = (
+                            f"add at least {shortage} complete {unit} to reach "
+                            f"{req.minimum}; do not leave outlines or placeholders"
+                        )
+                else:
+                    if req.minimum is not None and req.maximum is not None:
+                        target = (req.minimum + req.maximum) // 2
+                        correction = (
+                            f"rewrite or condense rather than append; aim for "
+                            f"about {target} {unit}, within {req.minimum}-{req.maximum}"
+                        )
+                    else:
+                        correction = f"reduce it to at most {req.maximum}"
+                verdict.unmet.append(
+                    f"{req.label} (closest file {path.name} has {count} {unit}; "
+                    f"{correction})"
+                )
+            continue
         if req.kind == "min_size":
             # Per file: the requirement is about *an* artifact, and summing
             # unrelated files is how five small files passed a 1200-byte check.
@@ -592,6 +930,23 @@ def check_artifacts(
             else:
                 verdict.unmet.append(
                     f"{req.label} (largest file is {biggest} bytes)"
+                )
+            continue
+        if req.kind == "source_count":
+            best_entries = max(
+                (_numbered_source_entries(text) for text in texts.values()),
+                key=len,
+                default=[],
+            )
+            valid_entries = sum(
+                bool(re.search(r"https?://\S+", entry)) for entry in best_entries
+            )
+            if any(req.satisfied_by(text) for text in texts.values()):
+                verdict.met.append(req.label)
+            else:
+                verdict.unmet.append(
+                    f"{req.label} (found {len(best_entries)} numbered entries, "
+                    f"{valid_entries} with URLs; put each source on its own numbered line)"
                 )
             continue
         if req.kind == "heading":

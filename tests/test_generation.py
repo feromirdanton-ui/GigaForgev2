@@ -53,6 +53,16 @@ class TestPlan:
         assert "features" in kinds
         assert "footer" in kinds
 
+    def test_snn_brief_plans_models_events_and_membership(self) -> None:
+        goal = (
+            "Create index.html with a hero, three model-spotlight cards, "
+            "an events/community section, and an accessible membership form."
+        )
+
+        assert plan_generation(goal).kinds() == [
+            "hero", "features", "events", "contact", "footer"
+        ]
+
     def test_plan_keeps_catalogue_order(self) -> None:
         kinds = plan_generation(SITE_GOAL).kinds()
         assert kinds.index("hero") < kinds.index("features") < kinds.index("footer")

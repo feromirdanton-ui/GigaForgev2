@@ -174,3 +174,37 @@ def test_reserve_refuses_when_phase_is_already_full():
     with pytest.raises(BudgetExceeded):
         tracker.reserve("react", 1, 0, task_id="t")
     first.settle(1000, 0)
+
+
+def test_task_specific_cap_applies_to_reservations_and_clears_cleanly():
+    tracker = _tracker()
+    tracker.set_task_cap("goal-cycle", 1000)
+    claim = tracker.reserve("react", 300, 600, task_id="goal-cycle")
+    assert tracker.task_remaining_for("goal-cycle") == 100
+    with pytest.raises(BudgetExceeded):
+        tracker.reserve("react", 100, 1, task_id="goal-cycle")
+    claim.settle(300, 600)
+    assert tracker.task_remaining_for("goal-cycle") == 100
+    tracker.clear_task_cap("goal-cycle")
+    assert tracker.task_remaining_for("goal-cycle") == 99_100
+
+
+def test_phase_usage_can_be_reset_between_sequential_pipeline_runs():
+    tracker = _tracker()
+    tracker.commit("react", 120, 80, task_id="first-run")
+
+    tracker.reset_phase_usage()
+
+    snapshot = tracker.snapshot()
+    assert snapshot["phase_used"] == {}
+    assert tracker.task_remaining_for("first-run") == 99_800
+
+
+def test_phase_usage_cannot_reset_while_a_call_is_reserved():
+    tracker = _tracker()
+    claim = tracker.reserve("react", 100, 100, task_id="run")
+
+    with pytest.raises(RuntimeError, match="reservations are active"):
+        tracker.reset_phase_usage()
+
+    claim.cancel()

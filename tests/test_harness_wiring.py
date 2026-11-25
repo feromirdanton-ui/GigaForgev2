@@ -108,15 +108,14 @@ def test_ledger_records_the_llm_and_tool_calls(tmp_path: Any) -> None:
     assert ledger.tool_calls == 1
 
 
-def test_harness_falls_back_to_linear_when_the_episode_fails(tmp_path: Any) -> None:
-    """A failed episode must still produce a plan, and still be accounted for."""
+def test_harness_uses_the_graph_plan_and_accounts_for_it(tmp_path: Any) -> None:
+    """A successful graph episode produces a plan and is accounted for."""
     from gigaforge.harness import HarnessPolicy
 
     pipeline, _ = _react_pipeline(tmp_path)
     strategy = pipeline.plan_strategy
     strategy.bind_run("run-h4")
 
-    # A policy that allows no attempts at all forces the failure path.
     policy = HarnessPolicy(max_attempts=1, max_compactions=0)
     outcome, ledger = strategy.plan_under_harness(
         "goal",
@@ -125,8 +124,6 @@ def test_harness_falls_back_to_linear_when_the_episode_fails(tmp_path: Any) -> N
         parse=lambda t: [t],
         policy=policy,
     )
-    # The episode succeeded here, so the plan is the ReAct one; the point of
-    # this test is that the harness path is the one that ran.
     assert outcome.steps
     assert ledger is not None
 

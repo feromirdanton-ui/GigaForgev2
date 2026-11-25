@@ -15,6 +15,9 @@ from gigaforge.agents.react import ReActRunner
 
 
 class _Budgets:
+    def task_remaining_for(self, task_id):
+        return 100_000
+
     def check(self, *a, **k):
         return None
 
@@ -53,6 +56,8 @@ class _Ctx:
         self.repo_root = root
         self.sandbox = None
         self.index = None
+        self.allow_file_writes = True
+        self.read_files: set[str] = set()
 
 
 def _runner(client, max_steps: int = 3) -> ReActRunner:
@@ -129,3 +134,54 @@ def test_a_cached_step_is_marked_as_cached(tmp_path: Path) -> None:
     assert _Grep.calls == 1
     assert result.steps[0]["cached"] is False
     assert result.steps[1]["cached"] is True
+
+
+def test_an_edited_file_is_reported_as_an_episode_write(tmp_path: Path) -> None:
+    import json
+
+    from gigaforge.client.giga_client import ChatResult
+
+    path = tmp_path / "index.html"
+    path.write_text("<h1>Old</h1>", encoding="utf-8")
+    edit_payload = json.dumps(
+        {
+            "path": "index.html",
+            "old_string": "<h1>Old</h1>",
+            "new_string": "<h1>New</h1>",
+        }
+    )
+
+    class _Client:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def chat(self, *a, **k):
+            self.calls += 1
+            if self.calls == 1:
+                body = (
+                    '{"thought":"read the file first","action":"read_file",'
+                    '"action_input":"index.html"}'
+                )
+            elif self.calls == 2:
+                body = json.dumps(
+                    {
+                        "thought": "Update the headline",
+                        "action": "edit_file",
+                        "action_input": edit_payload,
+                    }
+                )
+            else:
+                body = '{"thought":"done","action":"finish","action_input":"ok"}'
+            return ChatResult(
+                content=body,
+                usage={"prompt_tokens": 1, "completion_tokens": 1},
+            )
+
+    result = asyncio.run(
+        _runner(_Client(), max_steps=4).run(
+            "update the headline", _State(), ctx=_Ctx(tmp_path)
+        )
+    )
+
+    assert path.read_text(encoding="utf-8") == "<h1>New</h1>"
+    assert result.written_files == ["index.html"]

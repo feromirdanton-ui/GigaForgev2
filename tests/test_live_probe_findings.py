@@ -42,8 +42,8 @@ def test_plan_used_is_populated_on_a_real_run(tmp_path: Path) -> None:
     assert result.plan_steps_executed >= 1
 
 
-def test_a_linear_fallback_is_not_recorded_as_a_used_plan(tmp_path: Path) -> None:
-    """A fallback to the linear plan must not claim the episode's plan was used."""
+def test_an_empty_react_plan_is_not_recorded_as_a_used_plan(tmp_path: Path) -> None:
+    """An empty graph plan fails visibly instead of silently switching planners."""
     from tests.test_goal_to_diff import _pipeline, _repo, _ScriptedProvider
 
     _repo(tmp_path)
@@ -52,6 +52,7 @@ def test_a_linear_fallback_is_not_recorded_as_a_used_plan(tmp_path: Path) -> Non
         diff="",
     )
     result = _pipeline(tmp_path, provider).run("the arithmetic helper is wrong")
+    assert result.status == "failed"
     assert result.plan_used is False
 
 
@@ -92,7 +93,14 @@ def test_the_repaired_files_are_reported_on_the_result(tmp_path: Path) -> None:
 
     _repo(tmp_path)
     provider = _ScriptedProvider(
-        react_script=[{"thought": "done", "action": "finish", "action_input": []}],
+        react_script=[{
+            "thought": "edit the existing arithmetic helper and verify it",
+            "action": "finish",
+            "action_input": [
+                {"tool": "edit_function", "args": {"name": "add"}},
+                {"tool": "run_tests", "args": {}},
+            ],
+        }],
         diff=(
             "```diff\n--- /dev/null\n+++ b/math_utils.py\n@@ -0,0 +1,2 @@\n"
             "+def add(a: int, b: int) -> int:\n+    return a + b\n```\n"

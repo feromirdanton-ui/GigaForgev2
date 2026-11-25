@@ -13,11 +13,11 @@ from __future__ import annotations
 import inspect
 
 from gigaforge.core.fixloop import FixLoop
-from gigaforge.core.pipeline import TaskPipeline
+from gigaforge.core.pipeline import TaskPipeline, _diff_path_hint
 from gigaforge.firewall.diff import parse
 from gigaforge.firewall.validator import DiffValidator
 
-BARE_HUNK = "@@ -1,2 +1,2 @@\n-<h1>Old</h1>\n+<h1>New</h1>\n"
+BARE_HUNK = "@@ -1 +1 @@\n-<h1>Old</h1>\n+<h1>New</h1>\n"
 
 
 class TestTheParserAcceptsAHint:
@@ -52,6 +52,34 @@ class TestTheValidatorForwardsIt:
                                      path_hint="index.html")
         reasons = [a.repair.reason for a in outcome.attempts if a.repair]
         assert "diff could not be parsed" not in reasons
+        assert outcome.final_diff.startswith(
+            "--- a/index.html\n+++ b/index.html\n@@"
+        )
+
+    def test_autofix_note_does_not_abort_validation(self, tmp_path, monkeypatch) -> None:
+        from gigaforge.firewall.config import FirewallConfig
+
+        (tmp_path / "calc.py").write_text(
+            "def value():\n    return 1\n",
+            encoding="utf-8",
+        )
+        validator = DiffValidator(
+            config=FirewallConfig(repo_root=str(tmp_path), auto_fix=True)
+        )
+        monkeypatch.setattr(
+            validator,
+            "_auto_fix",
+            lambda paths: ["calc.py: auto-fixed by ruff"],
+        )
+
+        outcome = validator.validate(
+            "@@ -1,2 +1,2 @@\n-    return 1\n+    return 2\n",
+            max_retries=0,
+            dry_run=True,
+            path_hint="calc.py",
+        )
+
+        assert outcome.accepted
 
 
 class TestTheLoopForwardsIt:
@@ -64,4 +92,30 @@ class TestTheLoopForwardsIt:
     def test_the_pipeline_passes_the_owned_path(self) -> None:
         source = inspect.getsource(TaskPipeline._node_act)
         assert "path_hint=" in source
-        assert "harness_owned_paths" in source
+        assert "_diff_path_hint(ctx)" in source
+
+    def test_a_single_named_text_file_is_a_valid_hint(self) -> None:
+        from types import SimpleNamespace
+
+        ctx = SimpleNamespace(extras={
+            "task_kind": {
+                "artifact_paths": [],
+                "edit_paths": [],
+                "code_paths": ["welcome.txt"],
+            }
+        })
+
+        assert _diff_path_hint(ctx) == "welcome.txt"
+
+    def test_ambiguous_named_paths_do_not_choose_a_hint(self) -> None:
+        from types import SimpleNamespace
+
+        ctx = SimpleNamespace(extras={
+            "task_kind": {
+                "artifact_paths": [],
+                "edit_paths": [],
+                "code_paths": ["src/a.py", "src/b.py"],
+            }
+        })
+
+        assert _diff_path_hint(ctx) == ""

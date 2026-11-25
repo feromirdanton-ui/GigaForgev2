@@ -38,6 +38,7 @@ import os
 import re
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol
 
 log = logging.getLogger("gigaforge.core.strategies")
@@ -98,6 +99,8 @@ class PlanOutcome:
     #: the pipeline can compute their diff instead of asking the coder to
     #: reproduce work that already exists on disk.
     written_files: list[str] = field(default_factory=list)
+    #: The rendered steps were recovered from observations or successful writes.
+    salvaged: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -106,6 +109,7 @@ class PlanOutcome:
             "score": round(float(self.score), 3),
             "judge_used": self.judge_used,
             "localization": dict(self.localization),
+            "salvaged": self.salvaged,
             "candidates": [
                 {
                     "branch": c.get("branch"),
@@ -705,17 +709,14 @@ class ReActPlan:
     The strategy is a thin adapter: it builds a :class:`ReActRunner` from the
     pipeline's own collaborators (client, router, budgets, tracer, sandbox) and
     runs it through :func:`gigaforge.agents.engine.run_react`, which dispatches
-    to the classic loop or the LangGraph graph according to
-    ``GIGAFORGE_REACT_ENGINE``.  Both engines return the same
-    :class:`~gigaforge.agents.react.ReActResult`, so the DAG sees one shape.
+    to the required LangGraph graph.
 
     Opt-in, because every ReAct step is a model call:
 
         GIGAFORGE_PLAN_STRATEGY=react
 
-    When the runner cannot be built (no sandbox, no index, no client) the
-    strategy degrades to :class:`LinearPlan` rather than failing the run — a
-    missing exploration capability must not make the harness unrunnable.
+    If the runner cannot be built or the graph cannot produce a guarded plan,
+    the run fails visibly instead of silently switching to a legacy planner.
     """
 
     name = "react"
@@ -755,21 +756,6 @@ class ReActPlan:
         except TypeError:
             return self._runner_factory(goal)
 
-    def _linear(
-        self,
-        goal: str,
-        slice_text: str,
-        *,
-        ask: AskFn,
-        parse: Callable[[str], list[str]],
-        strategy: str = "react->linear",
-    ) -> PlanOutcome:
-        from .prompt import build_phase_prompt
-
-        prompt = build_phase_prompt("plan", goal=goal, slice_text=slice_text).render()
-        steps = parse(ask("plan", prompt))
-        return PlanOutcome(steps=steps, strategy=strategy, score=score_steps(steps))
-
     def plan(
         self,
         goal: str,
@@ -781,30 +767,26 @@ class ReActPlan:
     ) -> PlanOutcome:
         runner = self._build_runner(goal)
         if runner is None:
-            # No exploration capability wired in: fall back to the one-shot plan.
-            return self._linear(goal, slice_text, ask=ask, parse=parse)
+            raise RuntimeError("LangGraph ReAct runner could not be constructed")
         # Kept so the plan guard can read the runner's real tool registry.
         self._last_runner = runner
 
         from gigaforge.agents.engine import run_react
 
-        try:
-            result = run_react(
-                runner,
-                goal,
-                runner.state,
-                ctx=runner.ctx,
-                thread_id=self._run_id or "react-plan",
-            )
-        except Exception as exc:  # noqa: BLE001 - exploration is best-effort
-            log.warning("ReAct planning failed (%s); falling back to linear", exc)
-            return self._linear(goal, slice_text, ask=ask, parse=parse)
+        result = run_react(
+            runner,
+            goal,
+            runner.state,
+            ctx=runner.ctx,
+            thread_id=self._run_id or "react-plan",
+        )
 
         steps, verdict = self._guarded_steps(result)
         if not steps:
-            # The loop explored but never produced a plan: the slice-based plan
-            # is still better than an empty one.
-            return self._linear(goal, slice_text, ask=ask, parse=parse)
+            raise RuntimeError(
+                "LangGraph ReAct did not produce an executable plan: "
+                + str(verdict.to_dict())[:500]
+            )
         return PlanOutcome(
             steps=steps,
             strategy=self.name,
@@ -859,6 +841,25 @@ class ReActPlan:
                 return found | dag_tools
         return dag_tools | {"read_structure", "grep", "run_tests", "think"}
 
+    @staticmethod
+    def _safe_relative_paths(paths: Iterable[Any]) -> list[str]:
+        safe: list[str] = []
+        for raw_path in paths:
+            path = str(raw_path or "").strip().replace("\\", "/")
+            while path.startswith("./"):
+                path = path[2:]
+            parts = path.split("/")
+            if (
+                not path
+                or path.startswith("/")
+                or ":" in parts[0]
+                or any(part in {"", ".", ".."} for part in parts)
+            ):
+                continue
+            if path not in safe:
+                safe.append(path)
+        return safe
+
     def _guarded_steps(self, result: Any) -> tuple[list[str], Any]:
         """Render the episode's plan into DAG steps, after the plan guard.
 
@@ -870,9 +871,9 @@ class ReActPlan:
         ``edit_function: react.py`` with no symbol and no verification.
 
         The guard is deterministic and model-free, so it costs nothing and
-        cannot drift.  Returns ``(steps, verdict)``; ``steps`` is empty when the
-        guard rejected every step, which the caller turns into the linear
-        fallback.
+        cannot drift. Returns ``(steps, verdict)``; ``steps`` is empty when the
+        guard rejected every step and neither observations nor successful file
+        writes can be salvaged.
         """
         from gigaforge.harness.plan_guard import validate_plan
 
@@ -913,9 +914,8 @@ class ReActPlan:
             # the guard dropped it and the run reported zero steps despite
             # having the answer in its trajectory.
             #
-            # Salvage from the observations instead.  This is deterministic and
-            # model-free, and it is the same recovery the classic loop already
-            # applies when a finish payload does not parse.
+            # Salvage from the graph's observations instead. This is
+            # deterministic and model-free; it does not switch engines.
             trajectory = getattr(result, "trajectory", None)
             if trajectory:
                 salvaged = runner.synthesize_plan(trajectory) if runner is not None else []
@@ -926,7 +926,41 @@ class ReActPlan:
                         "plan guard emptied the plan; salvaged %d step(s) from observations",
                         len(steps),
                     )
+        if not steps:
+            written_files = self._safe_relative_paths(
+                getattr(result, "written_files", None) or []
+            )
+            steps = [
+                f"Review and refine the implementation already written to {path}; "
+                "verify that it satisfies the requested goal."
+                for path in written_files
+            ]
+            if steps:
+                log.info(
+                    "plan guard produced no steps; salvaged %d written file(s)",
+                    len(steps),
+                )
         return steps, verdict
+
+    @staticmethod
+    def _record_failed_usage(state: Any, ledger: Any) -> None:
+        if ledger is None:
+            return
+        record_usage = getattr(state, "record_phase_usage", None)
+        if not callable(record_usage):
+            return
+        tokens_in = max(0, int(getattr(ledger, "tokens_in", 0) or 0))
+        tokens_out = max(0, int(getattr(ledger, "tokens_out", 0) or 0))
+        record_usage(
+            "react",
+            {
+                "prompt_tokens": tokens_in,
+                "completion_tokens": tokens_out,
+                "total_tokens": tokens_in + tokens_out,
+                "calls": max(0, int(getattr(ledger, "llm_calls", 0) or 0)),
+                "cost_micros": max(0, int(getattr(ledger, "cost_micros", 0) or 0)),
+            },
+        )
 
     def plan_under_harness(
         self,
@@ -935,7 +969,11 @@ class ReActPlan:
         *,
         ask: AskFn,
         parse: Callable[[str], list[str]],
+        cancellation: Any = None,
+        pipeline_state: Any = None,
+        fallback_paths: Sequence[str] = (),
         policy: Any = None,
+        read_only: bool = False,
     ) -> tuple[PlanOutcome, Any]:
         """Plan through the :class:`~gigaforge.harness.Harness`.
 
@@ -945,18 +983,20 @@ class ReActPlan:
         exploration cost.
 
         Without this method the harness would be another inert layer — built,
-        tested, and never called by the product.  ``plan()`` keeps its old
-        behaviour for callers that do not want a policy; this is the entry point
-        the pipeline uses.
+        tested, and never called by the product. This is the entry point the
+        pipeline uses; graph failures are surfaced, never routed to a legacy plan.
 
-        Returns ``(outcome, ledger)``; the ledger is ``None`` when the runner
-        could not be built (the linear fallback has no episode to account for).
+        Returns ``(outcome, ledger)`` with the graph's actual execution ledger.
         """
         from gigaforge.harness import Harness, HarnessPolicy
 
         runner = self._build_runner(goal)
         if runner is None:
-            return self._linear(goal, slice_text, ask=ask, parse=parse), None
+            raise RuntimeError("LangGraph ReAct runner could not be constructed")
+        if read_only:
+            runner.ctx.allow_file_writes = False
+        if cancellation is not None:
+            runner.ctx.cancellation = cancellation
         # Kept so the plan guard can read the runner's real tool registry and
         # its guards (the deterministic-output rule lives on the runner).
         self._last_runner = runner
@@ -988,17 +1028,57 @@ class ReActPlan:
             react=True,
         )
         if not outcome.ok:
-            log.warning(
-                "ReAct planning stopped (%s: %s); falling back to linear",
-                outcome.finish_reason,
-                outcome.error,
+            self._record_failed_usage(
+                pipeline_state if pipeline_state is not None else runner.state,
+                getattr(outcome, "ledger", None),
             )
-            return self._linear(goal, slice_text, ask=ask, parse=parse), outcome.ledger
+            raise RuntimeError(
+                f"LangGraph ReAct planning failed ({outcome.finish_reason}): "
+                f"{outcome.error}"
+            )
 
         result = outcome.result
         steps, verdict = self._guarded_steps(result)
+        safe_fallback_paths = self._safe_relative_paths(fallback_paths)
+        if not steps and safe_fallback_paths:
+            steps = [
+                f"Apply the requested changes to {path} and verify the result."
+                for path in safe_fallback_paths
+            ]
+            log.info(
+                "plan guard produced no steps; salvaged %d designated file(s)",
+                len(steps),
+            )
         if not steps:
-            return self._linear(goal, slice_text, ask=ask, parse=parse), outcome.ledger
+            self._record_failed_usage(
+                pipeline_state if pipeline_state is not None else runner.state,
+                getattr(outcome, "ledger", None),
+            )
+            raise RuntimeError(
+                "LangGraph ReAct did not produce an executable plan: "
+                + str(verdict.to_dict())[:500]
+            )
+        salvaged = bool(steps) and not bool(verdict.steps)
+        written_files = self._safe_relative_paths(
+            getattr(result, "written_files", None) or []
+        )
+        if salvaged and safe_fallback_paths:
+            context = getattr(runner, "ctx", None)
+            worktree = getattr(context, "worktree", None)
+            if worktree:
+                root = Path(worktree).resolve()
+                for rel in safe_fallback_paths:
+                    candidate = (root / rel).resolve()
+                    try:
+                        candidate.relative_to(root)
+                    except ValueError:
+                        continue
+                    if candidate.is_file() and rel not in written_files:
+                        written_files.append(rel)
+        localization = dict(getattr(result, "localization", None) or {})
+        target_files = written_files or safe_fallback_paths
+        if target_files and not localization.get("target_file"):
+            localization["target_file"] = target_files[0]
         if outcome.ledger is not None:
             # Make the plan's fate visible in the run record.  Without this a run
             # that paid for exploration and discarded it is indistinguishable
@@ -1006,17 +1086,17 @@ class ReActPlan:
             outcome.ledger.note_plan(
                 used=True,
                 steps=len(steps),
-                salvaged=bool(getattr(result, "trajectory", None))
-                and not bool(getattr(result, "plan", None)),
+                salvaged=salvaged,
             )
         return (
             PlanOutcome(
                 steps=steps,
                 strategy=self.name,
                 score=score_steps(steps),
-                localization=dict(getattr(result, "localization", None) or {}),
+                localization=localization,
                 structured=list(getattr(result, "plan", None) or []),
-                written_files=list(getattr(result, "written_files", None) or []),
+                written_files=written_files,
+                salvaged=salvaged,
                 candidates=[{
                     "branch": "react",
                     "steps": steps,

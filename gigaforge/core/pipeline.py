@@ -34,6 +34,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import subprocess
 import threading
 import time
 from dataclasses import dataclass, field, replace
@@ -56,7 +57,7 @@ from .contracts import (
 )
 from .dag import CheckpointStore, DagExecutor, DagResult
 from .errors import CoreError, PipelineError
-from .fixloop import FixLoop, FixLoopResult
+from .fixloop import FixIteration, FixLoop, FixLoopResult
 from .metrics import MetricsCollector
 from .prompt import build_phase_prompt, extract_diff
 from .router import ModelRouter
@@ -484,6 +485,10 @@ class TaskPipeline:
                 requires=("task", "slice", "cache_hit"),
                 provides=("plan", "plan_meta"),
                 retries=0,
+                timeout=(
+                    self.config.react_timeout
+                    if self.plan_strategy.name == "react" else None
+                ),
                 description=f"decompose the goal (strategy: {self.plan_strategy.name})",
             ),
             NodeSpec(
@@ -589,6 +594,7 @@ class TaskPipeline:
         approve: Optional[Callable[[str], bool]] = None,
         resume: bool = False,
         max_fix_iterations: Optional[int] = None,
+        conversation_context: str = "",
         cancellation: Optional[CancellationToken] = None,
     ) -> PipelineResult:
         """Run the task DAG end to end.
@@ -617,9 +623,14 @@ class TaskPipeline:
                 use_cache=use_cache, dry_run=dry_run, use_subagents=use_subagents,
                 react=react, approve=approve, resume=resume,
                 max_fix_iterations=max_fix_iterations, cancellation=token,
+                conversation_context=conversation_context,
                 started_ms=started,
             )
         finally:
+            budget_tracker = getattr(getattr(self, "router", None), "budget", None)
+            clear_task_cap = getattr(budget_tracker, "clear_task_cap", None)
+            if callable(clear_task_cap):
+                clear_task_cap(run_id)
             callbacks: list[Callable[[], None]] = []
             with self._lock:
                 self._active_runs.pop(run_id, None)
@@ -651,10 +662,14 @@ class TaskPipeline:
         approve: Optional[Callable[[str], bool]],
         resume: bool,
         max_fix_iterations: Optional[int],
+        conversation_context: str,
         cancellation: CancellationToken,
         started_ms: float,
     ) -> PipelineResult:
         state = TaskState(run_id=run_id, goal=goal)
+        conversation_context = str(conversation_context or "").strip()[-8000:]
+        if conversation_context:
+            state.add_history("user", conversation_context)
         # ``router.reset()`` existed and was never called, so the per-phase
         # call/token counters accumulated across every run in the process.  A
         # goal run invokes ``pipeline.run()`` once per cycle, so from cycle 5
@@ -663,6 +678,18 @@ class TaskPipeline:
         # (`tokens 0`) and the goal gave up on work it had already done.
         # A run is the unit a phase budget is specified for.
         self.router.reset()
+        with self._lock:
+            is_only_active_run = len(self._active_runs) == 1
+        if is_only_active_run:
+            reset_phase_usage = getattr(
+                getattr(self.router, "budget", None), "reset_phase_usage", None
+            )
+            if callable(reset_phase_usage):
+                reset_phase_usage()
+        if budget_tokens:
+            task_budget = getattr(getattr(self.router, "budget", None), "set_task_cap", None)
+            if callable(task_budget):
+                task_budget(run_id, int(budget_tokens))
         # The active state, so helpers without a RunContext in hand (the
         # ``_degraded`` recorder) can still report what they could not do.
         self._active_state = state
@@ -690,6 +717,7 @@ class TaskPipeline:
                 "use_subagents": bool(use_subagents),
                 "react": bool(react),
                 "approve": approve,
+                "conversation_context": conversation_context,
             },
         )
         executor = self.build()
@@ -991,6 +1019,93 @@ class TaskPipeline:
                 return {"cache_hit": True, "cached_diff": diff}
         return {"cache_hit": False, "cached_diff": ""}
 
+    def _independent_subagent_files(self, goal: str) -> list[str]:
+        """Find explicit independent code targets that need no model planning."""
+        from gigaforge.firewall.slicer_keywords import Extractor
+        from gigaforge.harness.task_kind import classify_task
+
+        from .acceptance import allocate_work
+
+        root = self._repo_root()
+        if not classify_task(goal, root).is_code:
+            return []
+        config = getattr(getattr(self, "firewall", None), "config", None)
+        paths = Extractor(config).extract(goal).paths
+        named = [
+            rel for raw in dict.fromkeys(paths)
+            if (rel := _workspace_relative_path(raw, root))
+            and (root / rel).is_file()
+        ]
+        if not 2 <= len(named) <= 3:
+            return []
+        for rel in named:
+            lowered = rel.replace("\\", "/").lower()
+            name = lowered.rsplit("/", 1)[-1]
+            if (
+                name.startswith("test_")
+                or name.endswith("_test.py")
+                or "/tests/" in f"/{lowered}"
+                or "/test/" in f"/{lowered}"
+            ):
+                return []
+        return named if len(allocate_work(goal, named, coordinated=False)) >= 2 else []
+
+    def _subagent_symbol_owners(
+        self, goal: str, paths: Sequence[str]
+    ) -> dict[str, str]:
+        """Associate explicitly requested functions with their related module."""
+        import ast
+
+        requested = list(dict.fromkeys(re.findall(
+            r"\b(?:public\s+)?(?:function|method)\s+([A-Za-z_]\w*)\s*\(",
+            goal,
+            re.I,
+        )))
+        if not requested:
+            return {}
+
+        root = self._repo_root()
+        module_functions: dict[str, list[str]] = {}
+        for rel in paths:
+            try:
+                tree = ast.parse((root / rel).read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, SyntaxError):
+                continue
+            module_functions[rel] = [
+                node.name for node in tree.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and not node.name.startswith("_")
+            ]
+
+        def tokens(name: str) -> set[str]:
+            return {
+                part.lower()
+                for part in re.split(r"[^A-Za-z0-9]+|_", name)
+                if part and part.lower() not in {"to", "from", "and"}
+            }
+
+        owners: dict[str, str] = {}
+        for symbol in requested:
+            wanted = tokens(symbol)
+            scores = []
+            for path, existing in module_functions.items():
+                score = max(
+                    (
+                        len(wanted & tokens(name)) / max(1, len(wanted | tokens(name)))
+                        for name in existing
+                        if name != symbol
+                    ),
+                    default=0.0,
+                )
+                if score > 0:
+                    scores.append((score, path))
+            scores.sort(key=lambda item: (-item[0], item[1]))
+            if scores and scores[0][0] >= 0.5 and (
+                len(scores) == 1 or scores[0][0] > scores[1][0]
+            ):
+                owners[symbol] = scores[0][1]
+        return owners
+
     def _build_react_runner(
         self,
         goal: str = "",
@@ -1087,14 +1202,77 @@ class TaskPipeline:
         # episodes, and those strategies have none.
         harness_plan = getattr(self.plan_strategy, "plan_under_harness", None)
         ledger = None
-        if callable(harness_plan):
+        subagent_paths: list[str] = []
+        if ctx.extras.get("use_subagents"):
+            try:
+                subagent_paths = self._independent_subagent_files(ctx.state.goal)
+            except Exception as exc:  # noqa: BLE001 - fall back to the read-only planner
+                self._event(
+                    "pipeline.subagent_plan_error",
+                    run_id=ctx.run_id,
+                    error=str(exc)[:300],
+                )
+        if subagent_paths:
+            steps = [
+                "Delegate independent implementation work for "
+                + ", ".join(subagent_paths)
+                + " to isolated subagents and verify the merged changes."
+            ]
+            outcome = PlanOutcome(
+                steps=steps,
+                strategy="subagents",
+                score=1.0,
+            )
+            self._event(
+                "pipeline.subagent_plan",
+                run_id=ctx.run_id,
+                files=subagent_paths,
+                reason="explicit independent code targets do not need model planning",
+            )
+        elif callable(harness_plan):
+            planning_goal = ctx.state.goal
+            conversation_context = str(ctx.extras.get("conversation_context") or "").strip()
+            if conversation_context:
+                planning_goal = (
+                    f"{planning_goal}\n\nRelevant earlier conversation:\n"
+                    f"{conversation_context}"
+                )
+            if ctx.extras.get("use_subagents"):
+                planning_goal += (
+                    "\n\nSubagent planning constraint: do not read or edit the target "
+                    "files in this stage; isolated child agents will inspect their "
+                    "assignments. Finish immediately with a concise executable plan, "
+                    "using one targeted coder step per named file when the work is "
+                    "independent. If it is not eligible for delegation, the normal "
+                    "implementation stage will handle it. Do not write or edit files."
+                )
+            path_hints = list(
+                dict.fromkeys(
+                    str(path).strip().replace("\\", "/")
+                    for path in (
+                        *(ctx.extras.get("files") or ()),
+                        *(ctx.extras.get("focus_paths") or ()),
+                    )
+                    if str(path).strip()
+                )
+            )
+            if path_hints:
+                planning_goal += (
+                    "\n\nUser-designated files to inspect and modify "
+                    "(use these paths directly; do not search for them):\n"
+                    + "\n".join(f"- {path}" for path in path_hints)
+                )
             outcome, ledger = harness_plan(
-                ctx.state.goal,
+                planning_goal,
                 slice_text,
                 ask=lambda phase, prompt, temperature=None: self._ask(
                     phase, prompt, ctx, temperature=temperature
                 ),
                 parse=_parse_plan,
+                cancellation=getattr(ctx, "cancellation", None),
+                pipeline_state=ctx.state,
+                fallback_paths=path_hints,
+                read_only=bool(ctx.extras.get("use_subagents")),
             )
         else:
             outcome = self.plan_strategy.plan(
@@ -1125,10 +1303,27 @@ class TaskPipeline:
         ctx.extras["plan_used"] = bool(outcome.steps) and outcome.strategy != "linear"
         ctx.extras["plan_steps_executed"] = len(outcome.steps or [])
         ctx.extras["plan_salvaged"] = bool(
-            getattr(outcome, "structured", None) is None
-            and getattr(outcome, "steps", None)
-            and outcome.strategy != "linear"
+            getattr(outcome, "salvaged", False)
+            or (
+                getattr(outcome, "structured", None) is None
+                and getattr(outcome, "steps", None)
+                and outcome.strategy != "linear"
+            )
         )
+        if ledger is not None:
+            ctx.state.record_phase_usage(
+                "react",
+                {
+                    "prompt_tokens": int(getattr(ledger, "tokens_in", 0) or 0),
+                    "completion_tokens": int(getattr(ledger, "tokens_out", 0) or 0),
+                    "total_tokens": (
+                        int(getattr(ledger, "tokens_in", 0) or 0)
+                        + int(getattr(ledger, "tokens_out", 0) or 0)
+                    ),
+                    "calls": int(getattr(ledger, "llm_calls", 0) or 0),
+                    "cost_micros": int(getattr(ledger, "cost_micros", 0) or 0),
+                },
+            )
         plan = [s.description for s in ctx.state.plan]
         self._event(
             "pipeline.plan",
@@ -1484,7 +1679,7 @@ class TaskPipeline:
             )
         return "\n".join(parts)
 
-    def _subagent_diff(self, ctx: RunContext) -> str:
+    def _subagent_diff(self, ctx: RunContext, *, episode_diff: str = "") -> str:
         """Delegate a multi-file goal to sub-agents with exclusive ownership.
 
         Opt-in (``use_subagents``).  Each sub-agent runs the whole pipeline in
@@ -1524,7 +1719,24 @@ class TaskPipeline:
             ctx.extras["task_kind"] = kind.to_dict()
             self._event("pipeline.task_kind", run_id=ctx.run_id,
                         task_kind=kind.kind, evidence=kind.evidence[:300])
+            if kind.kind == "mixed":
+                # A mixed request needs one coordinated authoring pass.  Sending
+                # it through the artifact-only section builder drops its code
+                # paths; splitting it into file children can do the same for a
+                # newly-created artifact.
+                self._event(
+                    "pipeline.subagents_skipped", run_id=ctx.run_id,
+                    reason="mixed code and artifact work requires coordinated execution",
+                )
+                return ""
             if kind.is_artifact:
+                if episode_diff:
+                    self._event(
+                        "pipeline.subagents_skipped",
+                        run_id=ctx.run_id,
+                        reason="ReAct already wrote the artifact; preserving its content",
+                    )
+                    return ""
                 # ``--subagents`` used to be a silent no-op on a page goal: the
                 # artifact branch returned the sectional path and the flag was
                 # never mentioned again, so a user who asked for sub-agents got
@@ -1539,6 +1751,16 @@ class TaskPipeline:
                             reason="a page decomposes into sections, not worktrees; "
                                    "sections are generated concurrently")
                 return self._sectional_generation(ctx)
+            if kind.is_code and episode_diff:
+                # Child worktrees start from the repository base, not ReAct's
+                # uncommitted writes. Their diffs cannot safely replace files
+                # the planning episode has already changed.
+                self._event(
+                    "pipeline.subagents_skipped",
+                    run_id=ctx.run_id,
+                    reason="ReAct already wrote code; avoiding overlapping worktrees",
+                )
+                return ""
         except Exception as exc:  # noqa: BLE001 - fall through to the code path
             self._event("pipeline.generation_plan_error", run_id=ctx.run_id,
                         error=str(exc)[:300])
@@ -1581,21 +1803,47 @@ class TaskPipeline:
             self._event("pipeline.subagents_skipped", run_id=ctx.run_id,
                         files=len(named), reason="not enough independent work")
             return ""
+        symbol_owners = self._subagent_symbol_owners(ctx.state.goal, named)
 
-        specs = [
-            SubAgentSpec(
-                name=f"work-{index}",
-                # Only this item's work.  ``_scoped_goal`` removes the other
-                # paths from the text, so the child cannot re-derive them.
-                goal=_scoped_goal(ctx.state.goal, item.owns_paths, named),
-                focus_paths=item.owns_paths,
-                budget_tokens=int(ctx.extras.get("budget_tokens") or 0),
-                use_cache=bool(ctx.extras.get("use_cache", True)),
-                dry_run=bool(ctx.extras.get("dry_run", False)),
-                max_fix_iterations=ctx.extras.get("max_fix_iterations"),
+        task_budget = int(ctx.extras.get("budget_tokens") or 0)
+        child_budget = _allocate_subagent_budget(
+            task_budget, ctx.state.total_tokens(), len(items)
+        )
+        if task_budget and child_budget <= 0:
+            self._event(
+                "pipeline.subagents_skipped", run_id=ctx.run_id,
+                reason="remaining token budget is too small to allocate across children",
+                budget_tokens=task_budget, tokens_used=ctx.state.total_tokens(),
             )
-            for index, item in enumerate(items)
-        ]
+            return ""
+
+        specs = []
+        for index, item in enumerate(items):
+            scoped_goal = _scoped_goal(ctx.state.goal, item.owns_paths, named)
+            ownership = [
+                (
+                    f"Implement {symbol} only in {owner}."
+                    if owner in item.owns_paths
+                    else f"Do not implement or duplicate {symbol} in this file; "
+                         f"that requirement belongs exclusively to {owner}."
+                )
+                for symbol, owner in symbol_owners.items()
+            ]
+            if ownership:
+                scoped_goal += "\n\nSymbol ownership:\n" + "\n".join(
+                    f"- {rule}" for rule in ownership
+                )
+            specs.append(
+                SubAgentSpec(
+                    name=f"work-{index}",
+                    goal=scoped_goal,
+                    focus_paths=item.owns_paths,
+                    budget_tokens=child_budget,
+                    use_cache=bool(ctx.extras.get("use_cache", True)),
+                    dry_run=bool(ctx.extras.get("dry_run", False)),
+                    max_fix_iterations=ctx.extras.get("max_fix_iterations"),
+                )
+            )
         try:
             results = self.fan_out(specs, parent_ctx=ctx, parallel=True)
         except Exception as exc:  # noqa: BLE001 - fall back to one agent
@@ -1603,17 +1851,102 @@ class TaskPipeline:
                         error=str(exc)[:300])
             return ""
 
+        child_budget_overruns: list[dict[str, Any]] = []
+        for spec, result in zip(specs, results, strict=True):
+            if spec.budget_tokens:
+                child_tokens = max(0, int(getattr(result, "tokens", 0) or 0))
+                if child_tokens > spec.budget_tokens:
+                    child_budget_overruns.append(
+                        {
+                            "name": spec.name,
+                            "tokens": child_tokens,
+                            "budget_tokens": spec.budget_tokens,
+                        }
+                    )
+
+            observed_tokens = 0
+            observed_calls = 0
+            child_usage = getattr(result, "phase_usages", {}) or {}
+            child_costs = getattr(result, "phase_cost_micros", {}) or {}
+            if isinstance(child_usage, Mapping):
+                for phase, usage in child_usage.items():
+                    if not isinstance(usage, Mapping):
+                        continue
+                    phase_name = str(phase)
+                    bucket = ctx.state.phase_usages.setdefault(
+                        phase_name,
+                        {
+                            "prompt_tokens": 0,
+                            "completion_tokens": 0,
+                            "total_tokens": 0,
+                            "calls": 0,
+                        },
+                    )
+                    for key in ("prompt_tokens", "completion_tokens", "total_tokens", "calls"):
+                        value = max(0, int(usage.get(key, 0) or 0))
+                        bucket[key] = int(bucket.get(key, 0) or 0) + value
+                    observed_tokens += max(0, int(usage.get("total_tokens", 0) or 0))
+                    observed_calls += max(0, int(usage.get("calls", 0) or 0))
+                    if isinstance(child_costs, Mapping):
+                        phase_cost = max(0, int(child_costs.get(phase, 0) or 0))
+                        if phase_cost:
+                            ctx.state.phase_cost_micros[phase_name] = (
+                                int(ctx.state.phase_cost_micros.get(phase_name, 0))
+                                + phase_cost
+                            )
+
+            reported_tokens = max(0, int(getattr(result, "tokens", 0) or 0))
+            reported_calls = max(0, int(getattr(result, "calls", 0) or 0))
+            untracked_tokens = max(0, reported_tokens - observed_tokens)
+            untracked_calls = max(0, reported_calls - observed_calls)
+            if untracked_tokens or untracked_calls:
+                bucket = ctx.state.phase_usages.setdefault(
+                    "subagents",
+                    {
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "total_tokens": 0,
+                        "calls": 0,
+                    },
+                )
+                bucket["total_tokens"] = (
+                    int(bucket.get("total_tokens", 0)) + untracked_tokens
+                )
+                bucket["calls"] = int(bucket.get("calls", 0)) + untracked_calls
+            ctx.state.cost_micros += max(
+                0, int(getattr(result, "cost_micros", 0) or 0)
+            )
+
+        if child_budget_overruns:
+            ctx.extras["subagent_budget_overrun"] = child_budget_overruns
+            self._event(
+                "pipeline.subagents_budget_exceeded", run_id=ctx.run_id,
+                children=child_budget_overruns[:4],
+            )
+
         # Acceptance gate.  A rejected child is reported with its reason and
         # excluded from the merge; it is never silently dropped and never
         # silently merged.
         entries: list[dict[str, Any]] = []
         rejected: list[dict[str, Any]] = []
         accepted_paths: list[str] = []
-        for item, result in zip(items, results):
-            verdict = check_acceptance(
-                result, item, accepted_paths=accepted_paths, config=config
-            )
-            if verdict.accepted:
+        for item, result in zip(items, results, strict=True):
+            misplaced_symbols = [
+                f"{symbol} was added to {path}, but belongs in {owner}"
+                for path, symbol in _added_function_definitions(
+                    str(getattr(result, "diff", "") or "")
+                )
+                if (owner := symbol_owners.get(symbol)) and owner != path
+            ]
+            if misplaced_symbols:
+                reasons = misplaced_symbols
+                verdict = None
+            else:
+                verdict = check_acceptance(
+                    result, item, accepted_paths=accepted_paths, config=config
+                )
+                reasons = verdict.reasons
+            if verdict is not None and verdict.accepted:
                 accepted_paths.extend(verdict.paths)
                 entries.append({
                     "name": item.id,
@@ -1623,7 +1956,7 @@ class TaskPipeline:
             else:
                 rejected.append({
                     "name": item.id,
-                    "reasons": verdict.reasons,
+                    "reasons": reasons,
                     "ok": bool(getattr(result, "ok", False)),
                     "error": str(getattr(result, "error", "") or "")[:200],
                 })
@@ -1714,7 +2047,6 @@ class TaskPipeline:
             except Exception as exc:  # noqa: BLE001 - trimming is an optimisation
                 self._event("pipeline.optimize_error", run_id=ctx.run_id,
                             error=str(exc)[:200])
-        prefetched = self._subagent_diff(ctx)
         # The exploration episode may have written files itself (its ``write_file``
         # tool).  Those writes are real work the run already paid for, and the
         # coder cannot see them: it is asked to express the change as a diff, and
@@ -1725,6 +2057,7 @@ class TaskPipeline:
         # file sat on disk.  The harness computes the diff from the worktree —
         # that is a computation, not a judgement call.
         episode_diff = self._episode_diff(ctx)
+        prefetched = self._subagent_diff(ctx, episode_diff=episode_diff)
         if episode_diff:
             prefetched = "\n".join(p for p in (prefetched, episode_diff) if p)
 
@@ -1742,11 +2075,17 @@ class TaskPipeline:
                 ctx.extras["task_kind"] = kind.to_dict()
                 self._event("pipeline.task_kind", run_id=ctx.run_id,
                             task_kind=kind.kind, evidence=kind.evidence[:300])
-                if kind.is_artifact:
+                if kind.is_artifact and not kind.is_code:
                     prefetched = self._sectional_generation(ctx)
             except Exception as exc:  # noqa: BLE001 - fall back to the coder
                 self._event("pipeline.generation_plan_error", run_id=ctx.run_id,
                             error=str(exc)[:300])
+        if prefetched:
+            creation_diff = self._ensure_creations(ctx, prefetched, slice_text, ctx)
+            if creation_diff:
+                prefetched = "\n".join(
+                    part for part in (prefetched, creation_diff) if part
+                )
 
         def propose(phase: str, prompt_text: str, iteration: int, hint: str) -> ProposeResult:
             text = self._ask(phase, prompt_text, ctx)
@@ -1757,6 +2096,11 @@ class TaskPipeline:
                 from .fileblocks import files_to_diff
 
                 diff = "\n".join(part for part in (diff, files_to_diff(blocks)) if part)
+            diff = self._repair_creation_hunks(ctx, diff)
+            if diff:
+                creation_diff = self._ensure_creations(ctx, diff, slice_text, ctx)
+                if creation_diff:
+                    diff = "\n".join(part for part in (diff, creation_diff) if part)
             return ProposeResult(text=text, diff=diff, phase=phase,
                                  model=route.model if route else "")
 
@@ -1775,11 +2119,37 @@ class TaskPipeline:
             # file is meant, so it says so instead of failing the run with
             # "hunk without a file header and no path hint" — measured live on
             # the ``run`` mode, which rejected a correct page for this reason.
-            path_hint=(sorted(ctx.extras.get("harness_owned_paths") or []) or [""])[0],
+            path_hint=_diff_path_hint(ctx),
         )
         ctx.extras["fix_result"] = result
-        result.diff = self._ensure_creations(ctx, result.diff, slice_text, ctx)
         result.diff = self._repair_creation_hunks(ctx, result.diff)
+        creation_diff = self._ensure_creations(
+            ctx, result.diff, slice_text, ctx, validated=result.accepted
+        )
+        if creation_diff:
+            creation_diff = self._repair_creation_hunks(ctx, creation_diff)
+            creation_validation = self.fixloop.validate_once(
+                creation_diff,
+                task=ctx.state.goal,
+                dry_run=bool(ctx.extras.get("dry_run")),
+                path_hint=_diff_path_hint(ctx),
+            )
+            creation_status = _merge_focused_creation(
+                result,
+                creation_diff,
+                creation_validation,
+                ctx.extras.get("goal_named_paths") or (),
+            )
+            if creation_status["missing"]:
+                ctx.extras["focused_creation_partial"] = creation_status["missing"]
+            self._event(
+                "pipeline.focused_creation",
+                run_id=ctx.run_id,
+                accepted=creation_status["accepted"],
+                files=creation_status["files"],
+                missing=creation_status["missing"],
+                reason=creation_validation.reason[:300],
+            )
         # Ownership is ONE invariant, applied once.  Three mechanisms used to
         # approximate it — drop the model's hunks, put the harness's hunks back,
         # write the harness's bytes over the tree — and the invariant lived only
@@ -1850,7 +2220,7 @@ class TaskPipeline:
         return repaired
 
     def _ensure_creations(self, ctx: RunContext, diff: str, slice_text: str,
-                          ctx_any: Any = None) -> str:
+                          ctx_any: Any = None, *, validated: bool = False) -> str:
         """Ask for the missing *new* files the goal names, one focused call each.
 
         Models merge several files into a single ``diff --git`` block; the parser
@@ -1866,19 +2236,29 @@ class TaskPipeline:
             paths = Extractor(config).extract(ctx.state.goal).paths
         except Exception as exc:  # noqa: BLE001
             self._degraded("path_extractor", exc, "create_missing")
-            return diff
+            return ""
         root = self._repo_root()
         paths = [
             rel for raw in dict.fromkeys(paths)
             if (rel := _workspace_relative_path(raw, root))
         ]
-        created_markers = [p for p in paths if f"+++ b/{p}" in diff or f"+++ {p}" in diff]
+        ctx.extras["goal_named_paths"] = paths
+        created_markers = []
+        for rel in paths:
+            escaped = re.escape(rel)
+            creation = re.search(
+                rf"(?ms)^--- /dev/null\r?\n\+\+\+ (?:b/)?{escaped}\r?\n"
+                rf"(?P<body>.*?)(?=^--- |\Z)",
+                diff,
+            )
+            if creation and re.search(r"(?m)^\+[^+]", creation.group("body")):
+                created_markers.append(rel)
         missing = [
             p for p in paths
             if not (root / p).exists() and p not in created_markers
         ][:2]
         if not missing:
-            return diff
+            return ""
         extra_blocks: list[str] = []
         for rel in missing:
             prompt = (
@@ -1892,14 +2272,18 @@ class TaskPipeline:
                 text = self._ask("code", prompt, ctx)
             except Exception as exc:  # noqa: BLE001 - a missing creation is reported, not fatal
                 self._degraded("focused_create", exc, "generation")
-                continue
+                raise PipelineError(
+                    f"could not generate required file {rel}: {type(exc).__name__}: {exc}"
+                ) from exc
             proposal = extract_diff(text)
-            if proposal and ("/dev/null" in proposal or f"+++ b/{rel}" in proposal):
-                extra_blocks.append(proposal.strip())
-                ctx.state.add_note(f"create: {rel} (focused pass)")
-        if not extra_blocks:
-            return diff
-        return (diff.rstrip() + "\n" + "\n".join(extra_blocks)).strip()
+            headers = set(proposal.splitlines())
+            if f"+++ b/{rel}" not in headers:
+                raise PipelineError(
+                    f"focused creation for {rel} did not return a diff creating that file"
+                )
+            extra_blocks.append(proposal.strip())
+            ctx.state.add_note(f"create: {rel} (focused proposal)")
+        return "\n".join(extra_blocks).strip()
 
     def _file_blocks(self, text: str) -> dict[str, str]:
         """Whole-file blocks from an answer, restricted to files that do not exist.
@@ -2053,15 +2437,14 @@ class TaskPipeline:
         if not diff:
             return {"validation": ValidateResult(accepted=False, reason="no diff to validate")}
 
-        # No validator wired in means there is nothing that can reject a diff.
-        # Reporting that as "rejected" would fail every run in a deployment that
-        # simply has no lint/parse gate, so the verdict is accepted and the
-        # absence is stated in the reason rather than hidden.
+        # A proposed diff is not evidence that it is safe to apply. Keep the
+        # proposal available to the caller, but never report it as accepted
+        # without the configured validator.
         if self.fixloop.validator is None:
             return {"validation": ValidateResult(
-                accepted=True, applied=not bool(ctx.extras.get("dry_run")),
+                accepted=False, applied=False,
                 changed_files=list(getattr(proposal, "changed_files", []) or []),
-                reason="accepted without validation (no validator configured)",
+                reason="cannot validate the proposed diff: no validator is configured",
             )}
 
         # When the fix loop already validated a diff, reuse its verdict instead of
@@ -2071,11 +2454,15 @@ class TaskPipeline:
         if loop_result is not None and loop_result.iterations:
             last = loop_result.iterations[-1]
             if last.validate is not None:
-                return {"validation": last.validate}
-
-        result = self.fixloop.validate_once(
-            diff, task=ctx.state.goal, dry_run=bool(ctx.extras.get("dry_run"))
-        )
+                result = last.validate
+            else:
+                result = self.fixloop.validate_once(
+                    diff, task=ctx.state.goal, dry_run=bool(ctx.extras.get("dry_run"))
+                )
+        else:
+            result = self.fixloop.validate_once(
+                diff, task=ctx.state.goal, dry_run=bool(ctx.extras.get("dry_run"))
+            )
         # The project's own tests are the acceptance criterion, not a hint.  Until
         # now "accepted" meant "the diff parsed, applied and linted", which is how a
         # run reported success while two tests were red.  A red suite now rejects the
@@ -2099,6 +2486,128 @@ class TaskPipeline:
                             error=str(exc)[:200])
         return {"validation": result}
 
+    def _repair_goal_contract(
+        self, ctx: RunContext, validation: Any,
+    ) -> Optional[Mapping[str, Any]]:
+        """Repair deterministic artifact-contract failures before the run settles."""
+        if not validation or not getattr(validation, "accepted", False):
+            return None
+        changed = list(getattr(validation, "changed_files", []) or [])
+        contract = self._check_goal_contract(ctx, changed)
+        if contract is None or contract.ok or self.router is None:
+            return None
+
+        initial_unmet = list(contract.unmet)
+        self._event(
+            "pipeline.contract_repair_started",
+            run_id=ctx.run_id,
+            unmet=contract.unmet[:6],
+        )
+
+        def propose(phase: str, prompt_text: str, iteration: int, hint: str) -> ProposeResult:
+            text = self._ask(phase, prompt_text, ctx)
+            return ProposeResult(text=text, diff=extract_diff(text), phase=phase)
+
+        context = self._file_context(ctx.state.goal)
+        max_rounds = max(1, int(ctx.extras.get("max_fix_iterations") or 2))
+        repaired = None
+        applied = False
+        for repair_round in range(max_rounds):
+            guidance: list[str] = []
+            unmet_text = " ".join(contract.unmet).lower()
+            if "reduced-motion" in unmet_text:
+                guidance.append(
+                    "Use a valid CSS query exactly like "
+                    "`@media (prefers-reduced-motion: reduce) { ... }`."
+                )
+            if "responsive mobile navigation" in unmet_text:
+                guidance.append(
+                    "Add a real mobile menu button with aria-expanded and "
+                    "aria-controls, hide/show the navigation at the mobile "
+                    "breakpoint, and use a click handler to toggle both the "
+                    "menu and aria-expanded."
+                )
+            if "colour 'cyan'" in unmet_text:
+                guidance.append(
+                    "Use cyan in an actual CSS color declaration, such as "
+                    "`rgba(0, 255, 255, 0.18)`; a variable name or comment alone "
+                    "does not count."
+                )
+            if "colour 'magenta'" in unmet_text:
+                guidance.append(
+                    "Use magenta in an actual CSS color declaration, such as "
+                    "`rgba(255, 0, 255, 0.16)`; a variable name or comment alone "
+                    "does not count."
+                )
+            if "working form with validation and a success state" in unmet_text:
+                guidance.append(
+                    "Bind submit handling to the actual <form>, prevent its "
+                    "default navigation, validate the required fields, and show "
+                    "a visible aria-live success message without reloading."
+                )
+            if guidance:
+                guidance.append(
+                    "Edit the existing document in place. Keep CSS inside the "
+                    "existing <style> in <head>; do not append markup or styles "
+                    "after </html>."
+                )
+            feedback = (
+                "The deterministic artifact acceptance contract rejected the current "
+                "files. Repair these specific unmet requirements without replacing "
+                "unrelated content:\n"
+                + "\n".join(f"- {item}" for item in contract.unmet)
+                + (
+                    "\n\nImplementation details:\n"
+                    + "\n".join(f"- {item}" for item in guidance)
+                    if guidance else ""
+                )
+            )
+            if repair_round:
+                feedback += (
+                    "\n\nA previous diff passed syntax/application checks but these "
+                    "requirements remain unmet. Inspect the current file context and "
+                    "make a targeted correction."
+                )
+            repaired = self.fixloop.run(
+                ctx.state.goal,
+                propose_fn=propose,
+                initial_diff="",
+                ctx=ctx,
+                slice_text=context,
+                tests_output=feedback,
+                max_iterations=1,
+                run_id=ctx.run_id,
+                approve=ctx.extras.get("approve"),
+                path_hint=_diff_path_hint(ctx),
+            )
+            if not repaired.accepted:
+                break
+            applied = True
+            contract = self._check_goal_contract(ctx, changed)
+            if contract is None or contract.ok:
+                break
+            context = self._file_context(ctx.state.goal)
+
+        contract_satisfied = contract is not None and contract.ok
+        remaining = list(contract.unmet) if contract is not None else initial_unmet
+        final_diff = self._episode_diff(ctx, changed) if applied else ""
+        self._event(
+            "pipeline.contract_repair_finished",
+            run_id=ctx.run_id,
+            accepted=contract_satisfied,
+            attempts=repair_round + 1,
+            unmet=len(remaining),
+        )
+        return {
+            "fix_report": {
+                "verdict": "contract satisfied" if contract_satisfied else "contract repair incomplete",
+                "initial_unmet": initial_unmet,
+                "contract_unmet": remaining,
+                "repair": repaired.to_dict() if repaired is not None else {},
+            },
+            "fixed_diff": final_diff or (repaired.diff if applied and repaired else ""),
+        }
+
     def _node_fix(self, ctx: RunContext, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
         validation = inputs.get("validation")
         loop_result: Optional[FixLoopResult] = ctx.extras.get("fix_result")
@@ -2117,6 +2626,10 @@ class TaskPipeline:
                 return {"fix_report": {"iterations": 1, "self_debug": self_debug,
                                        "verdict": "repaired via react"},
                         "fixed_diff": react_fix}
+
+        contract_repair = self._repair_goal_contract(ctx, validation)
+        if contract_repair is not None:
+            return contract_repair
 
         if validation is not None and validation.accepted:
             return {"fix_report": {"skipped": "validation already accepted",
@@ -2419,6 +2932,18 @@ class TaskPipeline:
                 "pipeline.contract_rejected", run_id=ctx.run_id,
                 unmet=contract.unmet[:6], files=contract.files[:6],
             )
+        structure_unmet = self._check_html_structure(changed)
+        if structure_unmet:
+            accepted = False
+            ctx.extras["contract_unmet"] = list(
+                ctx.extras.get("contract_unmet") or []
+            ) + structure_unmet
+            self._event(
+                "pipeline.html_structure_rejected",
+                run_id=ctx.run_id,
+                unmet=structure_unmet[:6],
+                files=changed[:6],
+            )
         # A page is a RENDERED artifact.  The contract counts tags; a browser
         # shows what the tags produce, and the two disagreed twice: 1956
         # characters of CSS printed as text in the body, a doubled grid and
@@ -2455,6 +2980,24 @@ class TaskPipeline:
             self._event("pipeline.subagents_partial", run_id=ctx.run_id,
                         accepted=partial.get("accepted"),
                         rejected=len(partial.get("rejected") or []))
+        focused_creation_partial = ctx.extras.get("focused_creation_partial")
+        if focused_creation_partial:
+            accepted = False
+            ctx.extras["contract_unmet"] = list(ctx.extras.get("contract_unmet") or []) + [
+                "focused file creation was partial: "
+                + ", ".join(str(path) for path in focused_creation_partial[:4])
+            ]
+            self._event(
+                "pipeline.focused_creation_partial",
+                run_id=ctx.run_id,
+                missing=list(focused_creation_partial)[:4],
+            )
+        budget_overrun = ctx.extras.get("subagent_budget_overrun")
+        if budget_overrun:
+            accepted = False
+            ctx.extras["contract_unmet"] = list(ctx.extras.get("contract_unmet") or []) + [
+                "sub-agent work exceeded its allocated token budget"
+            ]
         ctx.state.artifacts["final_diff"] = final
         ctx.state.artifacts["accepted"] = accepted
         ctx.state.artifacts["review"] = dict(verdict or {})
@@ -2587,6 +3130,37 @@ class TaskPipeline:
                     unmet=unmet[:4])
         return [f"render: {item}" for item in unmet]
 
+    def _check_html_structure(self, changed: Sequence[str]) -> list[str]:
+        """Return structural HTML defects that deterministic repair could not fix."""
+        pages = [str(path) for path in changed
+                 if Path(str(path)).suffix.lower() in {".html", ".htm"}]
+        if not pages:
+            return []
+        try:
+            from gigaforge.harness.html_structure import audit_html_structure
+        except Exception as exc:  # noqa: BLE001 - a missing optional verifier
+            self._event("pipeline.html_structure_unavailable", error=str(exc)[:200])
+            return []
+
+        root = self._repo_root()
+        unmet: list[str] = []
+        for raw in pages:
+            page = (root / raw).resolve()
+            try:
+                page.relative_to(root)
+            except ValueError:
+                continue
+            if not page.is_file():
+                continue
+            try:
+                report = audit_html_structure(page.read_text(encoding="utf-8", errors="replace"))
+            except OSError as exc:
+                self._event("pipeline.html_structure_error",
+                            file=raw, error=str(exc)[:200])
+                continue
+            unmet.extend(f"HTML structure: {issue}" for issue in report.issues())
+        return unmet
+
     def _check_goal_contract(self, ctx: RunContext, changed: Sequence[str]) -> Any:
         """Check the artifact on disk against the goal's explicit requirements.
 
@@ -2609,7 +3183,10 @@ class TaskPipeline:
             files = [str(p) for p in changed if str(p).strip()]
             if not files:
                 return None
-            # A page goal is graded against the plan the harness itself made.
+            has_html_artifact = any(
+                Path(path).suffix.lower() in {".html", ".htm"} for path in files
+            )
+            # An HTML artifact is graded against the plan the harness itself made.
             # ``extract_requirements`` returns nothing for "Create a single-file
             # index.html", "Build a landing page" and "Make a website for my
             # bakery" — so the gate was absent exactly where it was needed, and
@@ -2617,7 +3194,7 @@ class TaskPipeline:
             # plan always exists for a page goal, so the contract always exists.
             requirements = []
             generation = ctx.extras.get("generation") or {}
-            if generation.get("sections"):
+            if has_html_artifact and generation.get("sections"):
                 try:
                     from gigaforge.harness.generation import (
                         GenerationPlan,
@@ -2651,8 +3228,13 @@ class TaskPipeline:
                 except Exception as exc:  # noqa: BLE001 - fall back to the goal text
                     self._event("pipeline.contract_plan_error", run_id=ctx.run_id,
                                 error=str(exc)[:200])
-            if not requirements:
-                requirements = extract_requirements(ctx.state.goal)
+            explicit_requirements = extract_requirements(_original_goal(ctx.state.goal))
+            known_labels = {requirement.label for requirement in requirements}
+            requirements.extend(
+                requirement
+                for requirement in explicit_requirements
+                if requirement.label not in known_labels
+            )
             if not requirements:
                 return None
             # The repair is NOT done here.  It used to be, after these two early
@@ -2794,7 +3376,38 @@ class TaskPipeline:
         if self.router is None:
             raise PipelineError("no model client is wired into the pipeline")
         messages = ctx.state.messages(extra=[{"role": "user", "content": prompt}])
-        result = self.router.complete(phase, messages, ctx=ctx, temperature=temperature)
+        max_tokens = None
+        budget = int(ctx.extras.get("budget_tokens") or 0)
+        if budget:
+            remaining = budget - ctx.state.total_tokens()
+            prompt_chars = sum(
+                len(str(message.get("content") or "")) + 12
+                for message in messages
+                if isinstance(message, Mapping)
+            )
+            estimated_input = (prompt_chars + 2) // 3
+            output_allowance = remaining - estimated_input
+            if output_allowance <= 0:
+                raise PipelineError(
+                    f"task token budget exhausted before the {phase!r} model call"
+                )
+            router_config = getattr(self.router, "config", None)
+            budget_for = getattr(router_config, "budget_for", None)
+            phase_budget = budget_for(phase) if callable(budget_for) else None
+            configured_output = int(
+                getattr(phase_budget, "max_output_tokens", 0) or 0
+            )
+            max_tokens = min(
+                output_allowance,
+                configured_output if configured_output > 0 else output_allowance,
+            )
+        result = self.router.complete(
+            phase,
+            messages,
+            ctx=ctx,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
         for attr in ("content", "text"):
             value = getattr(result, attr, None)
             if isinstance(value, str):
@@ -3269,6 +3882,21 @@ class _NullSlice:
         return {"symbols": [], "empty": True}
 
 
+def _allocate_subagent_budget(
+    budget_tokens: int, tokens_used: int, child_count: int
+) -> int:
+    """Split a finite remaining task allowance evenly among active children.
+
+    ``0`` preserves the existing convention that no explicit token cap is set.
+    """
+    budget_tokens = max(0, int(budget_tokens))
+    child_count = max(0, int(child_count))
+    if budget_tokens == 0 or child_count == 0:
+        return 0
+    remaining = max(0, budget_tokens - max(0, int(tokens_used)))
+    return remaining // child_count
+
+
 def _scoped_goal(goal: str, owns_paths: Sequence[str], all_paths: Sequence[str]) -> str:
     """The parent goal with every *other* path removed from the text.
 
@@ -3301,6 +3929,20 @@ def _scoped_goal(goal: str, owns_paths: Sequence[str], all_paths: Sequence[str])
         "Do not create, edit or delete any other file: writes outside this set "
         "are refused by the guard and the work will be rejected."
     )
+
+
+def _added_function_definitions(diff_text: str) -> list[tuple[str, str]]:
+    """Extract added top-level function declarations from a unified diff."""
+    path = ""
+    found: list[tuple[str, str]] = []
+    for line in str(diff_text or "").splitlines():
+        if line.startswith("+++ b/"):
+            path = line[6:].replace("\\", "/")
+        elif path and line.startswith("+") and not line.startswith("+++"):
+            match = re.match(r"\+\s*(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(", line)
+            if match:
+                found.append((path, match.group(1)))
+    return found
 
 
 def _workspace_relative_path(raw: str, root: Path) -> str:
@@ -3461,6 +4103,76 @@ def _original_goal(goal: str) -> str:
     marker = "\n\nLONG-LIVED GOAL MODE"
     head, sep, _tail = (goal or "").partition(marker)
     return head.strip() if sep else (goal or "").strip()
+
+
+def _diff_path_hint(ctx: RunContext) -> str:
+    """Return a path only when the harness can identify one unambiguously."""
+    for key in ("harness_owned_paths", "focus_paths"):
+        paths = list(dict.fromkeys(
+            str(path).strip() for path in (ctx.extras.get(key) or ()) if str(path).strip()
+        ))
+        if len(paths) == 1:
+            return paths[0]
+
+    task_kind = ctx.extras.get("task_kind") or {}
+    if isinstance(task_kind, Mapping):
+        paths = [
+            str(path).strip()
+            for key in ("artifact_paths", "edit_paths", "code_paths")
+            for path in (task_kind.get(key) or ())
+            if str(path).strip()
+        ]
+        paths = list(dict.fromkeys(paths))
+        if len(paths) == 1:
+            return paths[0]
+    return ""
+
+
+def _merge_focused_creation(
+    result: FixLoopResult,
+    diff: str,
+    validation: ValidateResult,
+    requested_paths: Sequence[str],
+) -> dict[str, Any]:
+    previous_accepted = result.accepted
+    previous_diff = result.diff
+    previous_files = list(result.changed_files)
+    created_files = list(validation.changed_files)
+    all_files = list(dict.fromkeys([*previous_files, *created_files]))
+    requested = set(requested_paths)
+
+    if validation.accepted:
+        missing = sorted(requested.difference(all_files))
+        result.diff = "\n".join(
+            item for item in (previous_diff if previous_accepted else "", diff) if item
+        )
+        result.changed_files = all_files
+        result.accepted = (previous_accepted or bool(created_files)) and not missing
+        result.reason = "focused creation accepted" if result.accepted else "focused creation was partial"
+        result.iterations.append(FixIteration(
+            index=result.proposals + 1,
+            kind="repair",
+            diff=diff,
+            accepted=True,
+            reason=validation.reason or "accepted",
+            validate=validation,
+        ))
+        return {"accepted": result.accepted, "files": created_files, "missing": missing}
+
+    if not previous_accepted:
+        result.diff = diff
+        result.iterations.append(FixIteration(
+            index=result.proposals + 1,
+            kind="repair",
+            diff=diff,
+            accepted=False,
+            reason=validation.reason or "rejected",
+            validate=validation,
+        ))
+    result.accepted = False
+    result.reason = validation.reason or "focused creation was rejected"
+    missing = sorted(requested.difference(all_files)) or ["focused file creation was rejected"]
+    return {"accepted": False, "files": created_files, "missing": missing}
 
 
 def _fallback_summary(accepted: bool, diff: str) -> str:

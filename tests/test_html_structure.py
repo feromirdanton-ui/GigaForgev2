@@ -15,6 +15,7 @@ import pytest
 from gigaforge.harness.html_structure import (
     audit_html_structure,
     duplicate_blocks,
+    duplicate_landmarks,
     leaked_css_text,
     looks_like_css,
     repair_html_structure,
@@ -149,6 +150,34 @@ class TestAudit:
         report = audit_html_structure(CLEAN_PAGE)
         assert report.ok, report.issues()
 
+    def test_semantic_element_with_matching_class_is_one_landmark(self) -> None:
+        page = "<html><body><footer class=\"footer\">Done</footer></body></html>"
+        assert duplicate_landmarks(page) == []
+
+    def test_style_after_html_root_is_reported_as_stray(self) -> None:
+        page = CLEAN_PAGE + (
+            "\n<style>@media (max-width: 600px) { "
+            "nav ul { flex-direction: column; } }</style>"
+        )
+        report = audit_html_structure(page)
+        assert not report.ok
+        assert report.stray_style_tags == 2
+
+    def test_duplicate_ids_and_nested_heads_are_reported(self) -> None:
+        page = (
+            "<html><head><head><title>Club</title></head></head><body>"
+            '<section id="models"></section><section id="models"></section>'
+            '<p>text mentioning id="models" is not an attribute.</p>'
+            '<script>const text = \'<div id="models"></div>\';</script>'
+            "</body></html>"
+        )
+
+        report = audit_html_structure(page)
+
+        assert report.duplicate_ids == [("models", 2)]
+        assert report.duplicate_heads == 1
+        assert any("id 'models' appears 2 times" in issue for issue in report.issues())
+
 
 class TestRepair:
     def test_repair_makes_the_broken_page_clean(self) -> None:
@@ -200,6 +229,24 @@ class TestRepair:
         assert "moved leaked stylesheet rules" in " ".join(actions)
         assert audit_html_structure(repaired).ok
 
+    def test_trailing_stylesheet_is_moved_into_head(self) -> None:
+        page = CLEAN_PAGE + (
+            "\n<!-- mobile adjustment -->\n"
+            "<style>\n@media (max-width: 600px) {\n"
+            "  nav ul { flex-direction: column; }\n}\n"
+        )
+
+        repaired, actions = repair_html_structure(page)
+
+        assert "moved trailing stylesheet rules into <head>" in actions
+        assert repaired.count("<style") == 1
+        assert repaired.index("@media (max-width: 600px)") < repaired.index("</head>")
+        assert repaired.endswith("</html>\n<!-- mobile adjustment -->")
+        assert audit_html_structure(repaired).ok
+        twice, second_actions = repair_html_structure(repaired)
+        assert twice == repaired
+        assert second_actions == []
+
 
 class TestVerifierIntegration:
     """The verifier must fail the page the harness used to accept."""
@@ -233,6 +280,21 @@ class TestVerifierIntegration:
         report = verifier.verify(tmp_path, ["index.html"], "make a landing page")
         html_checks = [c for c in report.checks if c.name.startswith("HTML structure")]
         assert html_checks and html_checks[0].status == "passed", html_checks[0].summary
+
+    def test_verifier_rejects_internal_links_without_targets(self, tmp_path: Path) -> None:
+        from gigaforge.core.goal import WorkspaceVerifier
+
+        page = CLEAN_PAGE.replace(
+            "<header class=\"hero\">",
+            "<nav><a href=\"#missing\">Missing section</a></nav>"
+            "<header class=\"hero\">",
+        )
+        (tmp_path / "index.html").write_text(page, encoding="utf-8")
+        verifier = WorkspaceVerifier(require_browser=False)
+        report = verifier.verify(tmp_path, ["index.html"], "make a landing page")
+        html_checks = [c for c in report.checks if c.name.startswith("HTML structure")]
+        assert html_checks and html_checks[0].status == "failed"
+        assert "internal links target missing ids: #missing" in html_checks[0].summary
 
 
 class TestMutation:

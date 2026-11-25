@@ -25,7 +25,10 @@ Offline and deterministic: no GigaChat key, no network.
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -60,7 +63,15 @@ class _ScriptedProvider:
             self.react_calls += 1
             body = self.react_script[index]
         elif is_react:
-            body = {"thought": "done", "action": "finish", "action_input": []}
+            self.react_calls += 1
+            body = {
+                "thought": "Use the known target and verify the edit.",
+                "action": "finish",
+                "action_input": [
+                    {"tool": "edit_function", "args": {"name": "add"}},
+                    {"tool": "run_tests", "args": {}},
+                ],
+            }
         else:
             body = self.diff
         content = body if isinstance(body, str) else json.dumps(body)
@@ -179,13 +190,13 @@ def test_the_harness_dispatches_through_run_react(tmp_path: Path) -> None:
     try:
         harness = Harness(policy=HarnessPolicy(sleep=lambda _s: None))
         outcome = harness.run(
-            _Runner(), "goal", _Runner().state, run_id="r", engine="classic", react=True
+            _Runner(), "goal", _Runner().state, run_id="r", engine="", react=True
         )
     finally:
         engine.run_react = original  # type: ignore[assignment]
 
-    assert seen == ["run_react:classic"]
-    assert outcome.ledger.engine == "classic"
+    assert seen == ["run_react:langgraph"]
+    assert outcome.ledger.engine == "langgraph"
 
 
 def test_the_harness_still_calls_a_plain_runner_directly(tmp_path: Path) -> None:
@@ -208,7 +219,7 @@ def test_the_harness_still_calls_a_plain_runner_directly(tmp_path: Path) -> None
 
 
 # ── N3: the trajectory survives the finish branch ───────────────────────────
-@pytest.mark.parametrize("engine", ["classic", "langgraph"])
+@pytest.mark.parametrize("engine", ["langgraph"])
 def test_a_finish_with_an_unusable_plan_still_salvages(
     tmp_path: Path, engine: str, monkeypatch: Any
 ) -> None:
@@ -218,11 +229,8 @@ def test_a_finish_with_an_unusable_plan_still_salvages(
     the observations into read steps — and it can only do that if the trajectory
     was carried out of the episode, which it was not on this branch.
 
-    Parametrised over **both** engines on purpose.  The first version of this
-    test ran only the default engine (``langgraph``), so mutating the classic
-    loop's return path did not fail it — the test was green for a reason that
-    had nothing to do with the code it claimed to cover.  N3 was a defect in
-    ``react.py``; a test that never executes ``react.py`` cannot catch it.
+    The product now has one supported engine; this test must drive that graph
+    rather than an obsolete classic-loop branch.
     """
     from gigaforge.agents.engine import run_react
 
@@ -335,3 +343,96 @@ def test_an_unparseable_compact_at_keeps_the_default(monkeypatch: Any) -> None:
 
     monkeypatch.setenv("GIGAFORGE_COMPACT_AT", "not-a-number")
     assert ContextWindowGuard().trigger_fraction == 0.85
+
+
+@pytest.mark.parametrize("use_subagents", [False, True])
+def test_mixed_goal_keeps_code_and_artifact_work_together(
+    tmp_path: Path, use_subagents: bool
+) -> None:
+    """A mixed task must not be diverted into the artifact-only generator."""
+    _repo(tmp_path)
+    diff = (
+        "```diff\n"
+        "--- a/math_utils.py\n"
+        "+++ b/math_utils.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def add(a: int, b: int) -> int:\n"
+        "-    return a - b\n"
+        "+    return a + b\n"
+        "--- /dev/null\n"
+        "+++ b/report.html\n"
+        "@@ -0,0 +1,6 @@\n"
+        "+<!doctype html>\n"
+        "+<html>\n"
+        "+<head><title>Report</title></head>\n"
+        "+<body><main><h1>Report</h1></main></body>\n"
+        "+</html>\n"
+        "```\n"
+    )
+    pipeline = _pipeline(tmp_path, _ScriptedProvider(diff=diff))
+
+    result = pipeline.run(
+        "Fix math_utils.py and add report.html",
+        use_subagents=use_subagents,
+        use_cache=False,
+    )
+
+    # This helper intentionally has no validator, so the proposed deliverable
+    # must remain inspectable without being reported as accepted.
+    assert "math_utils.py" in result.final_diff
+    assert "report.html" in result.final_diff
+    assert "return a + b" in result.final_diff
+    assert "<h1>Report</h1>" in result.final_diff
+    assert not result.accepted
+
+
+def test_code_contract_uses_git_baseline_for_removed_public_symbols(
+    tmp_path: Path,
+) -> None:
+    if shutil.which("git") is None:
+        pytest.skip("git is required to verify the code-contract baseline")
+
+    source = tmp_path / "math_utils.py"
+    source.write_text(
+        "def add(a: int, b: int) -> int:\n"
+        "    return a + b\n\n"
+        "def subtract(a: int, b: int) -> int:\n"
+        "    return a - b\n",
+        encoding="utf-8",
+    )
+    for command in (
+        ["git", "init", "--quiet"],
+        ["git", "config", "user.name", "GigaForge test"],
+        ["git", "config", "user.email", "test@example.invalid"],
+        ["git", "add", "math_utils.py"],
+        ["git", "commit", "--quiet", "-m", "Add public helpers"],
+    ):
+        subprocess.run(command, cwd=tmp_path, check=True, capture_output=True, text=True)
+
+    source.write_text(
+        "def add(a: int, b: int) -> int:\n"
+        "    return a + b\n",
+        encoding="utf-8",
+    )
+    pipeline = _pipeline(tmp_path, _ScriptedProvider(diff=""))
+    context = SimpleNamespace(
+        run_id="test-code-contract",
+        extras={
+            "task_kind": {
+                "kind": "code",
+                "code_paths": ["math_utils.py"],
+            }
+        }
+    )
+
+    unmet = pipeline._check_code_contract(context, ["math_utils.py"])
+
+    assert any("math_utils.py:subtract" in item for item in unmet)
+
+
+def test_subagent_budget_divides_only_the_remaining_task_allowance() -> None:
+    from gigaforge.core.pipeline import _allocate_subagent_budget
+
+    assert _allocate_subagent_budget(1000, 200, 2) == 400
+    assert _allocate_subagent_budget(1000, 999, 2) == 0
+    assert _allocate_subagent_budget(0, 500, 2) == 0

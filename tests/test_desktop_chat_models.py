@@ -61,6 +61,86 @@ def test_model_catalog_reports_api_error_when_using_cache(tmp_path: Path) -> Non
     assert "provider unavailable" in catalog.error
 
 
+def test_model_catalog_reapplies_configured_preferences_to_cached_models(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "models.json"
+    models = [
+        {"id": "GigaChat"},
+        {"id": "GigaChat-2"},
+        {"id": "GigaChat-2-Pro"},
+        {"id": "GigaChat-2-Max"},
+        {"id": "GigaChat-Plus"},
+    ]
+    fetch_models(ModelClient(models), path=path, force=True)
+
+    catalog = fetch_models(
+        ModelClient(error=RuntimeError("should use fresh cache")),
+        path=path,
+        configured_strong="GigaChat-2-Pro",
+        configured_default="GigaChat-2",
+    )
+
+    assert catalog.source == "cache"
+    assert catalog.roles.strong == "GigaChat-2-Pro"
+    assert catalog.roles.default == "GigaChat-2"
+
+
+def test_runtime_prefers_configured_available_model(tmp_path: Path, monkeypatch) -> None:
+    from dataclasses import replace
+
+    from gigaforge.config import get_settings
+    from gigaforge.core.config import CoreConfig
+    from gigaforge.runtime import build_runtime
+
+    for key in (
+        "GF_CORE__CHEAP_MODEL",
+        "GF_CORE__STRONG_MODEL",
+        "GF_CORE__DEFAULT_MODEL",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    class FakeClient(ModelClient):
+        def aclose(self) -> None:
+            pass
+
+    client = FakeClient([
+        {"id": "GigaChat"},
+        {"id": "GigaChat-2"},
+        {"id": "GigaChat-2-Pro"},
+        {"id": "GigaChat-2-Max"},
+        {"id": "GigaChat-Plus"},
+    ])
+    monkeypatch.setattr(
+        "gigaforge.runtime.build_client",
+        lambda settings, metrics=None: (client, None, None, object()),
+    )
+    settings = replace(
+        get_settings(),
+        auth_key="synthetic-test-credential",
+        models={
+            "plan": "GigaChat-3-Lightning",
+            "code": "GigaChat-2-Pro",
+            "explain": "GigaChat-2",
+        },
+    )
+    runtime = build_runtime(
+        settings=settings,
+        core_config=CoreConfig.from_env({}),
+        require_provider=True,
+        repo_root=tmp_path,
+        probe_models=True,
+        isolate_storage=True,
+        telemetry_root=tmp_path,
+    )
+    try:
+        assert runtime.catalog.roles.strong == "GigaChat-2-Pro"
+        assert runtime.core_config.route_for("code").model == "GigaChat-2-Pro"
+        assert runtime.core_config.default_model == "GigaChat-2"
+    finally:
+        runtime.aclose()
+
+
 def test_goal_command_is_consumed_only_at_the_start_of_composer_text() -> None:
     assert _consume_goal_command("/goal") == ""
     assert _consume_goal_command("/GOAL  Verify the saved result") == "Verify the saved result"

@@ -39,6 +39,12 @@ from gigaforge.core.context_window_guard import ContextWindowGuard
 
 
 class _Budgets:
+    def remaining(self, phase):
+        return 10**9
+
+    def task_remaining_for(self, task_id):
+        return 10**9
+
     def check(self, *a, **k):
         return None
 

@@ -63,5 +63,8 @@ class NullBudgets:
     def remaining(self, phase: str) -> int:
         return 10**9
 
+    def task_remaining_for(self, task_id: str) -> int:
+        return 10**9
+
     def task_total(self) -> int:
         return 0

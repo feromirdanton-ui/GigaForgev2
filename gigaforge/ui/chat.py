@@ -100,9 +100,19 @@ class ChatSession:
         self.directory = Path(directory)
         self.path = self.directory / f"{self.session_id}.jsonl"
         self.events: list[ChatEvent] = self._load()
+        self._persisted = self.path.is_file()
 
     def _load(self) -> list[ChatEvent]:
         return [ChatEvent.from_dict(row) for row in read_jsonl(self.path)]
+
+    def reload(self) -> None:
+        """Refresh from disk so mode-specific engines share one transcript."""
+        if self.path.is_file():
+            self.events = self._load()
+            self._persisted = True
+        elif self._persisted:
+            self.events = []
+            self._persisted = False
 
     def append(self, event: ChatEvent) -> ChatEvent:
         self.events.append(event)
@@ -110,6 +120,7 @@ class ChatSession:
             self.directory.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(event.to_dict(), ensure_ascii=False) + "\n")
+            self._persisted = True
         except OSError:  # pragma: no cover - read-only filesystem
             pass
         return event
@@ -128,6 +139,7 @@ class ChatSession:
 
     def clear(self) -> None:
         self.events = []
+        self._persisted = False
         try:
             self.path.unlink(missing_ok=True)
         except OSError:  # pragma: no cover
@@ -139,6 +151,42 @@ class ChatSession:
             prefix = {"say": "", "step": "  ", "tool": "» ", "error": "✗ ", "command": "$ "}.get(event.kind, "")
             lines.append(f"{prefix}{event.text}")
         return "\n".join(lines)
+
+    def context_for_task(self, current_text: str, *, max_chars: int = 8000) -> str:
+        """Return a bounded transcript of user/assistant turns before this task."""
+        turns: list[tuple[str, str]] = []
+        for event in self.events:
+            text = event.text.strip()
+            if not text:
+                continue
+            if (event.kind == "command" and event.data.get("role") == "user"
+                    and not text.startswith("/")):
+                turns.append(("User", text))
+            elif event.kind in {"say", "assistant", "text"}:
+                turns.append(("Assistant", text))
+
+        if turns and turns[-1] == ("User", (current_text or "").strip()):
+            turns.pop()
+        if not turns:
+            return ""
+
+        selected: list[str] = []
+        header = "Relevant earlier conversation (the current task takes priority):\n"
+        remaining = max(0, int(max_chars) - len(header))
+        for role, text in reversed(turns[-12:]):
+            line = f"{role}: {text}"
+            if len(line) > remaining:
+                if not selected and remaining > len(role) + 2:
+                    line = f"{role}: {text[-(remaining - len(role) - 2):]}"
+                else:
+                    break
+            selected.append(line)
+            remaining -= len(line) + 1
+            if remaining <= 0:
+                break
+        if not selected:
+            return ""
+        return header + "\n".join(reversed(selected))
 
     def __len__(self) -> int:
         return len(self.events)
@@ -221,6 +269,19 @@ class DirectChatBackend(AgentBackend):
 
     def reset(self) -> None:
         self.history.clear()
+
+    def restore_history(self, events: Sequence[ChatEvent]) -> None:
+        history: list[dict[str, str]] = []
+        for event in events:
+            text = event.text.strip()
+            if not text:
+                continue
+            if (event.kind == "command" and event.data.get("role") == "user"
+                    and not text.startswith("/")):
+                history.append({"role": "user", "content": text})
+            elif event.kind in {"say", "assistant", "text"}:
+                history.append({"role": "assistant", "content": text})
+        self.history = history[-self.window:]
 
     def stream(self, goal: str, session: ChatSession) -> Iterator[ChatEvent]:
         text = (goal or "").strip()
@@ -354,6 +415,7 @@ class PipelineBackend(AgentBackend):
         def worker() -> None:
             try:
                 kwargs = dict(self.run_kwargs)
+                conversation_context = session.context_for_task(goal)
                 # Human-in-the-loop: the gate is handed to the pipeline so it is
                 # consulted *before* the diff touches the worktree, with the exact
                 # diff the user is approving.
@@ -363,13 +425,20 @@ class PipelineBackend(AgentBackend):
                     goal_kwargs = {
                         key: value for key, value in kwargs.items()
                         if key in {"goal_id", "resume", "max_cycles", "max_fix_iterations",
-                                   "use_subagents", "files", "symbols", "budget_tokens", "approve"}
+                                   "use_subagents", "files", "symbols", "budget_tokens", "approve",
+                                   "conversation_context", "additional_context", "goal_override"}
                     }
+                    goal_for_runner = (
+                        str(goal_kwargs.pop("goal_override"))
+                        if "goal_override" in goal_kwargs else goal
+                    )
+                    if conversation_context and not goal_kwargs.get("resume"):
+                        goal_kwargs["conversation_context"] = conversation_context
                     goal_kwargs.setdefault("max_cycles", 8)
                     goal_kwargs.setdefault("max_fix_iterations", 2)
                     goal_kwargs.setdefault("approve", self.approve)
                     if self.goal_runner_factory is not None:
-                        box["result"] = self.goal_runner_factory(goal, **goal_kwargs)
+                        box["result"] = self.goal_runner_factory(goal_for_runner, **goal_kwargs)
                     else:
                         from pathlib import Path
 
@@ -379,8 +448,10 @@ class PipelineBackend(AgentBackend):
                         repo_root = Path(str(getattr(config, "repo_root", ".") or "."))
                         box["result"] = GoalRunner(
                             pipeline, repo_root=repo_root
-                        ).run(goal, **goal_kwargs)
+                        ).run(goal_for_runner, **goal_kwargs)
                 elif callable(getattr(pipeline, "run", None)):
+                    if conversation_context:
+                        kwargs["conversation_context"] = conversation_context
                     box["result"] = pipeline.run(goal, **kwargs)
                 elif callable(pipeline):
                     box["result"] = pipeline(goal, **kwargs)
@@ -635,12 +706,20 @@ class LangGraphBackend(AgentBackend):
         def worker() -> None:
             try:
                 kwargs = dict(self.run_kwargs)
+                goal_for_runner = (
+                    str(kwargs.pop("goal_override"))
+                    if "goal_override" in kwargs else goal
+                )
                 kwargs.setdefault("max_cycles", 8)
                 kwargs.setdefault("max_fix_iterations", 2)
+                if not kwargs.get("resume"):
+                    conversation_context = session.context_for_task(goal)
+                    if conversation_context:
+                        kwargs["conversation_context"] = conversation_context
                 if self.approve is not None:
                     kwargs.setdefault("approve", self.approve)
                 kwargs["emit"] = emit
-                box["result"] = self.goal_runner_factory(goal, **kwargs)
+                box["result"] = self.goal_runner_factory(goal_for_runner, **kwargs)
             except Exception as exc:  # noqa: BLE001 - surfaced to the user
                 box["error"] = f"{type(exc).__name__}: {exc}"
 
@@ -702,7 +781,7 @@ class ChatEngine:
     ) -> None:
         self.store = store
         self.backend = backend or PipelineBackend(store)
-        self.session = session or ChatSession()
+        self.session = session if session is not None else ChatSession()
         self.prices = prices
         self.default_model = default_model
 
@@ -715,6 +794,10 @@ class ChatEngine:
         text = (line or "").strip()
         if not text:
             return
+        self.session.reload()
+        restore_history = getattr(self.backend, "restore_history", None)
+        if callable(restore_history):
+            restore_history(self.session.events)
         if text.startswith("/"):
             yield from self._command(text)
             return
@@ -968,15 +1051,6 @@ def build_chat_handler(engine: ChatEngine) -> Callable[[str], str]:
     return handler
 
 
-def _langgraph_available() -> bool:
-    """True when the LangGraph goal engine can be used for chat."""
-    try:
-        from gigaforge.core.langgraph_runtime import langgraph_available
-
-        return langgraph_available()
-    except Exception:  # noqa: BLE001 - optional dependency
-        return False
-
 
 def default_engine(
     store: UiStore,
@@ -1010,8 +1084,10 @@ def default_engine(
             ]
         )
     else:
-        use_graph = goal_mode and _langgraph_available()
-        if use_graph:
+        if goal_mode:
+            from gigaforge.core.langgraph_runtime import require_langgraph
+
+            require_langgraph()
             backend = LangGraphBackend(
                 store,
                 goal_runner_factory=goal_runner_factory,

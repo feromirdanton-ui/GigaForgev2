@@ -22,6 +22,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -154,6 +155,69 @@ class TestSectionsAreParallel:
 
 
 class TestSubagentsFlagIsNotSilent:
+    def test_subagents_do_not_merge_over_code_written_by_react(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "temperature.py").write_text("value = 1\n", encoding="utf-8")
+        (tmp_path / "distance.py").write_text("value = 2\n", encoding="utf-8")
+        pipeline = TaskPipeline.__new__(TaskPipeline)
+        pipeline.config = SimpleNamespace(
+            repo_root=str(tmp_path),
+            subagents=SimpleNamespace(use_worktrees=True),
+        )
+        events: list[tuple[str, dict]] = []
+        pipeline._event = lambda name, **payload: events.append((name, payload))
+        ctx = SimpleNamespace(
+            run_id="code-run",
+            state=SimpleNamespace(
+                goal="Update temperature.py and distance.py conversion helpers"
+            ),
+            extras={"use_subagents": True},
+        )
+
+        diff = pipeline._subagent_diff(
+            ctx, episode_diff="diff --git a/temperature.py b/temperature.py"
+        )
+
+        assert diff == ""
+        assert any(
+            name == "pipeline.subagents_skipped"
+            and payload["reason"]
+            == "ReAct already wrote code; avoiding overlapping worktrees"
+            for name, payload in events
+        )
+
+    def test_subagents_preserve_an_artifact_already_written_by_react(
+        self, tmp_path: Path,
+    ) -> None:
+        pipeline = TaskPipeline.__new__(TaskPipeline)
+        pipeline.config = SimpleNamespace(
+            repo_root=str(tmp_path),
+            subagents=SimpleNamespace(use_worktrees=True),
+        )
+        events: list[tuple[str, dict]] = []
+        pipeline._event = lambda name, **payload: events.append((name, payload))
+        pipeline._sectional_generation = lambda _ctx: pytest.fail(
+            "sectional generation must not overwrite ReAct's artifact"
+        )
+        ctx = SimpleNamespace(
+            run_id="artifact-run",
+            state=SimpleNamespace(goal="Create a website in index.html"),
+            extras={"use_subagents": True},
+        )
+
+        diff = pipeline._subagent_diff(
+            ctx, episode_diff="diff --git a/index.html b/index.html"
+        )
+
+        assert diff == ""
+        assert any(
+            name == "pipeline.subagents_skipped"
+            and payload["reason"]
+            == "ReAct already wrote the artifact; preserving its content"
+            for name, payload in events
+        )
+
     def test_the_artifact_branch_emits_an_event(self) -> None:
         source = inspect.getsource(TaskPipeline._subagent_diff)
         assert "subagents_sections" in source, (

@@ -31,6 +31,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Annotated, Any, TypedDict
 
 from gigaforge.agents.react import _REACT_PHASE
+from gigaforge.client.errors import BudgetExceeded
 from gigaforge.core.context_window_guard import ContextOverflowError, ContextWindowGuard
 from gigaforge.core.loop_breaker import LoopBreaker
 from gigaforge.core.sync_adapter import await_blocking
@@ -39,7 +40,15 @@ from gigaforge.firewall import compress
 from gigaforge.firewall.tokens import estimate_tokens
 from gigaforge.providers.messages import nudge
 
-from .react import FINISH_ACTION, ReActContext, ReActResult, ReActRunner, _kind_for_tool
+from .react import (
+    FINISH_ACTION,
+    ReActContext,
+    ReActResult,
+    ReActRunner,
+    _kind_for_tool,
+    _remember_file_read,
+    read_only_tool_error,
+)
 
 __all__ = ["ReActState", "build_react_graph", "run_react_graph"]
 
@@ -91,6 +100,19 @@ def _merge_steps(left: list, right: list) -> list:
         else:
             merged.append(entry)
     return merged
+
+
+def _written_path(action: str, action_input: str, raw: str) -> str:
+    """Return a path only when a file-mutation tool actually succeeded."""
+    if action not in {"write_file", "edit_file", "create_file"}:
+        return ""
+    if str(raw).lstrip().startswith("ERROR:"):
+        return ""
+    try:
+        payload = json.loads(action_input) if action_input.strip() else {}
+    except (json.JSONDecodeError, AttributeError):
+        return ""
+    return str(payload.get("path") or payload.get("file") or "").strip()
 
 
 class ReActState(TypedDict, total=False):
@@ -274,10 +296,63 @@ def build_react_graph(
                 "trajectory": seed,
             }
 
-        est_in = sum(len(m.get("content") or "") for m in trajectory) // 4
-        est_out = max(int(settings.budget_plan_out) // 3, 200)
-        claim = runner.budgets.reserve(_REACT_PHASE, est_in, est_out,
-                                       task_id=task_state.task_id)
+        est_in = (sum(len(m.get("content") or "") for m in trajectory) + 2) // 3
+        task_remaining = runner.budgets.task_remaining_for(task_state.task_id)
+        phase_remaining = runner.budgets.remaining(_REACT_PHASE)
+        max_tokens = min(
+            runner._react_out(),
+            max(0, task_remaining - est_in),
+            phase_remaining,
+        )
+        if max_tokens <= 0:
+            _emit("react.budget_exhausted", step_idx=step_idx,
+                  task_tokens_remaining=task_remaining, estimated_input_tokens=est_in)
+            return {
+                "finished": True,
+                "finish_reason": "budget_exceeded",
+                "trajectory": trajectory,
+            }
+        try:
+            claim = runner.budgets.reserve(
+                _REACT_PHASE, est_in, max_tokens, task_id=task_state.task_id
+            )
+        except BudgetExceeded:
+            # Another concurrent stage may spend tokens after the check above.
+            # Refresh once and reserve only what is still available; if the
+            # reservation still fails, stop this episode instead of falling
+            # back to an unbounded linear plan.
+            task_remaining = runner.budgets.task_remaining_for(task_state.task_id)
+            phase_remaining = runner.budgets.remaining(_REACT_PHASE)
+            adjusted_tokens = min(
+                runner._react_out(),
+                max(0, task_remaining - est_in),
+                phase_remaining,
+            )
+            if adjusted_tokens <= 0 or adjusted_tokens >= max_tokens:
+                _emit("react.budget_exhausted", step_idx=step_idx,
+                      task_tokens_remaining=task_remaining,
+                      estimated_input_tokens=est_in)
+                return {
+                    "finished": True,
+                    "finish_reason": "budget_exceeded",
+                    "trajectory": trajectory,
+                }
+            max_tokens = adjusted_tokens
+            try:
+                claim = runner.budgets.reserve(
+                    _REACT_PHASE, est_in, max_tokens, task_id=task_state.task_id
+                )
+            except BudgetExceeded:
+                _emit("react.budget_exhausted", step_idx=step_idx,
+                      task_tokens_remaining=runner.budgets.task_remaining_for(
+                          task_state.task_id
+                      ),
+                      estimated_input_tokens=est_in)
+                return {
+                    "finished": True,
+                    "finish_reason": "budget_exceeded",
+                    "trajectory": trajectory,
+                }
 
         started = time.monotonic()
         try:
@@ -285,7 +360,7 @@ def build_react_graph(
                 runner.router.route(_REACT_PHASE),
                 trajectory,
                 temperature=0.1,
-                max_tokens=int(settings.budget_plan_out),
+                max_tokens=max_tokens,
                 task_id=task_state.task_id,
                 phase=_REACT_PHASE,
             )
@@ -366,6 +441,25 @@ def build_react_graph(
                     "content": f"Инструмент {action!r} неизвестен. Доступны: {available}.",
                 }],
             }
+        policy_error = read_only_tool_error(action, ctx)
+        if policy_error is not None:
+            kind = _kind_for_tool(action)
+            observation = compress(
+                kind, policy_error, limit_tokens=_OBS_TOKEN_BUDGET
+            ).text
+            _emit("react.read_only_tool_blocked", action=action)
+            return {
+                "observation": observation,
+                "steps": [{
+                    "step_idx": int(gstate.get("step_idx") or 1) - 1,
+                    "observation": observation,
+                    "blocked": True,
+                    "ok": False,
+                }],
+                "trajectory": [
+                    {"role": "user", "content": f"Observation ({kind}):\n{observation}"}
+                ],
+            }
         # ShellSafety: screen the call before it reaches the sandbox.
         blocked = guards.screen_tool_call(action, action_input)
         if blocked is not None:
@@ -390,6 +484,8 @@ def build_react_graph(
         observation = compressed.text
         if estimate_tokens(observation) > _OBS_TOKEN_BUDGET:
             observation = observation[: _OBS_TOKEN_BUDGET * 4] + "\n[truncated]"
+        if action == "read_file":
+            _remember_file_read(ctx, action_input, raw, observation)
         _emit("react.observation", action=action, kind=kind, chars=len(observation))
         delta: list[dict[str, str]] = [
             {"role": "user", "content": f"Observation ({kind}):\n{observation}"}
@@ -398,15 +494,7 @@ def build_react_graph(
         # artifact the run produced; without this list it would have to fall
         # back to every text file in the worktree, and a run that wrote nothing
         # would pass on a file that was already in the repository.
-        written: list[str] = []
-        if action in {"write_file", "create_file"}:
-            try:
-                payload = json.loads(action_input) if action_input.strip() else {}
-            except (json.JSONDecodeError, AttributeError):
-                payload = {}
-            rel = str(payload.get("path") or payload.get("file") or "").strip()
-            if rel:
-                written.append(rel)
+        written = _written_path(action, action_input, str(raw))
         # SpecificationAudit: nudge once after the model inspects a new file.
         audit = guards.after_observation(
             list(gstate.get("trajectory") or []) + delta
@@ -420,7 +508,7 @@ def build_react_graph(
             "trajectory": delta,
         }
         if written:
-            out["written_files"] = written
+            out["written_files"] = [written]
         return out
 
     def observe(gstate: ReActState) -> dict[str, Any]:

@@ -14,10 +14,9 @@ This module holds the parts both levels need to agree on: whether LangGraph is
 installed at all, how a checkpointer is opened, how a graph chunk becomes a
 GigaForge event, and how a thread is addressed.
 
-**Graceful degradation.**  ``langgraph`` is an optional dependency.  Importing
-this module never fails: when the package is missing,
-:data:`LANGGRAPH_AVAILABLE` is ``False`` and the classic ``GoalRunner`` /
-``ReActRunner`` paths keep working on a bare install.
+LangGraph is a required runtime dependency. Import failures are retained only
+so the startup check can provide an actionable installation error; product
+entry points must call :func:`require_langgraph` and may not select legacy loops.
 """
 from __future__ import annotations
 
@@ -29,6 +28,7 @@ __all__ = [
     "LANGGRAPH_AVAILABLE",
     "LANGGRAPH_IMPORT_ERROR",
     "langgraph_available",
+    "require_langgraph",
     "open_checkpointer",
     "open_checkpointer_async",
     "thread_config",
@@ -57,6 +57,16 @@ def langgraph_available() -> bool:
     return LANGGRAPH_AVAILABLE
 
 
+def require_langgraph() -> None:
+    """Fail loudly when a product entry point bypasses dependency setup."""
+    if not LANGGRAPH_AVAILABLE:
+        raise RuntimeError(
+            "LangGraph is required for the GigaForge agent runtime. "
+            "Install the project dependencies with `python -m pip install -e .` "
+            f"and restart. Import error: {LANGGRAPH_IMPORT_ERROR}"
+        )
+
+
 def open_checkpointer(
     path: Optional[str | Path] = None,
 ) -> Tuple[Any, Optional[sqlite3.Connection]]:
@@ -78,11 +88,7 @@ def open_checkpointer(
     Returns ``(saver, connection)``; the caller must keep the connection alive
     for as long as the saver is used and close it afterwards.
     """
-    if not LANGGRAPH_AVAILABLE:  # pragma: no cover - guarded by callers
-        raise RuntimeError(
-            "langgraph is not installed: pip install 'gigaforge[langgraph]' "
-            f"({LANGGRAPH_IMPORT_ERROR})"
-        )
+    require_langgraph()
     if path is None:
         return InMemorySaver(), None
     target = Path(path)
@@ -101,11 +107,7 @@ async def open_checkpointer_async(
     Returns ``(saver, connection)`` where the connection is an ``aiosqlite``
     connection; close it with ``await conn.close()``.
     """
-    if not LANGGRAPH_AVAILABLE:  # pragma: no cover - guarded by callers
-        raise RuntimeError(
-            "langgraph is not installed: pip install 'gigaforge[langgraph]' "
-            f"({LANGGRAPH_IMPORT_ERROR})"
-        )
+    require_langgraph()
     if path is None:
         return InMemorySaver(), None
     try:

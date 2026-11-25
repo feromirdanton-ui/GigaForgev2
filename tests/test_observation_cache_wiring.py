@@ -66,6 +66,12 @@ def test_the_runner_passes_the_context_root_to_the_cache(tmp_path: Path) -> None
                               usage={"prompt_tokens": 1, "completion_tokens": 1})
 
     class _Budgets:
+        def remaining(self, phase):
+            return 10**9
+
+        def task_remaining_for(self, task_id):
+            return 10**9
+
         def check(self, *a, **k):
             return None
 
@@ -139,6 +145,12 @@ def test_a_cache_hit_does_not_repeat_the_observation_text(tmp_path: Path) -> Non
             return ChatResult(content=body, usage={"prompt_tokens": 1, "completion_tokens": 1})
 
     class _Budgets:
+        def remaining(self, phase):
+            return 10**9
+
+        def task_remaining_for(self, task_id):
+            return 10**9
+
         def check(self, *a, **k):
             return None
 

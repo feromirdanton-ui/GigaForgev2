@@ -56,6 +56,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ui", choices=("tk", "qml"), default="qml",
                         help="Desktop surface (Qt Quick is primary; --ui tk opens the fallback).")
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
+    from gigaforge.runtime_dependencies import ensure_agent_runtime
+
+    agent_runtime = ensure_agent_runtime(auto_install=True)
+    if not agent_runtime.available:
+        print(
+            "GigaForge cannot start without its required LangGraph runtime. "
+            "Run `python -m pip install -e .` and restart. "
+            + agent_runtime.detail,
+            file=sys.stderr,
+        )
+        return 3
     try:
         if args.ui == "qml":
             from .qt_app import run_qml

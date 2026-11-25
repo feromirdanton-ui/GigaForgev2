@@ -422,7 +422,9 @@ TASK5 = TaskFixture(
     ),
     target_function="",
     target_file="",
-    plan_response=_json.dumps({"steps": []}),
+    plan_response=_json.dumps(
+        {"steps": [{"tool": "read_structure", "args": {"path": "index.html"}}]}
+    ),
     code_responses=[],
     review_responses=[_TASK1_REVIEW_OK],
     test_command=[],
@@ -480,6 +482,7 @@ class BenchFakeGigaClient:
         self.chat_calls: list[dict[str, Any]] = []
         self._fixture = fixture
         self.metrics_sink = metrics_sink or (lambda r: None)
+        self._react_calls = 0
         self._code_responses = list(fixture.code_responses)
         self._review_responses = list(fixture.review_responses)
         #: Real token accounting for the fake transport.
@@ -516,8 +519,40 @@ class BenchFakeGigaClient:
         # bench must catch is the trajectory, and the trajectory is every
         # message before the last one.
         tokens_in = sum(len(str(m.get("content", "") or "")) for m in messages) // 4 + 4
-        if phase == "plan":
+        if phase == "react":
+            self._react_calls += 1
+            if self._react_calls == 1:
+                body = {
+                    "thought": "Locate the target before planning.",
+                    "action": "grep",
+                    "action_input": self._fixture.target_function or "demo repo",
+                }
+            else:
+                try:
+                    steps = _json.loads(self._fixture.plan_response).get("steps", [])
+                except (TypeError, ValueError, AttributeError):
+                    steps = []
+                if not steps and not self._fixture.target_file:
+                    steps = [{"tool": "write_file", "args": {"path": "index.html"}}]
+                body = {
+                    "thought": "The target is identified; hand the executor a concrete plan.",
+                    "action": "finish",
+                    "action_input": steps,
+                }
+            content = _json.dumps(body)
+        elif phase == "plan":
             content = self._fixture.plan_response
+        elif phase == "react":
+            # The product plans through LangGraph ReAct. Reuse the fixture's
+            # structured plan as a deterministic finish action so the bench
+            # exercises that runtime instead of depending on a linear planner.
+            content = _json.dumps(
+                {
+                    "thought": "Use the fixture plan.",
+                    "action": "finish",
+                    "action_input": self._fixture.plan_response,
+                }
+            )
         elif phase == "code" and self._fixture.section_responses:
             # The sectional page path: the prompt names the section kind, so the
             # answer is chosen by kind rather than by position.  Sections run

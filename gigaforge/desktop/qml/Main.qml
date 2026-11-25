@@ -26,6 +26,7 @@ ApplicationWindow {
     property bool adaptiveContextBefore: true
     property bool adaptiveHistoryBefore: true
     property bool modelPickerExpanded: false
+    property var expandedToolGroups: ({})
     readonly property var modelPickerPrimaryChoices: {
         const available = bridge.modelChoices
         const preferred = [
@@ -60,6 +61,39 @@ ApplicationWindow {
     readonly property var modelPickerChoices: modelPickerExpanded
         ? modelPickerPrimaryChoices.concat(modelPickerAdditionalChoices)
         : modelPickerPrimaryChoices
+    readonly property var chatTranscriptEvents: {
+        const source = bridge.events
+        const rows = []
+        let activeToolGroup = null
+        for (let i = 0; i < source.length; i++) {
+            const event = source[i]
+            if (event.kind === "tool") {
+                if (!activeToolGroup) {
+                    activeToolGroup = {
+                        kind: "toolGroup",
+                        groupId: String(i),
+                        toolEvents: []
+                    }
+                    rows.push(activeToolGroup)
+                }
+                activeToolGroup.toolEvents.push(event)
+                continue
+            }
+            if (event.kind === "step" && activeToolGroup) {
+                rows.push(event)
+                continue
+            }
+            activeToolGroup = null
+            rows.push(event)
+        }
+        return rows
+    }
+    function toggleToolGroup(groupId) {
+        const next = Object.assign({}, expandedToolGroups)
+        const key = String(groupId)
+        next[key] = !next[key]
+        expandedToolGroups = next
+    }
     readonly property var agentProfileChoices: [
         { id: "", name: window.tr("Стандартный агент", "Default agent") }
     ].concat(bridge.agentProfiles)
@@ -2149,18 +2183,23 @@ ApplicationWindow {
                                     Layout.fillHeight: true
                                     clip: true
                                     spacing: 11 * window.densityScale
-                                    model: bridge.events
+                                    model: window.chatTranscriptEvents
                                     boundsBehavior: Flickable.StopAtBounds
                                     ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
                                     delegate: Item {
                                         id: messageRow
                                         required property var modelData
                                         property bool fromUser: (modelData.data || {}).role === "user"
+                                        property bool toolGroup: modelData.kind === "toolGroup"
+                                        property bool toolGroupExpanded: toolGroup
+                                            && window.expandedToolGroups[String(modelData.groupId)] === true
                                         property bool eventStep: modelData.kind === "step" || modelData.kind === "tool"
                                         width: transcript.width
-                                        height: messageBubble.implicitHeight + 8
+                                        height: toolGroup
+                                            ? toolGroupBubble.height + 8 : messageBubble.implicitHeight + 8
                                         Rectangle {
                                             id: messageBubble
+                                            visible: !messageRow.toolGroup
                                             x: messageRow.fromUser ? messageRow.width - width : 0
                                             y: 4
                                             width: messageRow.fromUser
@@ -2207,7 +2246,7 @@ ApplicationWindow {
                                                     visible: !!modelData.text
                                                              && modelData.kind !== "snapshot"
                                                              && modelData.kind !== "step"
-                                                    text: modelData.text
+                                                    text: String(modelData.text || "")
                                                     color: modelData.kind === "error" ? themeTokens.fail
                                                          : messageRow.fromUser ? ink : inkSoft
                                                     font.pixelSize: Math.round((messageRow.fromUser ? 11.5 : 10.5) * window.textScale)
@@ -2215,6 +2254,85 @@ ApplicationWindow {
                                                     wrapMode: Text.Wrap
                                                     textFormat: Text.PlainText
                                                     Layout.fillWidth: true
+                                                }
+                                            }
+                                            Rectangle {
+                                                id: toolGroupBubble
+                                                visible: messageRow.toolGroup
+                                                x: 0
+                                                y: 4
+                                                width: messageRow.width * 0.76
+                                                height: toolGroupColumn.implicitHeight + 18
+                                                radius: 13
+                                                color: themeTokens.surface
+                                                border.color: themeTokens.lineSoft
+                                                ColumnLayout {
+                                                    id: toolGroupColumn
+                                                    anchors.fill: parent
+                                                    anchors.margins: 9
+                                                    spacing: 5 * window.densityScale
+                                                    Button {
+                                                        objectName: messageRow.toolGroup
+                                                            ? "toggleToolCallsGroup_" + messageRow.modelData.groupId : ""
+                                                        Accessible.name: window.tr(
+                                                            "Показать или скрыть вызовы инструментов",
+                                                            "Show or hide tool calls"
+                                                        )
+                                                        Layout.fillWidth: true
+                                                        Layout.preferredHeight: 24
+                                                        onClicked: window.toggleToolGroup(messageRow.modelData.groupId)
+                                                        background: Item {}
+                                                        contentItem: RowLayout {
+                                                            spacing: 7
+                                                            Text {
+                                                                text: {
+                                                                    const count = (messageRow.modelData.toolEvents || []).length
+                                                                    return window.tr(
+                                                                        "Вызовы инструментов · " + count,
+                                                                        "Tool calls · " + count
+                                                                    )
+                                                                }
+                                                                color: themeTokens.ink2
+                                                                font.family: themeTokens.text
+                                                                font.pixelSize: Math.round(9.5 * window.textScale)
+                                                                font.bold: true
+                                                                Layout.fillWidth: true
+                                                            }
+                                                            Text {
+                                                                text: messageRow.toolGroupExpanded ? "⌃" : "⌄"
+                                                                color: themeTokens.aquaInk
+                                                                font.pixelSize: Math.round(12 * window.textScale)
+                                                            }
+                                                        }
+                                                    }
+                                                    Repeater {
+                                                        model: messageRow.modelData.toolEvents || []
+                                                        delegate: ColumnLayout {
+                                                            required property var modelData
+                                                            visible: messageRow.toolGroupExpanded
+                                                            Layout.fillWidth: true
+                                                            spacing: 2
+                                                            Text {
+                                                                text: String((modelData.data || {}).name
+                                                                    || window.tr("Инструмент", "Tool"))
+                                                                color: themeTokens.aquaInk
+                                                                font.family: themeTokens.mono
+                                                                font.pixelSize: Math.round(8.5 * window.textScale)
+                                                                elide: Text.ElideRight
+                                                                Layout.fillWidth: true
+                                                            }
+                                                            Text {
+                                                                visible: !!modelData.text
+                                                                text: String(modelData.text || "")
+                                                                color: themeTokens.ink3
+                                                                font.family: themeTokens.text
+                                                                font.pixelSize: Math.round(9 * window.textScale)
+                                                                wrapMode: Text.Wrap
+                                                                textFormat: Text.PlainText
+                                                                Layout.fillWidth: true
+                                                            }
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
@@ -3076,6 +3194,7 @@ ApplicationWindow {
 
                                 ScrollView {
                                     id: settingsScroll
+                                    objectName: "settingsScrollView"
                                     Layout.fillWidth: true
                                     Layout.fillHeight: true
                                     clip: true
@@ -3610,15 +3729,69 @@ ApplicationWindow {
                                                 font.pixelSize: Math.round(11 * window.textScale)
                                                 Layout.fillWidth: true
                                             }
-                                            SpinBox {
-                                                objectName: "settingsGoalCycles"
-                                                from: 1
-                                                to: 20
-                                                value: bridge.goalMaxCycles
-                                                editable: true
-                                                enabled: !bridge.running
-                                                Layout.preferredWidth: 96
-                                                onValueModified: bridge.setGoalMaxCycles(value)
+                                            RowLayout {
+                                                Layout.preferredWidth: 108
+                                                Layout.preferredHeight: 36
+                                                spacing: 4
+                                                Button {
+                                                    objectName: "goalCyclesDecrementButton"
+                                                    Accessible.name: window.tr("Уменьшить число циклов", "Decrease cycle count")
+                                                    Layout.preferredWidth: 28
+                                                    Layout.preferredHeight: 34
+                                                    padding: 0
+                                                    enabled: !bridge.running && bridge.goalMaxCycles > 1
+                                                    onClicked: bridge.setGoalMaxCycles(Math.max(1, bridge.goalMaxCycles - 1))
+                                                    background: Rectangle {
+                                                        radius: 7
+                                                        color: parent.hovered ? themeTokens.mintTint : themeTokens.surface2
+                                                        border.color: themeTokens.line
+                                                    }
+                                                    contentItem: Text {
+                                                        text: "−"
+                                                        color: parent.enabled ? themeTokens.primaryDeep : themeTokens.ink4
+                                                        font.pixelSize: Math.round(14 * window.textScale)
+                                                        font.bold: true
+                                                        horizontalAlignment: Text.AlignHCenter
+                                                        verticalAlignment: Text.AlignVCenter
+                                                    }
+                                                }
+                                                SpinBox {
+                                                    id: goalCyclesSpinBox
+                                                    objectName: "settingsGoalCycles"
+                                                    from: 1
+                                                    to: 20
+                                                    stepSize: 1
+                                                    value: bridge.goalMaxCycles
+                                                    editable: true
+                                                    enabled: !bridge.running
+                                                    Layout.preferredWidth: 48
+                                                    Layout.preferredHeight: 36
+                                                    up.indicator: Item { implicitWidth: 0; implicitHeight: 0; visible: false }
+                                                    down.indicator: Item { implicitWidth: 0; implicitHeight: 0; visible: false }
+                                                    onValueModified: bridge.setGoalMaxCycles(value)
+                                                }
+                                                Button {
+                                                    objectName: "goalCyclesIncrementButton"
+                                                    Accessible.name: window.tr("Увеличить число циклов", "Increase cycle count")
+                                                    Layout.preferredWidth: 28
+                                                    Layout.preferredHeight: 34
+                                                    padding: 0
+                                                    enabled: !bridge.running && bridge.goalMaxCycles < 20
+                                                    onClicked: bridge.setGoalMaxCycles(Math.min(20, bridge.goalMaxCycles + 1))
+                                                    background: Rectangle {
+                                                        radius: 7
+                                                        color: parent.hovered ? themeTokens.mintTint : themeTokens.surface2
+                                                        border.color: themeTokens.line
+                                                    }
+                                                    contentItem: Text {
+                                                        text: "+"
+                                                        color: parent.enabled ? themeTokens.primaryDeep : themeTokens.ink4
+                                                        font.pixelSize: Math.round(14 * window.textScale)
+                                                        font.bold: true
+                                                        horizontalAlignment: Text.AlignHCenter
+                                                        verticalAlignment: Text.AlignVCenter
+                                                    }
+                                                }
                                             }
                                         }
                                         Item { Layout.fillWidth: true; height: 16 }
@@ -4016,40 +4189,51 @@ ApplicationWindow {
                                                     contentItem: Text { text: parent.text; color: parent.enabled ? themeTokens.aqua : themeTokens.consoleDim; font.pixelSize: Math.round(10.5 * window.textScale); font.bold: true; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter; leftPadding: 10; rightPadding: 10 }
                                                 }
                                             }
-                                            TextArea {
-                                                id: editor
-                                                objectName: "projectEditor"
-                                                Accessible.name: window.tr(
-                                                    "Редактор файла " + (bridge.openPath || "не выбран"),
-                                                    "File editor " + (bridge.openPath || "not selected")
-                                                )
+                                            ScrollView {
+                                                id: editorScrollView
+                                                objectName: "projectEditorScrollView"
                                                 Layout.fillWidth: true
                                                 Layout.fillHeight: true
-                                                text: bridge.editorContents
-                                                enabled: !!bridge.openPath
-                                                selectByMouse: true
-                                                wrapMode: TextEdit.NoWrap
-                                                color: themeTokens.consoleInk
-                                                font.family: themeTokens.mono
-                                                font.pixelSize: Math.round(11.5 * window.textScale)
-                                                placeholderTextColor: themeTokens.consoleDim
-                                                background: Rectangle {
-                                                    radius: themeTokens.radiusControl
-                                                    color: themeTokens.console2
-                                                        border.color: parent.activeFocus ? themeTokens.aqua : themeTokens.line
-                                                    border.width: 1
-                                                }
-                                                placeholderText: window.tr(
-                                                    "Откройте текстовый файл слева или создайте новый.",
-                                                    "Open a text file on the left or create a new one."
-                                                )
-                                                Component.onCompleted: text = bridge.editorContents
-                                                Keys.onPressed: function(event) {
-                                                    if (event.key === Qt.Key_S && (event.modifiers & Qt.ControlModifier)) {
-                                                        if (bridge.openPath && editor.text !== bridge.savedEditorContents)
-                                                            bridge.saveFile(editor.text)
-                                                        event.accepted = true
-                                                    }
+                                                clip: true
+                                                contentWidth: editor.width
+                                                contentHeight: editor.height
+                                                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                                                ScrollBar.horizontal: ScrollBar { policy: ScrollBar.AsNeeded }
+                                                TextArea {
+                                                        id: editor
+                                                        objectName: "projectEditor"
+                                                        Accessible.name: window.tr(
+                                                            "Редактор файла " + (bridge.openPath || "не выбран"),
+                                                            "File editor " + (bridge.openPath || "not selected")
+                                                        )
+                                                        width: Math.max(editorScrollView.availableWidth, editor.contentWidth)
+                                                        height: Math.max(editorScrollView.availableHeight, editor.contentHeight)
+                                                        text: bridge.editorContents
+                                                        enabled: !!bridge.openPath
+                                                        selectByMouse: true
+                                                        wrapMode: TextEdit.NoWrap
+                                                        color: themeTokens.consoleInk
+                                                        font.family: themeTokens.mono
+                                                        font.pixelSize: Math.round(11.5 * window.textScale)
+                                                        placeholderTextColor: themeTokens.consoleDim
+                                                        background: Rectangle {
+                                                            radius: themeTokens.radiusControl
+                                                            color: themeTokens.console2
+                                                            border.color: parent.activeFocus ? themeTokens.aqua : themeTokens.line
+                                                            border.width: 1
+                                                        }
+                                                        placeholderText: window.tr(
+                                                            "Откройте текстовый файл слева или создайте новый.",
+                                                            "Open a text file on the left or create a new one."
+                                                        )
+                                                        Component.onCompleted: text = bridge.editorContents
+                                                        Keys.onPressed: function(event) {
+                                                            if (event.key === Qt.Key_S && (event.modifiers & Qt.ControlModifier)) {
+                                                                if (bridge.openPath && editor.text !== bridge.savedEditorContents)
+                                                                    bridge.saveFile(editor.text)
+                                                                event.accepted = true
+                                                            }
+                                                        }
                                                 }
                                             }
                                         }
@@ -5322,9 +5506,9 @@ ApplicationWindow {
             bridge.saveFloatingChatGeometry(x, y, width, height)
         }
 
-        readonly property var transcriptEvents: bridge.events.filter(function(event) {
+        readonly property var transcriptEvents: window.chatTranscriptEvents.filter(function(event) {
             const data = event.data || {}
-            return event.kind === "command" || !!String(event.text || "").trim()
+            return event.kind === "toolGroup" || event.kind === "command" || !!String(event.text || "").trim()
                 || !!data.summary || !!data.status || !!data.event
         })
 
@@ -5378,20 +5562,27 @@ ApplicationWindow {
                     model: chatFloatingWindow.transcriptEvents
                     onCountChanged: Qt.callLater(function() { positionViewAtEnd() })
                     delegate: Rectangle {
+                        id: floatingChatEventRow
                         required property var modelData
                         property var eventData: modelData.data || ({})
-                        property bool userMessage: eventData.role === "user" || modelData.kind === "command"
+                        property bool toolGroup: modelData.kind === "toolGroup"
+                        property bool toolGroupExpanded: toolGroup
+                            && window.expandedToolGroups[String(modelData.groupId)] === true
+                        property bool userMessage: !toolGroup
+                            && (eventData.role === "user" || modelData.kind === "command")
                         width: floatingChatTranscript.width
-                        height: Math.max(42, Math.min(messageBody.implicitHeight, 160) + 26)
+                        height: Math.max(42, chatMessageContent.implicitHeight + 18)
                         radius: themeTokens.radiusInner
                         color: userMessage ? themeTokens.primaryTint : themeTokens.surface2
                         border.color: userMessage ? themeTokens.lineStrong : themeTokens.lineSoft
 
                         Column {
+                            id: chatMessageContent
                             anchors.fill: parent
                             anchors.margins: 9 * window.densityScale
                             spacing: 4 * window.densityScale
                             Text {
+                                visible: !parent.parent.toolGroup
                                 text: parent.parent.userMessage
                                     ? window.tr("ВЫ", "YOU")
                                     : String(parent.parent.eventData.role || parent.parent.eventData.node
@@ -5402,8 +5593,40 @@ ApplicationWindow {
                                 font.bold: true
                                 font.letterSpacing: 0.7
                             }
+                            Button {
+                                objectName: "toggleFloatingToolCallsGroup_" + floatingChatEventRow.modelData.groupId
+                                Accessible.name: window.tr(
+                                    "Показать или скрыть вызовы инструментов",
+                                    "Show or hide tool calls"
+                                )
+                                visible: parent.parent.toolGroup
+                                width: parent.width
+                                height: 24
+                                onClicked: window.toggleToolGroup(parent.parent.modelData.groupId)
+                                background: Item {}
+                                contentItem: RowLayout {
+                                    Text {
+                                        text: window.tr(
+                                            "Вызовы инструментов · "
+                                                + (floatingChatEventRow.modelData.toolEvents || []).length,
+                                            "Tool calls · "
+                                                + (floatingChatEventRow.modelData.toolEvents || []).length
+                                        )
+                                        color: themeTokens.ink2
+                                        font.pixelSize: Math.round(9.5 * window.textScale)
+                                        font.bold: true
+                                        Layout.fillWidth: true
+                                    }
+                                    Text {
+                                        text: floatingChatEventRow.toolGroupExpanded ? "⌃" : "⌄"
+                                        color: themeTokens.aquaInk
+                                        font.pixelSize: Math.round(12 * window.textScale)
+                                    }
+                                }
+                            }
                             Text {
                                 id: messageBody
+                                visible: !parent.parent.toolGroup
                                 width: parent.width
                                 text: String(parent.parent.modelData.text
                                     || parent.parent.eventData.summary
@@ -5415,6 +5638,32 @@ ApplicationWindow {
                                 wrapMode: Text.Wrap
                                 maximumLineCount: 9
                                 elide: Text.ElideRight
+                            }
+                            Repeater {
+                                model: parent.parent.modelData.toolEvents || []
+                                delegate: Column {
+                                    required property var modelData
+                                    visible: floatingChatEventRow.toolGroupExpanded
+                                    width: chatMessageContent.width
+                                    spacing: 2
+                                    Text {
+                                        text: String((modelData.data || {}).name
+                                            || window.tr("Инструмент", "Tool"))
+                                        color: themeTokens.aquaInk
+                                        font.family: themeTokens.mono
+                                        font.pixelSize: Math.round(8.5 * window.textScale)
+                                        elide: Text.ElideRight
+                                        width: parent.width
+                                    }
+                                    Text {
+                                        visible: !!modelData.text
+                                        text: String(modelData.text || "")
+                                        color: themeTokens.ink3
+                                        font.pixelSize: Math.round(9 * window.textScale)
+                                        wrapMode: Text.Wrap
+                                        width: parent.width
+                                    }
+                                }
                             }
                         }
                     }

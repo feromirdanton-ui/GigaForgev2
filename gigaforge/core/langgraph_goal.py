@@ -36,17 +36,21 @@ from .goal import (
     VerificationReport,
     Verifier,
     WorkspaceVerifier,
+    _merge_conversation_context,
+    _fingerprint_changed_files,
     _now,
+    _remaining_goal_budget,
+    _repeated_failed_goal_output,
     _safe_excerpt,
 )
 from .goal_workspace import GoalWorkspace
 from .langgraph_runtime import (
-    LANGGRAPH_AVAILABLE,
     Command,
     graph_state_summary,
     interrupt,
     iter_graph_events,
     open_checkpointer,
+    require_langgraph,
     thread_config,
 )
 
@@ -86,6 +90,7 @@ class GoalState(TypedDict, total=False):
 
     goal_id: str
     goal: str
+    conversation_context: str
     cycle_index: int
     max_cycles: int
     max_fix_iterations: int
@@ -100,6 +105,8 @@ class GoalState(TypedDict, total=False):
     accepted: bool
     error: str
     feedback: str
+    no_progress: bool
+    budget_exhausted: bool
     changed_files: list[str]
     published_files: list[str]
     tokens: int
@@ -143,8 +150,7 @@ def build_goal_graph(
     ``cancellation`` is closed over rather than carried in the state: the state
     is serialised by the checkpointer, and a token is not JSON-safe.
     """
-    if not LANGGRAPH_AVAILABLE:  # pragma: no cover - guarded by the caller
-        raise RuntimeError("langgraph is not installed")
+    require_langgraph()
 
     from langgraph.graph import END, START, StateGraph
 
@@ -178,6 +184,7 @@ def build_goal_graph(
             "active_run_id": "",
             "active_cycle_index": 0,
             "tokens": int(state.get("tokens") or 0),
+            "budget_tokens": int(state.get("budget_tokens") or 0),
             "calls": int(state.get("calls") or 0),
             "started_at": state.get("started_at", ""),
             "updated_at": _now(),
@@ -248,6 +255,31 @@ def build_goal_graph(
                 "updated_at": _now(),
             }
 
+        budget_tokens = int(state.get("budget_tokens") or 0)
+        tokens_used = max(0, int(state.get("tokens") or 0))
+        budget_remaining = _remaining_goal_budget(budget_tokens, tokens_used)
+        if budget_tokens and budget_remaining == 0:
+            message = (
+                f"Goal token budget exhausted ({tokens_used}/{budget_tokens}); "
+                "increase budget_tokens to resume."
+            )
+            _emit(
+                "goal.budget_exhausted",
+                node=f"Цикл {cycle_index}",
+                status="Остановлено: исчерпан бюджет токенов",
+                goal_id=state.get("goal_id"),
+                tokens_used=tokens_used,
+                budget_tokens=budget_tokens,
+            )
+            return {
+                "status": "blocked",
+                "accepted": False,
+                "error": message,
+                "feedback": message,
+                "budget_exhausted": True,
+                "updated_at": _now(),
+            }
+
         _emit(
             "goal.cycle_start",
             node=f"Цикл {cycle_index} из {max_cycles}",
@@ -263,12 +295,13 @@ def build_goal_graph(
                 run_id=run_id,
                 files=list(state.get("files") or []),
                 symbols=list(state.get("symbols") or []),
-                budget_tokens=int(state.get("budget_tokens") or 0),
+                budget_tokens=budget_remaining,
                 use_cache=False,
                 dry_run=False,
                 use_subagents=bool(state.get("use_subagents")),
                 react=True,
                 max_fix_iterations=int(state.get("max_fix_iterations") or 2),
+                conversation_context=str(state.get("conversation_context") or ""),
                 cancellation=cancel,
                 resume=False,
             )
@@ -320,7 +353,39 @@ def build_goal_graph(
             calls=int(getattr(result, "calls", 0) or 0),
             duration_ms=float(getattr(result, "duration_ms", 0.0) or 0.0),
             error=error[:900],
+            output_fingerprint=_fingerprint_changed_files(root, changed),
         )
+        total_tokens = int(state.get("tokens") or 0) + cycle.tokens
+        total_calls = int(state.get("calls") or 0) + cycle.calls
+        if budget_tokens and cycle.tokens > budget_remaining:
+            message = (
+                "Pipeline exceeded the remaining goal token budget "
+                f"({cycle.tokens}>{budget_remaining}); review usage accounting."
+            )
+            _emit(
+                "goal.budget_exceeded",
+                node=f"Цикл {cycle_index}",
+                status="Pipeline превысил оставшийся бюджет",
+                goal_id=state.get("goal_id"),
+                cycle_index=cycle_index,
+                cycle_tokens=cycle.tokens,
+                budget_remaining=budget_remaining,
+            )
+            return {
+                "cycle_index": cycle_index,
+                "cycles": [cycle.to_dict()],
+                "accepted": False,
+                "status": "blocked",
+                "error": message,
+                "feedback": message,
+                "changed_files": changed,
+                "pending_diff": str(getattr(result, "final_diff", "") or ""),
+                "verification": None,
+                "tokens": total_tokens,
+                "calls": total_calls,
+                "budget_exhausted": True,
+                "updated_at": _now(),
+            }
         _emit(
             "goal.cycle_finish",
             node=f"Цикл {cycle_index} из {max_cycles}",
@@ -341,14 +406,36 @@ def build_goal_graph(
             "changed_files": changed,
             "pending_diff": str(getattr(result, "final_diff", "") or ""),
             "verification": None,
-            "tokens": int(state.get("tokens") or 0) + cycle.tokens,
-            "calls": int(state.get("calls") or 0) + cycle.calls,
+            "tokens": total_tokens,
+            "calls": total_calls,
             "updated_at": _now(),
         }
 
     def verify(state: GoalState) -> dict[str, Any]:
         """Deterministic project checks — the same verifier as the classic path."""
         if not state.get("accepted"):
+            if state.get("budget_exhausted"):
+                return {}
+            cycles = list(state.get("cycles") or [])
+            if len(cycles) >= 2 and _repeated_failed_goal_output(cycles[-1], cycles[-2]):
+                message = (
+                    "Goal stopped after the same output and failure repeated; "
+                    "review the saved workspace or change the task."
+                )
+                _emit(
+                    "goal.no_progress",
+                    node=f"Цикл {int(state.get('cycle_index') or 0)}",
+                    status="Остановлено: результат не изменился",
+                    goal_id=state.get("goal_id"),
+                    cycle_index=int(state.get("cycle_index") or 0),
+                    output_fingerprint=cycles[-1].get("output_fingerprint", ""),
+                )
+                return {
+                    "status": "needs_attention",
+                    "accepted": False,
+                    "error": message,
+                    "no_progress": True,
+                }
             return {}
         cycle_index = int(state.get("cycle_index") or 0)
         max_cycles = int(state.get("max_cycles") or 8)
@@ -379,7 +466,7 @@ def build_goal_graph(
         cycles = list(state.get("cycles") or [])
         if cycles:
             cycles[-1] = {**cycles[-1], "verification": report.to_dict()}
-        return {
+        delta = {
             "verification": report.to_dict(),
             "cycles": cycles,
             "feedback": report.feedback() if report.passed is not True else "",
@@ -390,6 +477,30 @@ def build_goal_graph(
                 else "needs_attention"
             ),
         }
+        if (
+            report.passed is False
+            and len(cycles) >= 2
+            and _repeated_failed_goal_output(cycles[-1], cycles[-2])
+        ):
+            message = (
+                "Goal stopped after the same output and failure repeated; "
+                "review the saved workspace or change the task."
+            )
+            _emit(
+                "goal.no_progress",
+                node=f"Цикл {cycle_index}",
+                status="Остановлено: результат не изменился",
+                goal_id=state.get("goal_id"),
+                cycle_index=cycle_index,
+                output_fingerprint=cycles[-1].get("output_fingerprint", ""),
+            )
+            delta.update(
+                status="needs_attention",
+                accepted=False,
+                error=message,
+                no_progress=True,
+            )
+        return delta
 
     def approve(state: GoalState) -> dict[str, Any]:
         """Human-in-the-loop gate.  Suspends the thread; resumes with a decision.
@@ -524,7 +635,7 @@ def build_goal_graph(
 
     # ── routing ──────────────────────────────────────────────────────────────
     def after_verify(state: GoalState) -> str:
-        if state.get("status") == "failed":
+        if state.get("no_progress") or state.get("status") in {"failed", "blocked"}:
             return "stop"
         if not state.get("accepted"):
             return "retry" if int(state.get("cycle_index") or 0) < int(state.get("max_cycles") or 8) else "stop"
@@ -704,6 +815,8 @@ def run_goal_graph(
     files: Sequence[str] = (),
     symbols: Sequence[str] = (),
     budget_tokens: int = 0,
+    conversation_context: str = "",
+    additional_context: str = "",
     approve: Optional[Callable[[str], bool]] = None,
     gate: Any = None,
     cancellation: Optional[CancellationToken] = None,
@@ -721,30 +834,44 @@ def run_goal_graph(
     loop streams the graph, and whenever the thread suspends on the approval
     node the ``approve`` callable answers and the graph resumes.
     """
-    if not LANGGRAPH_AVAILABLE:  # pragma: no cover - guarded by the caller
-        raise RuntimeError("langgraph is not installed")
+    require_langgraph()
 
     root = Path(repo_root).resolve()
     goal_store = store or GoalStore(root)
     max_cycles = int(max_cycles)
     if not 1 <= max_cycles <= 20:
         raise ValueError("max_cycles must be between 1 and 20")
+    budget_tokens = int(budget_tokens)
+    if budget_tokens < 0:
+        raise ValueError("budget_tokens cannot be negative")
 
+    saved_record: dict[str, Any] = {}
+    prior_context = ""
     if resume:
         if not goal_id:
             raise ValueError("goal_id is required when resuming a goal")
-        saved = goal_store.load(goal_id)
-        goal = str(saved.get("goal") or "").strip()
+        saved_record = goal_store.load(goal_id)
+        prior_context = str(saved_record.get("conversation_context") or "")
+        goal = str(saved_record.get("goal") or "").strip()
         if not goal:
             raise ValueError(f"goal {goal_id!r} has no saved objective")
-        if saved.get("status") == "completed":
-            return _result_from_record(saved)
+        if saved_record.get("status") == "completed":
+            return _result_from_record(saved_record)
+        # On resume, zero keeps the saved lifetime cap. A larger explicit value
+        # extends the total allowance; previous cycle usage remains charged.
+        budget_tokens = budget_tokens or int(saved_record.get("budget_tokens") or 0)
     else:
         goal = str(goal or "").strip()
         if not goal:
             raise ValueError("goal cannot be empty")
         goal_id = goal_id or GoalStore.new_id()
 
+    conversation_context = _merge_conversation_context(
+        prior_context, conversation_context, additional_context
+    )
+    if resume:
+        saved_record["conversation_context"] = conversation_context
+        goal_store.save(saved_record)
     assert goal_id is not None
     owned_conn = None
     if checkpointer is None:
@@ -777,10 +904,12 @@ def run_goal_graph(
             "accepted": False,
             "cycles": [],
             "tokens": 0,
+            "budget_tokens": budget_tokens,
             "calls": 0,
             "started_at": _now(),
             "updated_at": _now(),
             "error": detail,
+            "conversation_context": conversation_context,
             "workspace_root": str(getattr(workspace, "root", "") or ""),
             "published_files": [],
             "engine": "langgraph",
@@ -794,50 +923,69 @@ def run_goal_graph(
     try:
         if resume:
             snapshot = graph_state_summary(graph, config)
-            graph_input: Any = None if snapshot["next"] else {
-                "goal_id": goal_id,
-                "goal": goal,
-                "cycle_index": 0,
-                "max_cycles": max_cycles,
-                "max_fix_iterations": int(max_fix_iterations),
-                "use_subagents": bool(use_subagents),
-                "files": list(files),
-                "symbols": list(symbols),
-                "budget_tokens": int(budget_tokens),
-                "require_approval": approve is not None or gate is not None,
-                "cycles": [],
-                "status": "running",
-                "accepted": False,
-                "error": "",
-                "feedback": "",
-                "changed_files": [],
-                "published_files": [],
-                "tokens": 0,
-                "calls": 0,
-                "started_at": _now(),
-                "updated_at": _now(),
-                "workspace_root": str(getattr(workspace, "root", "") or ""),
-                "pending_diff": "",
-                "verification": None,
-                "approval": {},
-            }
+            saved_cycles = list(saved_record.get("cycles") or [])
+            saved_cycle_index = (
+                int(saved_cycles[-1].get("index") or len(saved_cycles))
+                if saved_cycles and isinstance(saved_cycles[-1], Mapping)
+                else len(saved_cycles)
+            )
+            if snapshot["next"]:
+                if conversation_context != prior_context:
+                    graph.update_state(
+                        config, {"conversation_context": conversation_context}
+                    )
+                graph_input: Any = None
+            else:
+                graph_input = {
+                    "goal_id": goal_id,
+                    "goal": goal,
+                    "conversation_context": conversation_context,
+                    "cycle_index": saved_cycle_index,
+                    "max_cycles": max_cycles,
+                    "max_fix_iterations": int(max_fix_iterations),
+                    "use_subagents": bool(use_subagents),
+                    "files": list(files),
+                    "symbols": list(symbols),
+                    "budget_tokens": budget_tokens,
+                    "require_approval": approve is not None or gate is not None,
+                    "cycles": saved_cycles,
+                    "status": "running",
+                    "accepted": False,
+                    "error": "",
+                    "feedback": "",
+                    "no_progress": False,
+                    "budget_exhausted": False,
+                    "changed_files": [],
+                    "published_files": list(saved_record.get("published_files") or []),
+                    "tokens": int(saved_record.get("tokens") or 0),
+                    "calls": int(saved_record.get("calls") or 0),
+                    "started_at": str(saved_record.get("started_at") or _now()),
+                    "updated_at": _now(),
+                    "workspace_root": str(getattr(workspace, "root", "") or ""),
+                    "pending_diff": "",
+                    "verification": None,
+                    "approval": {},
+                }
         else:
             graph_input = {
                 "goal_id": goal_id,
                 "goal": goal,
+                "conversation_context": conversation_context,
                 "cycle_index": 0,
                 "max_cycles": max_cycles,
                 "max_fix_iterations": int(max_fix_iterations),
                 "use_subagents": bool(use_subagents),
                 "files": list(files),
                 "symbols": list(symbols),
-                "budget_tokens": int(budget_tokens),
+                "budget_tokens": budget_tokens,
                 "require_approval": approve is not None or gate is not None,
                 "cycles": [],
                 "status": "running",
                 "accepted": False,
                 "error": "",
                 "feedback": "",
+                "no_progress": False,
+                "budget_exhausted": False,
                 "changed_files": [],
                 "published_files": [],
                 "tokens": 0,
@@ -880,10 +1028,12 @@ def run_goal_graph(
         "accepted": bool(values.get("accepted")),
         "cycles": list(values.get("cycles") or []),
         "tokens": int(values.get("tokens") or 0),
+        "budget_tokens": int(values.get("budget_tokens") or 0),
         "calls": int(values.get("calls") or 0),
         "started_at": str(values.get("started_at") or ""),
         "updated_at": _now(),
         "error": str(values.get("error") or ""),
+        "conversation_context": conversation_context,
         "workspace_root": str(values.get("workspace_root") or ""),
         "published_files": list(values.get("published_files") or []),
         "engine": "langgraph",
@@ -939,6 +1089,7 @@ def _result_from_record(record: Mapping[str, Any]) -> GoalResult:
             calls=int(item.get("calls") or 0),
             duration_ms=float(item.get("duration_ms") or 0.0),
             error=str(item.get("error") or ""),
+            output_fingerprint=str(item.get("output_fingerprint") or ""),
         )
         for item in (record.get("cycles") or [])
         if isinstance(item, Mapping)
@@ -950,6 +1101,7 @@ def _result_from_record(record: Mapping[str, Any]) -> GoalResult:
         accepted=bool(record.get("accepted")),
         cycles=cycles,
         tokens=int(record.get("tokens") or 0),
+        budget_tokens=int(record.get("budget_tokens") or 0),
         calls=int(record.get("calls") or 0),
         started_at=str(record.get("started_at") or ""),
         updated_at=str(record.get("updated_at") or ""),

@@ -200,6 +200,7 @@ class CoreConfig:
 
     # ── DAG execution ────────────────────────────────────────────────────────
     node_timeout: float = 480.0
+    react_timeout: float = 480.0
     pipeline_timeout: float = 2400.0
     checkpoint: bool = True
     dlq_enabled: bool = True
@@ -346,6 +347,7 @@ class CoreConfig:
             strong_model=text("strong_model", "GigaChat-Pro"),
             max_concurrency=integer("max_concurrency", 4),
             node_timeout=number("node_timeout", 120.0),
+            react_timeout=number("react_timeout", 480.0),
             pipeline_timeout=number("pipeline_timeout", 900.0),
             checkpoint=flag("checkpoint", True),
             dlq_enabled=flag("dlq_enabled", True),
@@ -403,6 +405,7 @@ class CoreConfig:
             "strong_model": self.strong_model,
             "max_concurrency": self.max_concurrency,
             "node_timeout": self.node_timeout,
+            "react_timeout": self.react_timeout,
             "pipeline_timeout": self.pipeline_timeout,
             "checkpoint": self.checkpoint,
             "dlq_enabled": self.dlq_enabled,
