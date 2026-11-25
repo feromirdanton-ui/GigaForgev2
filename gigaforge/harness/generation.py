@@ -709,6 +709,14 @@ def _layout_invariants() -> str:
         "    width: auto !important;\n"
         "    max-width: none !important;\n"
         "}\n"
+        # The palette is the harness's, and a headline is where it shows.  A
+        # child that writes ``<h1 style="color: #fff">`` overrides the sheet
+        # with an inline style — measured live, the page's h1 rendered white
+        # while ``--accent: cyan`` sat unused in ``:root``.  A stylesheet rule
+        # with ``!important`` beats an inline style without it, so the palette
+        # is restored without touching the child's markup.
+        "h1 { color: var(--accent) !important; }\n"
+        "h2 { color: var(--secondary) !important; }\n"
     )
 
 

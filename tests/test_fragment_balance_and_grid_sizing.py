@@ -113,3 +113,16 @@ def test_the_invariants_are_emitted_last():
 
     source = inspect.getsource(generation.assemble_page)
     assert source.index("_layout_invariants()") > source.index("child_css")
+
+
+def test_the_palette_survives_an_inline_style():
+    """A child's ``<h1 style="color:#fff">`` must not repaint the headline.
+
+    Measured live: the page's h1 rendered white while ``--accent: cyan`` sat
+    unused in ``:root``.  A stylesheet rule with ``!important`` beats an inline
+    style without it, so the palette is restored without editing the child's
+    markup.
+    """
+    css = _layout_invariants()
+    assert "h1 { color: var(--accent) !important; }" in css
+    assert "h2 { color: var(--secondary) !important; }" in css
