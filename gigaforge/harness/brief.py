@@ -134,6 +134,21 @@ class TaskBrief:
     read_only: bool = False
     #: True when the goal asks for a reply rather than a change.
     wants_answer: bool = False
+    #: Real source the goal refers to, quoted verbatim by the harness.
+    #:
+    #: Measured live: a goal said "write a design note explaining the GigaForge
+    #: decision ladder: the four levels, when a step escalates, and why L0
+    #: exists".  The model wrote a confident, well-structured document that
+    #: described L0 as "Initial Assessment", L1 as "Detailed Analysis" and L3 as
+    #: "Final Approval" — none of which is what the ladder does.  It never read
+    #: the module; it invented a plausible ladder from the words in the goal.
+    #:
+    #: The harness can prevent that deterministically: when the goal names a
+    #: module that exists, the module's own text is quoted into the brief.  A
+    #: model that has the source in front of it cannot invent a different one,
+    #: and the tokens spent quoting it are fewer than the tokens spent writing a
+    #: wrong document and then a right one.
+    grounding: tuple[tuple[str, str], ...] = ()
     #: Anything the harness measured that does not fit the fields above.
     notes: tuple[str, ...] = ()
 
@@ -146,6 +161,7 @@ class TaskBrief:
             or self.test_command
             or self.read_only
             or self.wants_answer
+            or self.grounding
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -158,6 +174,7 @@ class TaskBrief:
             "test_command": self.test_command,
             "read_only": self.read_only,
             "wants_answer": self.wants_answer,
+            "grounding": [path for path, _ in self.grounding],
             "notes": list(self.notes),
         }
 
@@ -244,6 +261,72 @@ def _test_command(root: Path) -> str:
     return ""
 
 
+def _grounding(
+    goal: str, root: Path | None, *, max_files: int = 2, max_chars: int = 6000
+) -> tuple[tuple[str, str], ...]:
+    """Real source the goal refers to, quoted verbatim.
+
+    A goal that names a module (``the decision ladder``, ``ladder.py``,
+    ``core/ladder``) is asking about code that exists.  The harness can find it
+    and quote it, which is cheaper and more reliable than hoping the model
+    reads it: measured live, a document goal invented a completely different
+    ladder from the words in the goal and never opened the module.
+
+    Selection is deterministic and narrow:
+
+    * a path the goal names explicitly, if it exists;
+    * otherwise a file whose stem appears in the goal's words;
+    * otherwise nothing — a guess at "the relevant file" is how a brief starts
+      quoting the wrong module.
+
+    The quote is capped: a brief is context, not a repository dump.
+    """
+    if root is None or not root.is_dir():
+        return ()
+    words = {w.lower() for w in re.findall(r"[A-Za-z0-9_]{3,}", goal or "")}
+    if not words:
+        return ()
+
+    candidates: list[Path] = []
+    # 1. A path the goal names, resolved against the tree.
+    for rel in _named_paths(goal, root=root):
+        target = root / rel
+        try:
+            if target.is_file():
+                candidates.append(target)
+        except OSError:
+            continue
+
+    # 2. A file whose stem the goal names (``ladder`` -> ``core/ladder.py``).
+    if not candidates:
+        try:
+            for path in sorted(root.rglob("*.py")):
+                if any(part in {".git", ".venv", "node_modules", "tests"}
+                       for part in path.parts):
+                    continue
+                if path.stem.lower() in words:
+                    candidates.append(path)
+                    if len(candidates) >= max_files:
+                        break
+        except OSError:
+            return ()
+
+    quoted: list[tuple[str, str]] = []
+    for path in candidates[:max_files]:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if len(text) > max_chars:
+            text = text[:max_chars] + "\n# … (truncated)"
+        try:
+            rel = str(path.relative_to(root))
+        except ValueError:
+            rel = str(path)
+        quoted.append((rel, text))
+    return tuple(quoted)
+
+
 def build_brief(
     goal: str,
     *,
@@ -300,6 +383,8 @@ def build_brief(
     read_only = any(phrase in low for phrase in _NO_CHANGE)
     wants_answer = task_kind == "answer"
 
+    grounding = _grounding(text, root)
+
     notes: list[str] = []
     if read_only:
         notes.append(
@@ -307,6 +392,11 @@ def build_brief(
         )
     if wants_answer:
         notes.append("the goal asks for a reply: the run's output is text")
+    if grounding:
+        notes.append(
+            "the source the goal refers to is quoted below: describe what it "
+            "actually does, not what its name suggests"
+        )
 
     return TaskBrief(
         task_kind=task_kind,
@@ -317,6 +407,7 @@ def build_brief(
         test_command=test_command,
         read_only=read_only,
         wants_answer=wants_answer,
+        grounding=grounding,
         notes=tuple(notes),
     )
 
@@ -355,5 +446,11 @@ def render_brief(brief: TaskBrief) -> str:
 
     for note in brief.notes:
         lines.append(f"- {note}")
+
+    for path, source in brief.grounding:
+        lines.append(f"\n### Source: `{path}` (quoted by the harness)")
+        lines.append("```")
+        lines.append(source.rstrip())
+        lines.append("```")
 
     return "\n".join(lines)
