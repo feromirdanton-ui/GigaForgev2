@@ -309,6 +309,10 @@ def build_goal_graph(
                 conversation_context=str(state.get("conversation_context") or ""),
                 cancellation=cancel,
                 resume=False,
+                # The run edits the isolated copy, so the brief must measure the
+                # copy.  Without this the pipeline measured the destination and
+                # reported ``files: 0``, quoting no source at all.
+                worktree=str(getattr(workspace, "root", "") or "") or None,
             )
         except Exception as exc:  # noqa: BLE001 - a failed cycle is a state, not a crash
             error = f"{type(exc).__name__}: {str(exc)[:700]}"

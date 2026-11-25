@@ -636,11 +636,19 @@ class TaskPipeline:
         max_fix_iterations: Optional[int] = None,
         conversation_context: str = "",
         cancellation: Optional[CancellationToken] = None,
+        worktree: Optional[str | Path] = None,
     ) -> PipelineResult:
         """Run the task DAG end to end.
 
         Pass a :class:`CancellationToken` to let a caller request a cooperative
         stop; ``cancel(run_id)`` is the runtime-facing convenience API.
+
+        ``worktree`` is the tree this run actually writes to.  A goal run works
+        in an isolated copy of the repository, and without this the pipeline
+        measured the *destination* while editing the *copy*: the task brief
+        reported ``files: 0`` and quoted no source, so a document goal about the
+        decision ladder invented a ladder that does not exist.  ``None`` keeps
+        the configured root, which is what a plain ``run`` wants.
         """
         started = self.clock.timestamp()
         run_id = run_id or self._new_run_id()
@@ -665,6 +673,7 @@ class TaskPipeline:
                 max_fix_iterations=max_fix_iterations, cancellation=token,
                 conversation_context=conversation_context,
                 started_ms=started,
+                worktree=worktree,
             )
         finally:
             budget_tracker = getattr(getattr(self, "router", None), "budget", None)
@@ -705,6 +714,7 @@ class TaskPipeline:
         conversation_context: str,
         cancellation: CancellationToken,
         started_ms: float,
+        worktree: Optional[str | Path] = None,
     ) -> PipelineResult:
         state = TaskState(run_id=run_id, goal=goal)
         conversation_context = str(conversation_context or "").strip()[-8000:]
@@ -758,6 +768,7 @@ class TaskPipeline:
                 "react": bool(react),
                 "approve": approve,
                 "conversation_context": conversation_context,
+                "worktree": str(worktree) if worktree else "",
             },
         )
         executor = self.build()
@@ -923,7 +934,7 @@ class TaskPipeline:
                 # prefix where the brief and the skills should have been.
                 # ``_repo_root()`` is the one resolver the rest of the pipeline
                 # uses, so the brief now sees the same tree the run writes to.
-                repo_root=self._repo_root(),
+                repo_root=self._brief_root(ctx),
                 task_kind=getattr(kind_obj, "kind", "") or "",
                 task_evidence=getattr(kind_obj, "evidence", "") or "",
             )
@@ -1704,6 +1715,29 @@ class TaskPipeline:
             return ""
         return ("\n\nTarget files — copy hunk context lines VERBATIM from here and "
                 "match their real line numbers:\n\n" + "\n\n".join(blocks))
+
+    def _brief_root(self, ctx: Any) -> Path:
+        """The tree the brief should measure: the one this run writes to.
+
+        A goal run works in an isolated copy of the repository.  The brief was
+        built against the configured root — the *destination* — while the run
+        edited the *copy*, so it reported ``files: 0`` and quoted no source.
+        Measured live: a document goal about the decision ladder invented a
+        ladder that does not exist, because the module it was describing was
+        never in the tree the brief looked at.
+
+        The run's own worktree wins when it is set and is a directory; the
+        configured root is the fallback, which is what a plain ``run`` wants.
+        """
+        raw = str(getattr(ctx, "extras", {}).get("worktree") or "")
+        if raw:
+            candidate = Path(raw)
+            try:
+                if candidate.is_dir():
+                    return candidate.resolve()
+            except OSError:
+                pass
+        return self._repo_root()
 
     def _repo_root(self) -> Path:
         """The repository this pipeline writes to.
