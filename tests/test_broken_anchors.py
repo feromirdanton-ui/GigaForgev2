@@ -76,14 +76,20 @@ class TestTheGateIsWiredIntoThePipeline:
             "or no mode sees it"
         )
 
-    def test_run_attaches_the_same_verifier_as_goal(self) -> None:
-        """``run`` graded the same artifact more weakly than ``goal``."""
+    def test_run_does_not_pass_a_verifier_the_pipeline_does_not_accept(self) -> None:
+        """``run`` must not pass ``verifier=`` to ``TaskPipeline.run``.
+
+        The first fix attached a ``WorkspaceVerifier`` to ``run`` — but
+        ``TaskPipeline.run`` has no ``verifier`` parameter, so every ``run``
+        invocation died with ``TypeError`` before doing anything.  The anchor
+        gate lives in the pipeline's own per-file structural check, which every
+        mode runs; a verifier is not the mechanism.
+        """
         import inspect
 
         from gigaforge.cli.app import run as run_command
 
         source = inspect.getsource(run_command)
-        assert "WorkspaceVerifier(" in source, (
-            "run must verify; without a verifier its report says "
-            "verification: None and every HTML defect passes"
+        assert "verifier=" not in source, (
+            "run must not pass a verifier the pipeline does not accept"
         )

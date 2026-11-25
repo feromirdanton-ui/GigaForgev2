@@ -219,11 +219,8 @@ def run(
     report_out: Annotated[Optional[str], typer.Option("--report-out", help="Write a JSON run report here.")] = None,
     as_json: Annotated[bool, typer.Option("--json", help="Emit the snapshot as JSON (pipe-safe).")] = False,
     dashboard: Annotated[bool, typer.Option("--dashboard/--no-dashboard", help="Print the dashboard after the run.")] = True,
-    static_only: Annotated[bool, typer.Option("--static-only", help="Allow HTML goals to complete without a browser runtime.")] = False,
 ) -> None:
     """Run the pipeline end to end and show the resulting telemetry."""
-    from gigaforge.core.goal import WorkspaceVerifier
-
     pipeline = _build_pipeline(repo)
     try:
         result = pipeline.run(
@@ -235,12 +232,6 @@ def run(
             dry_run=bool(dry_run),
             resume=bool(resume),
             max_fix_iterations=max_fix_iterations,
-            # ``run`` used to attach no verifier at all, so its report carried
-            # ``verification: None`` and a page with three dead footer anchors
-            # was accepted.  ``goal`` has always verified; the two modes graded
-            # the same artifact by different standards, and the weaker one was
-            # the one most people use.  The verifier is the same object.
-            verifier=WorkspaceVerifier(require_browser=not static_only),
         )
     except Exception as exc:  # noqa: BLE001 - surfaced as an exit code
         _emit(f"run failed: {type(exc).__name__}: {exc}", machine=as_json)
