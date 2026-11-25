@@ -798,6 +798,39 @@ def _default_css(accent: str, secondary: str) -> str:
             padding: 1.5rem;
             background: rgba(255, 255, 255, 0.03);
         }}
+        /* A child model that has seen Bootstrap writes
+           ``.feature-grid > .container > .grid > .row > .col-md-6.col-lg-3``.
+           The rules above then match nothing: measured in headless Chromium on
+           the live page, ``.feature-grid`` resolved to ``display: block`` with
+           ONE child (the container), and the four cards stacked vertically at
+           1440px each.  The page "had four cards" and was not a grid.
+
+           The harness cannot know which wrapper names a model will invent, so
+           the invariant is stated structurally instead of by class name: any
+           element that is the sole child of a grid container becomes a grid
+           too, and any ``.row``/``.grid``/``.col-*`` is laid out as one.  This
+           is emitted last, so it wins over the model's own rules. */
+        .feature-grid > :only-child,
+        .features-grid > :only-child,
+        .grid, .row {{
+            display: grid;
+            gap: 1.5rem;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            width: 100%;
+        }}
+        .feature-grid > :only-child > :only-child,
+        .grid > .row {{
+            display: grid;
+            gap: 1.5rem;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            width: 100%;
+        }}
+        [class*="col-"] {{
+            min-width: 0;
+            width: auto !important;
+            max-width: none !important;
+            flex: 1 1 240px;
+        }}
         @keyframes glitch {{
             0% {{ transform: translate(0); text-shadow: 0 0 0 transparent; }}
             20% {{ transform: translate(-2px, 2px); text-shadow: 2px 0 var(--secondary); }}
