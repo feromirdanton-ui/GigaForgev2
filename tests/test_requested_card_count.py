@@ -34,7 +34,7 @@ from gigaforge.harness.generation import plan_generation
         ("a features grid with 4 cards", 4),
         ("4 feature cards", 4),
         ("a grid with 12 tiles", 12),
-        ("six panels", 0),  # a word, not a digit: not guessed at
+        ("six panels", 6),  # a word is still a number the user wrote
         ("a grid with 2 columns", 2),
     ],
 )

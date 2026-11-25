@@ -721,6 +721,15 @@ def _without_style_and_script(html: str) -> str:
     return text
 
 
+#: Number words a goal may use instead of digits.  Only the small ones: a goal
+#: that says "twenty cards" is not a landing page, and the 1..24 guard below
+#: would reject it anyway.
+_NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+}
+
+
 def requested_card_count(goal: str) -> int:
     """How many cards the goal asked for, or 0 when it did not say.
 
@@ -736,6 +745,12 @@ def requested_card_count(goal: str) -> int:
     text = (goal or "").lower()
     if not text:
         return 0
+    # A goal written in prose says "four cards", not "4 cards".  Measured live:
+    # the goal asked for "a feature grid with four cards", the page shipped
+    # three, and the contract passed it because the number was a word.  The
+    # count is a fact about the request either way.
+    for word, value in _NUMBER_WORDS.items():
+        text = re.sub(rf"\b{word}\b", str(value), text)
     pattern = re.compile(
         r"(?<![\d.])(\d{1,2})(?![\d.])\s*(?:[\w-]+\s+){0,2}?"
         r"(?:cards?|tiles?|panels?|items?|columns?|boxes?)\b"

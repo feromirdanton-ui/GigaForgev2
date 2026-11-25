@@ -111,6 +111,19 @@ class GenerationPlan:
     def ok(self) -> bool:
         return bool(self.sections)
 
+    @property
+    def card_count(self) -> int:
+        """How many cards the goal asked for, or 0 when it did not say.
+
+        The number is in the goal's own words ("a feature grid with four
+        cards"), so the harness can read it instead of asking a model to count
+        what it wrote.  Zero means "the goal did not say", and a page whose
+        plan says nothing about cards is left exactly as the child wrote it.
+        """
+        from gigaforge.harness.goal_contract import requested_card_count
+
+        return requested_card_count(self.goal)
+
     def kinds(self) -> list[str]:
         return [section.kind for section in self.sections]
 
@@ -846,6 +859,69 @@ def _layout_invariants() -> str:
     )
 
 
+def _normalise_cards(fragment: str, section: Any, plan: Any) -> str:
+    """Drop empty cards and bring the card count up to what the plan promised.
+
+    Two defects, one cause: the harness knew the answer and let the model
+    decide it.  A child returned ``<div class="feature-card">`` with no
+    content, and the page shipped a blank card; it also returned three cards
+    where the goal asked for four.  Both are countable facts about markup the
+    harness already holds.
+
+    Only the features section is touched, and only when the plan states a
+    count: a page whose plan says nothing about cards is left exactly as the
+    child wrote it.
+    """
+    kind = getattr(section, "kind", "")
+    if kind not in ("features", "feature_grid", "grid"):
+        return fragment
+    wanted = int(getattr(plan, "card_count", 0) or 0)
+    if wanted <= 0:
+        return fragment
+
+    # An empty card is a card element whose inner text is blank.
+    def _is_empty(match: "re.Match[str]") -> bool:
+        inner = re.sub(r"<[^>]+>", "", match.group(2))
+        return not inner.strip()
+
+    pattern = re.compile(
+        r'(<div\s+class="[^"]*feature-card[^"]*"[^>]*>)(.*?)(</div>)',
+        re.DOTALL,
+    )
+    kept: list[str] = []
+    for match in pattern.finditer(fragment):
+        if _is_empty(match):
+            continue
+        kept.append(match.group(0))
+
+    if not kept:
+        return fragment
+
+    # Rebuild the grid with the surviving cards, then top it up from the plan.
+    grid = re.search(
+        r'(<div\s+class="[^"]*(?:feature-grid|features-grid)[^"]*"[^>]*>)(.*?)(</div>\s*</section>)',
+        fragment,
+        re.DOTALL,
+    )
+    if grid is None:
+        return fragment
+
+    features = list(getattr(plan, "features", None) or [])
+    while len(kept) < wanted:
+        index = len(kept)
+        if index < len(features):
+            name, desc = features[index]
+        else:
+            name, desc = f"Feature {index + 1}", "Details to follow."
+        kept.append(
+            f'<div class="feature-card"><h3>{_escape(name)}</h3>'
+            f"<p>{_escape(desc)}</p></div>"
+        )
+
+    rebuilt = grid.group(1) + "".join(kept) + grid.group(3)
+    return fragment[: grid.start()] + rebuilt + fragment[grid.end():]
+
+
 def _fallback_section(section: "SectionSpec", plan: "GenerationPlan") -> str:
     """Minimal valid markup for a planned section whose child returned nothing.
 
@@ -921,6 +997,15 @@ def assemble_page(
         # produced markup.  Shipping its source renders the template as prose.
         if fragment and not _looks_like_markup(fragment):
             fragment = ""
+        if fragment:
+            # A child that emits an empty card has produced a grid with a hole
+            # in it.  Measured live on ``subagents``: the features child
+            # returned ``<div class="feature-card">`` with no content, so the
+            # page shipped three cards where the goal asked for four, and the
+            # first of them was blank.  The harness knows the plan's card count
+            # and can see the markup, so it settles both deterministically
+            # instead of asking the model to count.
+            fragment = _normalise_cards(fragment, section, plan)
         if not fragment:
             # A planned section with no fragment used to be skipped silently, so
             # the page came out missing a part the plan promised.  Measured live
