@@ -2109,6 +2109,20 @@ class TaskPipeline:
         # from what was gathered.  That is also the cheapest possible structure:
         # the synthesis sees the observations, not the whole trajectory.
         text = self._synthesize_answer(ctx, goal, text, citations, searched, result)
+        # A search-backed answer must name its sources, and the gate enforces it.
+        # Measured live: the episode really searched (6 real Wikipedia URLs were
+        # observed) and the synthesis wrote a good answer — but it cited none of
+        # them, so ``_validate_answer`` rejected the run with "the answer used
+        # web results but cites none of them".  The gate was right; the writer
+        # was wrong.
+        #
+        # Asking the model to remember to cite is a hope.  Appending the
+        # observed URLs is a fact: they came from the tool, not from the model,
+        # so this cannot invent a source.  It runs only when the reply cites
+        # nothing, so a model that already cites keeps its own formatting.
+        if searched and citations and not re.search(r"https?://", text):
+            listed = "\n".join(f"- {url}" for url in citations[:8])
+            text = f"{text}\n\nSources:\n{listed}" if text else f"Sources:\n{listed}"
         ctx.extras["answer_text"] = text
         ctx.extras["answer_citations"] = citations
         ctx.extras["answer_searched"] = searched
