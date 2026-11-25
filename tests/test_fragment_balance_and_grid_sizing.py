@@ -207,3 +207,34 @@ def test_a_mangled_closing_tag_is_removed():
     out = _balance_fragment('<section class="hero"><h1>H</h1></section>\n/div>')
     assert "/div>" not in out
     assert out.endswith("</section>")
+
+
+def test_a_dead_anchor_becomes_plain_text():
+    """A link to a section that does not exist is unwrapped, not deleted.
+
+    Measured live on ``subagents``: the footer child wrote
+    ``<a href="#about">About</a>`` and ``<a href="#contact">Contact</a>``, and
+    the plan has no such sections.  The page was rejected with "internal links
+    target missing ids: #about, #contact" after 17 752 tokens.
+    """
+    from gigaforge.harness.generation import _drop_dead_anchors
+
+    page = (
+        '<section id="hero"><a href="#features">Go</a>'
+        '<a href="#about">About</a></section>'
+        '<section id="features"><p>x</p></section>'
+        '<footer id="footer"><a href="#contact">Contact</a></footer>'
+    )
+    out = _drop_dead_anchors(page)
+    assert 'href="#about"' not in out
+    assert 'href="#contact"' not in out
+    assert 'href="#features"' in out
+    # The reader still needs the label.
+    assert "About" in out and "Contact" in out
+
+
+def test_a_live_anchor_is_untouched():
+    from gigaforge.harness.generation import _drop_dead_anchors
+
+    page = '<section id="a"><a href="#b">B</a></section><section id="b"></section>'
+    assert _drop_dead_anchors(page) == page

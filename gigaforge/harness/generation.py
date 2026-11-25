@@ -683,6 +683,41 @@ def _drop_foreign_sections(fragment: str, kind: str, kinds: set[str]) -> str:
     return pattern.sub("", fragment).strip()
 
 
+def _drop_dead_anchors(page: str) -> str:
+    """Turn a link to a section that does not exist into plain text.
+
+    Measured live on ``subagents`` at HEAD 4d52e0b: the footer child wrote
+    ``<a href="#about">About</a>`` and ``<a href="#contact">Contact</a>``, and
+    the plan has no such sections.  The page was rejected with "internal links
+    target missing ids: #about, #contact" — correctly, because both links went
+    nowhere, and the run ended needs_attention after 17 752 tokens.
+
+    The harness knows every id on the page, so it can see the dead link.  It
+    cannot invent the section the child meant, and it must not delete the
+    label — the reader still needs to see "About".  So the anchor is unwrapped:
+    the text stays, the link goes.
+    """
+    if not page:
+        return page
+    ids = set(re.findall(r"\bid\s*=\s*[\"']([^\"']+)[\"']", page))
+    if not ids:
+        return page
+
+    def unwrap(match: re.Match[str]) -> str:
+        target = match.group("target")
+        if target in ids:
+            return match.group(0)
+        return match.group("label")
+
+    return re.sub(
+        r"<a\b[^>]*\bhref\s*=\s*[\"']#(?P<target>[^\"']+)[\"'][^>]*>"
+        r"(?P<label>.*?)</a\s*>",
+        unwrap,
+        page,
+        flags=re.S | re.I,
+    )
+
+
 def _ensure_section_id(fragment: str, kind: str) -> str:
     """Give a section the anchor its own name promises.
 
@@ -894,7 +929,7 @@ def assemble_page(
     # owns the *structure* — one grid, wrapping, a minimum card width — and the
     # child owns the look.
     base_css = base_css + "\n" + _layout_invariants()
-    return (
+    page = (
         "<!DOCTYPE html>\n"
         '<html lang="en">\n'
         "<head>\n"
@@ -909,6 +944,8 @@ def assemble_page(
         + "\n".join(body_parts)
         + "\n</body>\n</html>\n"
     )
+    # Last, because it needs every id the page ended up with.
+    return _drop_dead_anchors(page)
 
 
 def _escape(text: str) -> str:
