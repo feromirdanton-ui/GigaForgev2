@@ -165,3 +165,45 @@ def test_assembly_gives_every_planned_section_an_id():
     page = assemble_page(plan, fragments)
     for section in plan.sections:
         assert f'id="{section.kind}"' in page, section.kind
+
+
+def test_a_sibling_section_pasted_into_a_fragment_is_dropped():
+    """A child is asked for one section; a sibling is not its to write.
+
+    Measured live on ``run``: the hero child returned its own section **and** a
+    complete ``<section class="features-grid">`` with a broken
+    ``<!-- more cards h</div>>`` comment.  The page carried two feature
+    sections and the grid laid out ``1392px 0px 0px 0px 0px``.
+    """
+    from gigaforge.harness.generation import _drop_foreign_sections
+
+    hero = (
+        '<section class="hero"><div class="container"><h1>H</h1></div></section>'
+        '<section class="features-grid"><div class="container"><h2>Features</h2>'
+        '<div class="row"><div class="col-md-3 feature-card"><h3>P</h3></div>'
+        "</div></div></section>"
+    )
+    out = _drop_foreign_sections(hero, "hero", {"hero", "features", "footer"})
+    assert "features-grid" not in out
+    assert 'class="hero"' in out
+
+
+def test_a_nested_section_inside_a_card_is_kept():
+    from gigaforge.harness.generation import _drop_foreign_sections
+
+    fragment = (
+        '<section class="features"><div class="grid">'
+        '<div class="feature-card"><section class="quote"><p>q</p></section></div>'
+        "</div></section>"
+    )
+    out = _drop_foreign_sections(fragment, "features", {"hero", "features"})
+    assert 'class="quote"' in out
+
+
+def test_a_mangled_closing_tag_is_removed():
+    """``/div>`` — a closing tag with the ``<`` eaten — rendered as prose."""
+    from gigaforge.harness.generation import _balance_fragment
+
+    out = _balance_fragment('<section class="hero"><h1>H</h1></section>\n/div>')
+    assert "/div>" not in out
+    assert out.endswith("</section>")

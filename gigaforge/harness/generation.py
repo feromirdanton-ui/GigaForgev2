@@ -607,7 +607,12 @@ def _balance_fragment(fragment: str) -> str:
     out.append(fragment[cursor:])
     while stack:
         out.append(f"</{stack.pop()}>")
-    return "".join(out).strip()
+    text = "".join(out)
+    # A child that mangled its own markup leaves fragments like ``/div>`` —
+    # a closing tag with the ``<`` eaten.  Measured live on ``run``: the hero
+    # fragment ended with ``</div>/div>`` and the stray text rendered as prose.
+    text = re.sub(r"(?<![<\w])/([a-zA-Z][a-zA-Z0-9-]*)>", "", text)
+    return text.strip()
 
 
 #: A unified-diff header, a hunk header, or a ``--- a/…``/``+++ b/…`` pair.
@@ -647,6 +652,35 @@ def _added_lines_of(patch: str) -> str:
         if line.startswith("+"):
             kept.append(line[1:])
     return "\n".join(kept).strip()
+
+
+def _drop_foreign_sections(fragment: str, kind: str, kinds: set[str]) -> str:
+    """Remove a whole sibling section a child pasted into its own fragment.
+
+    Measured live on ``run`` (the agent path): the hero child returned its own
+    ``<section class="hero">`` **and** a complete
+    ``<section class="features-grid">`` with a broken ``<!-- more cards h</div>>``
+    comment.  The assembler pasted both in, so the page carried two feature
+    sections — one with a single card, one with four — and the grid laid out
+    ``1392px 0px 0px 0px 0px``: the first child took the whole width.
+
+    A child is asked for one section.  A section it was not asked for is not
+    its to write, and the harness already has a fragment for it.  Only a
+    *top-level* section of another planned kind is dropped, so a nested
+    ``<section>`` inside a card is left alone.
+    """
+    if not fragment or not kinds:
+        return fragment
+    others = {k for k in kinds if k and k != kind}
+    if not others:
+        return fragment
+    pattern = re.compile(
+        r"<section\b[^>]*\bclass\s*=\s*[\"'][^\"']*\b("
+        + "|".join(re.escape(k) for k in sorted(others))
+        + r")\b[^\"']*[\"'][^>]*>.*?</section\s*>",
+        re.S | re.I,
+    )
+    return pattern.sub("", fragment).strip()
 
 
 def _ensure_section_id(fragment: str, kind: str) -> str:
@@ -814,6 +848,11 @@ def assemble_page(
             raw = existing.get(section.kind, "")
             reused = bool(raw.strip())
         fragment = _strip_document_wrapper(raw)
+        # A child is asked for one section; a sibling section it pasted in is
+        # not its to write, and the harness has its own fragment for it.
+        fragment = _drop_foreign_sections(
+            fragment, section.kind, {s.kind for s in plan.sections}
+        )
         if not fragment:
             # A planned section with no fragment used to be skipped silently, so
             # the page came out missing a part the plan promised.  Measured live
