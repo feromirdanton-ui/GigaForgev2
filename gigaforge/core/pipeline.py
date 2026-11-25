@@ -3439,6 +3439,7 @@ class TaskPipeline:
                             file=raw, error=str(exc)[:200])
                 continue
             unmet.extend(f"HTML structure: {issue}" for issue in report.issues())
+            unmet.extend(_broken_anchors(page.read_text(encoding="utf-8", errors="replace")))
         return unmet
 
     def _check_goal_contract(self, ctx: RunContext, changed: Sequence[str]) -> Any:
@@ -4316,6 +4317,32 @@ def _citations_from(result: Any) -> list[str]:
             if url not in urls:
                 urls.append(url)
     return urls
+
+
+def _broken_anchors(html: str) -> list[str]:
+    """In-page links whose target id does not exist.
+
+    **Measured live** on the cyberpunk landing page, agent mode: the footer
+    linked ``#about``, ``#contact`` and ``#terms`` while the page defined only
+    ``id="top"``.  Clicking any of them does nothing — a defect a browser shows
+    and no tag-level check sees.  The run was accepted, because ``run`` does not
+    attach a verifier at all and the structural audit did not look at anchors.
+
+    ``href="#"`` is not a broken anchor: it is the conventional "top of page"
+    link and has no target by design.  A link to another document
+    (``page.html#x``) is out of scope here — this checks one file.
+    """
+    import re as _re
+
+    ids = set(_re.findall(r"""\bid\s*=\s*["']([^"']+)["']""", html, _re.I))
+    broken: list[str] = []
+    for href in _re.findall(r"""\bhref\s*=\s*["']#([^"']+)["']""", html, _re.I):
+        target = href.strip()
+        if target and target not in ids and target not in broken:
+            broken.append(target)
+    if not broken:
+        return []
+    return ["internal links target missing ids: " + ", ".join(f"#{b}" for b in broken[:8])]
 
 
 def _drop_hunks_for(diff: str, paths: set[str]) -> str:
