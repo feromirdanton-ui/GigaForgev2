@@ -113,7 +113,23 @@ class TestArtifactDetection:
         assert kind.kind == "code"
 
     def test_no_path_no_phrase_defaults_to_code(self, repo: Path) -> None:
+        """A mutating goal with no named path is code work, not a chat reply.
+
+        ``Make the tests pass`` changes the tree, so ``answer`` would be wrong —
+        it would refuse to do the work.  The verdict is code; the evidence says
+        which verb decided it.
+        """
         kind = classify_task("Make the tests pass", repo)
+        assert kind.kind == "code"
+        assert "make" in kind.evidence
+
+    def test_a_goal_with_neither_signal_defaults_to_code(self, repo: Path) -> None:
+        """No path, no page phrase, no mutating verb and no question: code.
+
+        The safe default is code: a wrong ``code`` verdict edits a file the user
+        named, while a wrong ``answer`` verdict refuses to do the work at all.
+        """
+        kind = classify_task("The parser and the emitter", repo)
         assert kind.kind == "code"
         assert "defaulting to code" in kind.evidence
 

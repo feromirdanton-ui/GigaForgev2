@@ -151,6 +151,16 @@ class PipelineResult:
     cache_hit_rate: float = 0.0
     cache_hits: int = 0
     cache_lookups: int = 0
+    #: The reply, when the goal asked for one.  Empty for a diff-producing run.
+    #: This is the field the harness did not have: every run had to end in a
+    #: unified diff, so a goal whose correct output is a sentence was rejected
+    #: ("diff could not be parsed") or died in the planner ("steps: 0").
+    answer: str = ""
+    #: URLs the answer's search actually returned.  Kept apart from the reply so
+    #: a report can tell "cited what it read" from "wrote a plausible URL".
+    answer_citations: list[str] = field(default_factory=list)
+    #: Did the episode use ``web_search`` at all?
+    answer_searched: bool = False
     #: Things the run could not do and did not fail on.  A silent ``except``
     #: that swallows a broken check makes a run look clean when it was merely
     #: unverified; every such degradation is recorded here instead.
@@ -208,6 +218,13 @@ class PipelineResult:
             "contract_unmet": list(self.contract_unmet),
             "completeness": self.completeness,
             "summary": self.summary,
+            # The reply, when the goal asked for one.  ``to_dict`` is what the
+            # CLI's ``--json`` and a report are built from, so a field missing
+            # here is a field the product never delivers: the answer was
+            # produced, accepted, and then dropped by the serialiser.
+            "answer": self.answer,
+            "answer_citations": list(self.answer_citations),
+            "answer_searched": self.answer_searched,
             "plan": list(self.plan),
             "duration_ms": round(self.duration_ms, 3),
             "resumed_from": list(self.resumed_from),
@@ -544,7 +561,8 @@ class TaskPipeline:
                 name="settle",
                 fn=self._node_settle,
                 requires=("proposal", "validation", "fix_report", "review_verdict", "repair_report"),
-                provides=("final_diff", "accepted", "changed_files"),
+                provides=("final_diff", "accepted", "changed_files",
+                          "answer", "answer_citations", "answer_searched"),
                 retries=0,
                 description="join node: pick the diff that won, then apply the review veto",
             ),
@@ -1173,6 +1191,28 @@ class TaskPipeline:
         )
         return runner
 
+    def _task_kind(self, ctx: RunContext) -> Any:
+        """The run's task kind, classified **once** and cached on the context.
+
+        ``classify_task`` was called from two places, both under conditions
+        (``_subagent_diff`` after an early return, ``_node_act`` only when
+        nothing was prefetched), so ``ctx.extras["task_kind"]`` could stay unset
+        on an ordinary run — and ``_check_render`` gates on it, which meant the
+        browser check silently did not run.  One call, at the first node that
+        needs it, and every later reader gets the same verdict.
+        """
+        cached = ctx.extras.get("task_kind_obj")
+        if cached is not None:
+            return cached
+        from gigaforge.harness.task_kind import classify_task
+
+        kind = classify_task(_original_goal(ctx.state.goal), self._repo_root())
+        ctx.extras["task_kind_obj"] = kind
+        ctx.extras["task_kind"] = kind.to_dict()
+        self._event("pipeline.task_kind", run_id=ctx.run_id,
+                    task_kind=kind.kind, evidence=kind.evidence[:300])
+        return kind
+
     def _node_plan(self, ctx: RunContext, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
         if inputs.get("cache_hit"):
             # The cached entry already holds the diff this exact task + slice +
@@ -1182,6 +1222,18 @@ class TaskPipeline:
             return {
                 "plan": [],
                 "plan_meta": {"strategy": self.plan_strategy.name, "cached": True, "steps": 0},
+            }
+        # An answer goal has no executable steps to plan: its output is a reply.
+        # The planner demands a step with a target file, so it returned
+        # ``steps: 0`` and the run died here — measured live on "What is 2+2?
+        # Answer in chat, do not change any files."  The plan for a reply is the
+        # reply itself, produced by the episode in ``act``.
+        if _task_kind_for(self, ctx).is_answer:
+            self._event("pipeline.plan_answer", run_id=ctx.run_id,
+                        reason="the goal asks for a reply, not a change to the tree")
+            return {
+                "plan": ["Answer the question from the repository and the web."],
+                "plan_meta": {"strategy": "answer", "steps": 1, "answer": True},
             }
         if self.router is None:
             raise PipelineError("no model client is wired into the pipeline")
@@ -2005,6 +2057,125 @@ class TaskPipeline:
                     rejected=len(rejected) + len(report.rejected))
         return report.diff
 
+    def _answer_proposal(self, ctx: RunContext) -> Mapping[str, Any]:
+        """Answer the goal with an episode, and return the reply as the proposal.
+
+        **Why this is a separate path and not a prompt tweak.**  The harness had
+        exactly one output channel: a unified diff.  A goal whose correct output
+        is a sentence therefore had nowhere to go — measured live, "What is
+        2+2? Answer in chat, do not change any files." died at ``plan`` with
+        ``steps: 0``, and a web-search goal was rejected with "diff could not be
+        parsed: no file sections found in diff" *after* the search had really
+        run and returned real results.  The tool worked; the product refused to
+        deliver what it produced.
+
+        The episode is the right executor because it already has both halves:
+        the repository tools (so "what does this repo do" is answerable) and
+        ``web_search`` (budgeted, cached, honest when offline).  Its ``finish``
+        prose is the deliverable, and the citations it saw are carried out so
+        the acceptance gate can check that a search-backed answer names its
+        sources instead of inventing them.
+
+        The proposal carries the reply in ``text`` and an **empty** ``diff``.
+        That is the point: ``validate`` must not demand a diff for a reply, and
+        ``settle`` must accept on the answer's own terms.
+        """
+        goal = _original_goal(ctx.state.goal)
+        runner = self._build_react_runner(goal, run_id=ctx.run_id)
+        if runner is None:
+            return {
+                "proposal": ProposeResult(
+                    text="", diff="", phase="answer", model="",
+                ),
+                "proposal_source": "answer-unavailable",
+            }
+        from gigaforge.agents.engine import run_react
+
+        result = run_react(
+            runner, goal, runner.state, ctx=runner.ctx,
+            thread_id=f"{ctx.run_id}-answer",
+        )
+        text = str(getattr(result, "final_text", "") or "").strip()
+        citations = _citations_from(result)
+        searched = any(str(s.get("action") or "") == "web_search"
+                       for s in (getattr(result, "steps", None) or []))
+        # The episode's ``finish`` prose is frequently a *narration of its own
+        # progress* — measured live: "The calculation of 2+2 returned 4, which is
+        # correct. Now, I need to finish the task as required." That is a status
+        # line, not an answer, and delivering it would be the harness mistaking
+        # its own telemetry for the user's deliverable.
+        #
+        # So the episode's job is to *gather*; one clean call writes the answer
+        # from what was gathered.  That is also the cheapest possible structure:
+        # the synthesis sees the observations, not the whole trajectory.
+        text = self._synthesize_answer(ctx, goal, text, citations, searched, result)
+        ctx.extras["answer_text"] = text
+        ctx.extras["answer_citations"] = citations
+        ctx.extras["answer_searched"] = searched
+        self._event(
+            "pipeline.answer", run_id=ctx.run_id,
+            chars=len(text), citations=len(citations),
+            searched=bool(ctx.extras["answer_searched"]),
+            finish_reason=str(getattr(result, "finish_reason", "")),
+        )
+        return {
+            "proposal": ProposeResult(
+                text=text, diff="", phase="answer",
+                model=str(getattr(self.router, "last_model", "") or ""),
+                raw=result,
+            ),
+            "proposal_source": "answer",
+        }
+
+    def _synthesize_answer(self, ctx: RunContext, goal: str, narration: str,
+                           citations: Sequence[str], searched: bool,
+                           episode: Any) -> str:
+        """Write the reply from what the episode observed, not from its notes.
+
+        Two inputs, in order of authority:
+
+        1. the **observations** — tool output the episode actually saw;
+        2. the episode's own ``finish`` prose — often a status line.
+
+        When there are no observations at all (a pure arithmetic question needs
+        no tools), the narration is the only content there is and it is passed
+        through.  Otherwise one cheap call writes the answer, with a prompt that
+        forbids narrating its own process: the user asked the question, not for
+        a transcript of the run.
+
+        A synthesis failure is a degradation, not a run failure: the narration
+        is still delivered rather than losing an accepted answer to a second
+        call going wrong.
+        """
+        observations: list[str] = []
+        for step in getattr(episode, "steps", None) or []:
+            observed = str(step.get("observation") or "").strip()
+            if observed:
+                observations.append(f"- {str(step.get('action') or 'tool')}: {observed[:1500]}")
+        if not observations and not searched:
+            return narration
+        material = "\n".join(observations[:12]) or "(no tool output)"
+        prompt = build_phase_prompt(
+            "summarize",
+            goal=goal,
+            extra_blocks=[
+                ("What the tools returned", material),
+                ("Citation URLs (use only these)", "\n".join(citations[:20]) or "(none)"),
+                ("Instruction",
+                 "Write the final answer for the person who asked. Address the "
+                 "question directly and completely. Do not describe your process, "
+                 "your plan, or what you are about to do — no 'now I need to' and "
+                 "no narration of steps. If you cite a source, use only a URL "
+                 "from the list above. Be concise."),
+            ],
+        )
+        try:
+            produced = self._ask("summarize", prompt.render(), ctx).strip()
+        except Exception as exc:  # noqa: BLE001 - the narration is still deliverable
+            self._degraded("answer_synthesis", exc, "act")
+            return narration
+        return produced or narration
+
     def _node_act(self, ctx: RunContext, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
         if inputs.get("cache_hit"):
             return {
@@ -2014,6 +2185,14 @@ class TaskPipeline:
             }
         if self.router is None:
             raise PipelineError("no model client is wired into the pipeline")
+
+        # An answer goal is answered, not coded.  The coder is asked for a diff;
+        # a reply has none, so the run either produced nothing or was rejected
+        # for "diff could not be parsed".  The episode is the right executor: it
+        # has the repository tools AND ``web_search``, and its ``finish`` prose
+        # is the deliverable.
+        if _task_kind_for(self, ctx).is_answer:
+            return self._answer_proposal(ctx)
 
         slice_obj = inputs.get("slice")
         slice_text = slice_obj.render() if slice_obj is not None else ""
@@ -2432,9 +2611,63 @@ class TaskPipeline:
                         tests=bool(findings.get("tests_failed")))
         return findings
 
+    def _validate_answer(self, ctx: RunContext, proposal: Any) -> ValidateResult:
+        """Accept a reply on the facts a reply can be held to.
+
+        Three checks, all deterministic:
+
+        * the reply is not empty (an empty answer is a failed run, not a terse one);
+        * if the episode searched, the reply names at least one URL it actually
+          saw — a search-backed answer with no citation is a claim without a
+          source, and the harness has the observations to prove it;
+        * the reply does not cite a URL that appears in no observation — that is
+          an invented source, the one failure mode a search tool exists to
+          prevent.
+
+        No diff is required, and none is expected.
+        """
+        text = str(getattr(proposal, "text", "") or "").strip()
+        if not text:
+            return ValidateResult(
+                accepted=False, applied=False,
+                reason="the run produced no answer text",
+            )
+        citations = list(ctx.extras.get("answer_citations") or [])
+        searched = bool(ctx.extras.get("answer_searched"))
+        cited_in_reply = [
+            m.group(0).rstrip(".,;:")
+            for m in re.finditer(r"https?://[^\s<>\"')\]]+", text)
+        ]
+        if searched and not citations:
+            return ValidateResult(
+                accepted=False, applied=False,
+                reason="the episode searched the web but no result URL was observed",
+            )
+        invented = [u for u in cited_in_reply if u not in citations]
+        if invented:
+            return ValidateResult(
+                accepted=False, applied=False,
+                reason="the answer cites URL(s) no observation returned: "
+                       + ", ".join(invented[:3]),
+            )
+        if searched and not cited_in_reply:
+            return ValidateResult(
+                accepted=False, applied=False,
+                reason="the answer used web results but cites none of them",
+            )
+        return ValidateResult(
+            accepted=True, applied=False, changed_files=[],
+            reason=f"answer accepted ({len(text)} chars, {len(citations)} citation(s))",
+        )
+
     def _node_validate(self, ctx: RunContext, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
         proposal = inputs.get("proposal")
         diff = getattr(proposal, "diff", "") or ""
+        # An answer is validated on its own terms: a non-empty reply, and — when
+        # the episode searched — at least one citation that came from a real
+        # observation.  Demanding a diff here is what made every reply fail.
+        if _task_kind_for(self, ctx).is_answer:
+            return {"validation": self._validate_answer(ctx, proposal)}
         if not diff:
             return {"validation": ValidateResult(accepted=False, reason="no diff to validate")}
 
@@ -2903,6 +3136,24 @@ class TaskPipeline:
         if repaired:
             final = _merge_repaired_diff(final, repaired)
         validated = bool(validation and validation.accepted)
+        # An answer goal settles on its own verdict.  The artifact/code gates
+        # below all ask "is the tree right?", which is not a question a reply
+        # can answer: running them would reject every answer for having no
+        # changed files.
+        if _task_kind_for(self, ctx).is_answer:
+            answer = str(ctx.extras.get("answer_text") or "")
+            self._event(
+                "pipeline.settle_answer", run_id=ctx.run_id,
+                accepted=validated, chars=len(answer),
+            )
+            return {
+                "accepted": validated,
+                "changed_files": [],
+                "final_diff": "",
+                "answer": answer,
+                "answer_citations": list(ctx.extras.get("answer_citations") or []),
+                "answer_searched": bool(ctx.extras.get("answer_searched")),
+            }
         verdict = inputs.get("review_verdict") or {}
         review_rejected = str((verdict or {}).get("verdict") or "ok") == "reject"
         # The review stage can only ever *narrow* an acceptance: a diff the
@@ -3019,7 +3270,13 @@ class TaskPipeline:
         self._event("pipeline.settle", run_id=ctx.run_id, accepted=accepted,
                     diff_chars=len(final), files=len(changed),
                     reviewed=bool(verdict), review_rejected=review_rejected)
-        return {"final_diff": final, "accepted": accepted, "changed_files": changed}
+        return {
+            "final_diff": final, "accepted": accepted, "changed_files": changed,
+            # Declared in ``provides``, so they must be returned on every path.
+            # Empty here: this is a diff-producing run, and an empty answer is
+            # the honest value for it.
+            "answer": "", "answer_citations": [], "answer_searched": False,
+        }
 
     def _check_code_contract(self, ctx: RunContext, changed: Sequence[str]) -> list[str]:
         """Grade a code change: files, tests, linter, public symbols.
@@ -3304,6 +3561,15 @@ class TaskPipeline:
     def _node_summarize(self, ctx: RunContext, inputs: Mapping[str, Any]) -> Mapping[str, Any]:
         diff = str(inputs.get("final_diff", "") or "")
         accepted = bool(inputs.get("accepted"))
+        # An answer goal's summary IS the answer.  Summarising it through a
+        # second model call would paraphrase the deliverable and could drop a
+        # citation — and the citations are what the gate just checked.  Read
+        # from the context rather than a DAG artifact: the answer path is
+        # orthogonal to the diff graph, and wiring it as a dependency would make
+        # every graph that does not have an answer node fail to validate.
+        answer = str(ctx.extras.get("answer_text") or "")
+        if answer:
+            return {"summary": answer}
         cached_summary = str((ctx.extras.get("cached_value") or {}).get("summary", "") or "")
         if cached_summary:
             return {"summary": cached_summary}
@@ -3489,6 +3755,9 @@ class TaskPipeline:
             final_diff=final_diff,
             changed_files=list(artifacts.get("changed_files") or []),
             summary=str(artifacts.get("summary", "") or ""),
+            answer=str(artifacts.get("answer", "") or ""),
+            answer_citations=list(artifacts.get("answer_citations") or []),
+            answer_searched=bool(artifacts.get("answer_searched")),
             plan=list(artifacts.get("plan") or []),
             cache_hit=bool(artifacts.get("cache_hit")),
             slice_hash=state.slice_hash,
@@ -3987,6 +4256,44 @@ def _parse_plan(text: str) -> list[str]:
         if stripped:
             steps.append(stripped)
     return steps[:24]
+
+
+def _task_kind_for(owner: Any, ctx: RunContext) -> Any:
+    """The goal's task kind, tolerating a caller that predates ``_task_kind``.
+
+    Node functions are called directly by tests with a lightweight stand-in for
+    the pipeline, and those stand-ins have no ``_task_kind``.  Falling back to a
+    fresh classification keeps them working without weakening the product path,
+    which uses the cached verdict.
+    """
+    fn = getattr(owner, "_task_kind", None)
+    if callable(fn):
+        return fn(ctx)
+    from gigaforge.harness.task_kind import classify_task
+
+    root_fn = getattr(owner, "_repo_root", None)
+    root = root_fn() if callable(root_fn) else None
+    return classify_task(_original_goal(ctx.state.goal), root)
+
+
+def _citations_from(result: Any) -> list[str]:
+    """The URLs a search-backed answer actually saw.
+
+    Read from the episode's own observations, not from the reply text: a model
+    can write a plausible URL it never visited, and the acceptance gate must be
+    able to tell "cited what it read" from "invented a source".  Only URLs that
+    appear in a ``web_search`` observation count.
+    """
+    urls: list[str] = []
+    for step in getattr(result, "steps", None) or []:
+        if str(step.get("action") or "") != "web_search":
+            continue
+        observation = str(step.get("observation") or "")
+        for match in re.finditer(r"https?://[^\s<>\"')\]]+", observation):
+            url = match.group(0).rstrip(".,;:")
+            if url not in urls:
+                urls.append(url)
+    return urls
 
 
 def _drop_hunks_for(diff: str, paths: set[str]) -> str:

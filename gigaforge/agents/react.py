@@ -258,6 +258,14 @@ class ReActResult:
     #: these into a diff: the coder is asked for a diff, and a file the episode
     #: already produced is invisible to it otherwise.
     written_files: list[str] = field(default_factory=list)
+    #: The prose the model finished with, when it finished with prose.
+    #:
+    #: A ``finish`` whose ``action_input`` is not a plan is the model *answering*
+    #: — and the harness threw that answer away: it synthesised a plan from the
+    #: trajectory and kept nothing of what the model said.  For a goal whose
+    #: output is a reply ("what is 2+2", "search the web and summarise"), that
+    #: prose IS the deliverable.  Kept verbatim so the pipeline can return it.
+    final_text: str = ""
 
 
 # --- Built-in tools ---------------------------------------------------------
@@ -1226,6 +1234,9 @@ class ReActRunner:
                     continue
                 plan = self._parse_finish_plan(action_input)
                 if not plan:
+                    # The prose is kept: for an answer goal it is the
+                    # deliverable, not a malformed plan.
+                    result.final_text = (action_input or "").strip()
                     # The model said "finish" but its payload did not parse.
                     # Returning here with an empty plan threw away every
                     # observation the episode had paid for \u2014 measured live: the

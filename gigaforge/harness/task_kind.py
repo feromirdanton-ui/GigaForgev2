@@ -90,6 +90,46 @@ _KNOWN_SUFFIXES = frozenset(
 #: A path-like token: at least one dot, no spaces, no quotes.
 _PATH_RE = re.compile(r"[A-Za-z0-9_][\w./\\-]*\.[A-Za-z0-9]{1,8}\b")
 
+#: Verbs that ask for a *change to the tree*.  A goal containing one of these is
+#: never an ``answer`` goal, whatever else it says: "explain and fix the bug in
+#: app.py" is code work with an explanation attached, not a chat reply.
+_MUTATING_VERBS: tuple[str, ...] = (
+    "add", "create", "write", "build", "make", "generate", "implement",
+    "fix", "repair", "patch", "refactor", "rename", "move", "delete",
+    "remove", "update", "change", "edit", "modify", "replace", "rewrite",
+    "migrate", "install", "configure", "set up", "setup", "scaffold",
+    "оптимизир", "исправ", "добав", "созда", "напиши", "написать",
+    "перепиши", "удали", "измени", "обнови", "почини", "сгенерир",
+    "реализуй", "отрефактор", "переименуй", "внедри", "настрой",
+)
+
+#: Phrases that ask for a *reply*, not a change.  These are checked only after
+#: the filesystem and the mutating verbs have had their say, so a goal that
+#: names a file to change is never demoted to a chat answer.
+_ANSWER_PHRASES: tuple[str, ...] = (
+    "what is", "what's", "what are", "who is", "who was", "when did",
+    "where is", "why does", "why is", "how does", "how do", "how many",
+    "how much", "explain", "describe", "summarise", "summarize", "tell me",
+    "find out", "look up", "search for", "search the web", "research",
+    "compare", "list the", "give me a summary", "answer in chat",
+    "do not change", "don't change", "no file changes", "without changing",
+    "что такое", "кто такой", "когда", "почему", "как работает",
+    "объясни", "опиши", "расскажи", "найди в интернете", "поищи",
+    "сравни", "сколько", "перечисли", "дай ответ", "ответь",
+)
+
+#: Phrases that explicitly forbid a change.  They contain a mutating verb
+#: ("change", "edit") and mean its negation, so they are removed from the text
+#: before the verb scan — otherwise the clearest possible request for a reply
+#: ("do not change any files") is read as a request to edit.
+_NO_CHANGE_PHRASES: tuple[str, ...] = (
+    "do not change", "don't change", "do not edit", "don't edit",
+    "do not modify", "don't modify", "do not touch", "don't touch",
+    "no file changes", "no changes", "without changing", "without editing",
+    "without modifying", "read-only", "read only",
+    "не меняй", "не изменяй", "не трогай", "без изменений", "только ответь",
+)
+
 #: Phrases that mean "produce a page" when the goal names no path at all.
 #: Bare ``site`` and bare ``html`` are excluded on purpose — see the module
 #: docstring; they are the substrings that mis-routed "composite" and
@@ -139,6 +179,19 @@ class TaskKind:
     @property
     def is_code(self) -> bool:
         return self.kind in ("code", "mixed")
+
+    @property
+    def is_answer(self) -> bool:
+        """True when the goal asks for a reply, not a change to the tree.
+
+        This is the dimension the harness did not have.  Every run had to end
+        in a unified diff, so a goal whose correct output is a sentence was
+        either rejected ("diff could not be parsed") or died in the planner
+        ("did not produce an executable plan: steps: 0").  Measured live on
+        ``"What is 2+2? Answer in chat, do not change any files."``: the run
+        failed at ``plan`` with ``steps: 0``.
+        """
+        return self.kind == "answer"
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -333,7 +386,7 @@ def classify_task(goal: str, repo_root: Path | str | None = None) -> TaskKind:
             unresolved.append(rel)
 
     if artifact_paths and (code_paths or edit_paths):
-        kind: Literal["code", "artifact", "artifact_edit", "mixed"] = "mixed"
+        kind: Literal["code", "artifact", "artifact_edit", "mixed", "answer"] = "mixed"
         evidence = (
             "goal names artifact path(s) absent from the repo "
             f"({', '.join(artifact_paths)}) and existing path(s) "
@@ -367,11 +420,56 @@ def classify_task(goal: str, repo_root: Path | str | None = None) -> TaskKind:
             kind = "artifact"
             evidence = f"goal names no path but says {phrase!r}"
         else:
-            kind = "code"
-            evidence = (
-                "goal names no resolvable path and no page phrase; "
-                "defaulting to code (a wrong artifact verdict writes a stray page)"
-            )
+            # No path, no page phrase.  Two possibilities remain, and they are
+            # not the same product: a change to the tree, or a reply.
+            #
+            # The harness had only the first.  A goal whose correct output is a
+            # sentence was routed to the coder, the planner demanded an
+            # executable step with a target file, and the run died at ``plan``
+            # with ``steps: 0`` — measured live on "What is 2+2? Answer in chat,
+            # do not change any files."
+            #
+            # The decision is made on two deterministic signals, in this order:
+            #
+            # 1. **A mutating verb** ("add", "fix", "refactor", "исправь"…)
+            #    means the tree changes.  It wins over any question phrasing,
+            #    because "explain and fix the bug" is code work.
+            # 2. **A question/answer phrase** ("what is", "explain", "search
+            #    the web", "объясни"…) means a reply.
+            #
+            # Neither present → ``code``, the safe default: a wrong ``code``
+            # verdict edits a file the user named, while a wrong ``answer``
+            # verdict refuses to do the work at all.
+            mutating = next((v for v in _MUTATING_VERBS if v in low), "")
+            asking = next((p for p in _ANSWER_PHRASES if p in low), "")
+            # "do not change any files" contains the verb "change" and means the
+            # opposite of it.  A negation is stripped before the verb scan, or
+            # the one phrase that most clearly asks for a reply is read as a
+            # request to edit.  Measured: "What is 2+2? Answer in chat, do not
+            # change any files." classified as ``code``.
+            negated = low
+            for phrase in _NO_CHANGE_PHRASES:
+                negated = negated.replace(phrase, " ")
+            mutating = next((v for v in _MUTATING_VERBS if v in negated), "")
+            if asking and not mutating:
+                kind = "answer"
+                evidence = (
+                    f"goal names no path and no mutating verb, but asks {asking!r}: "
+                    "the run's output is a reply, not a diff"
+                )
+            elif mutating:
+                kind = "code"
+                evidence = (
+                    f"goal names no resolvable path but asks to {mutating!r}: "
+                    "the tree changes"
+                )
+            else:
+                kind = "code"
+                evidence = (
+                    "goal names no resolvable path, no page phrase and no answer "
+                    "phrase; defaulting to code (a wrong artifact verdict writes a "
+                    "stray page)"
+                )
 
     return TaskKind(
         kind=kind,
