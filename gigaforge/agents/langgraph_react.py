@@ -364,9 +364,20 @@ def build_react_graph(
                 task_id=task_state.task_id,
                 phase=_REACT_PHASE,
             )
-        except BaseException:
+        except BaseException as exc:
             claim.cancel()
-            raise
+            # A provider failure is not a parse failure and not a bad plan.  It
+            # is recorded on the state so the caller can say what happened
+            # instead of "the model produced no plan" — measured live: 55
+            # retried 429s surfaced as a planning defect.
+            _emit("react.provider_error", step_idx=step_idx,
+                  error=f"{type(exc).__name__}: {exc}"[:300])
+            return {
+                "finished": True,
+                "finish_reason": "error",
+                "error": f"{type(exc).__name__}: {exc}"[:500],
+                "trajectory": seed,
+            }
         latency_ms = int((time.monotonic() - started) * 1000)
         text = chat_result.content or ""
         usage = chat_result.usage or {}
@@ -651,6 +662,7 @@ def _to_result(values: Mapping[str, Any]) -> ReActResult:
     # The files the episode wrote travel with the result: the pipeline turns
     # them into a diff, and the contract checks them instead of the worktree.
     result.written_files = list(values.get("written_files") or [])
+    result.error = str(values.get("error") or "")
     return result
 
 

@@ -266,6 +266,12 @@ class ReActResult:
     #: output is a reply ("what is 2+2", "search the web and summarise"), that
     #: prose IS the deliverable.  Kept verbatim so the pipeline can return it.
     final_text: str = ""
+    #: Why the episode ended when it ended badly.  ``finish_reason`` says
+    #: *which* way it ended ("error", "budget_exceeded"); this says what
+    #: happened.  Without it a caller can only report "no plan", which blames
+    #: the model for a provider quota — measured live: 55 retried 429s surfaced
+    #: as "did not produce an executable plan".
+    error: str = ""
 
 
 # --- Built-in tools ---------------------------------------------------------

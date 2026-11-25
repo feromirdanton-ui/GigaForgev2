@@ -783,6 +783,24 @@ class ReActPlan:
 
         steps, verdict = self._guarded_steps(result)
         if not steps:
+            # An empty plan has two very different causes, and reporting the
+            # wrong one sends the next cycle after the wrong problem.
+            #
+            # Measured live (subagents on the site goal): 55 provider 429s were
+            # retried inside the episode, the episode ended with
+            # ``finish_reason: "error"`` and no plan, and the run reported
+            # "LangGraph ReAct did not produce an executable plan: {'steps': 0,
+            # ...}".  That is a statement about the model's competence when the
+            # truth was a statement about the quota — and the goal's transient
+            # retry logic keys on the error text, so it never recognised the
+            # 429 and burned a cycle instead of waiting.
+            reason = str(getattr(result, "finish_reason", "") or "")
+            if reason and reason not in {"finish_action", "max_steps"}:
+                raise RuntimeError(
+                    f"LangGraph ReAct episode ended without a plan "
+                    f"(finish_reason={reason}): "
+                    + str(getattr(result, "error", "") or verdict.to_dict())[:400]
+                )
             raise RuntimeError(
                 "LangGraph ReAct did not produce an executable plan: "
                 + str(verdict.to_dict())[:500]
