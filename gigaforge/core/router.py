@@ -318,21 +318,47 @@ class ModelRouter:
         self.last_decision = decision
         return decision
 
+    def _may_serve(self, model: str) -> bool:
+        """True when this account is allowed to call *model*.
+
+        A flagship is usually the ``Max`` family, which the account gates behind
+        ``GIGAFORGE_ALLOW_MAX``.  Asking here means the ladder never promises a
+        model the router will refuse.
+        """
+        if model in self.exclude_models:
+            return False
+        if "max" in model.lower() and not self._allow_max():
+            return False
+        return True
+
     def _model_for_level(self, phase: str, level: Level) -> Optional[str]:
         """The model a level maps to, or ``None`` when the level is L0.
 
         The mapping is deliberately coarse: a level is a *class* of model, and
         the per-phase route is the operator's choice within that class.  L1
-        takes the cheap model, L2 the phase's configured model, L3 the strong
-        model — and L3 is refused unless the account allows it, which is the
-        router's gate, not the ladder's.
+        takes the cheap model, L2 the phase's configured model, L3 the flagship
+        — and L3 is refused unless the account allows it, which is the router's
+        gate, not the ladder's.
+
+        **L3 must differ from L2 or it is not an escalation.**  The previous
+        version returned ``strong_model`` for L3 while ``default_routes`` already
+        put ``strong_model`` on plan/code/fix/react, so the top rung resolved to
+        the model that had just failed.  Measured: L2 == L3 on four of six
+        phases.  Now L3 returns ``flagship_model`` and ``None`` when no flagship
+        is configured — the ladder then stops at L2 instead of pretending.
         """
         if level is Level.L0_DETERMINISTIC:
             return None
         if level is Level.L1_CHEAP:
             return self.config.cheap_model
         if level is Level.L3_FLAGSHIP:
-            return self.config.strong_model
+            flagship = str(getattr(self.config, "flagship_model", "") or "").strip()
+            if not flagship:
+                return None
+            if flagship == self.config.strong_model:
+                # A flagship that is the strong model is not a rung.
+                return None
+            return flagship
         return None  # L2: the phase's own route decides
 
     def route(
@@ -372,8 +398,18 @@ class ModelRouter:
                     detail={"level": int(level), "phase": phase},
                 )
             levelled = self._model_for_level(phase, level)
-            if levelled:
+            if levelled and self._may_serve(levelled):
                 model = levelled
+            elif level is Level.L3_FLAGSHIP:
+                # The ladder asked for the flagship rung and this account cannot
+                # serve it.  Falling through to the phase's own route is right —
+                # but it must be *said*, because the trace otherwise reports an
+                # escalation that did not happen.
+                self.last_fallback = (
+                    "flagship rung unavailable "
+                    f"({levelled or 'no flagship configured'}); "
+                    "served by the phase's own route"
+                )
 
         spec: Optional[PhaseRoute] = self.config.routes.get(phase)
         if spec is not None and model is None:

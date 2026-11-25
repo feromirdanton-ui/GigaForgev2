@@ -55,6 +55,67 @@ class FileBlock:
         return bool(self.path and self.text)
 
 
+#: Escapes git emits inside a quoted path.  Octal is the one that matters: git
+#: quotes any path with a non-ASCII byte and writes each byte as ``\NNN``.
+_GIT_ESCAPES = {
+    "a": 0x07, "b": 0x08, "t": 0x09, "n": 0x0A, "v": 0x0B, "f": 0x0C,
+    "r": 0x0D, '"': 0x22, "\\": 0x5C,
+}
+
+
+def unquote_git_path(token: str) -> str:
+    """Undo git's C-style quoting of a path, or return *token* unchanged.
+
+    **Why this exists.**  ``git diff`` quotes any path containing a non-ASCII
+    byte or a control character and writes the bytes as octal escapes::
+
+        diff --git "a/\\321\\201.html" "b/\\321\\201.html"
+
+    ``split_diff`` used to take that token literally, so the path came out as
+    ``"b//321/201.html"`` — quotes kept, backslashes turned into slashes by
+    :func:`normalise_path`.  The file was then unrecognised, ``_drop_hunks_for``
+    did not drop its hunk, and ``final_diff`` described a file that was not in
+    the tree.  A Russian-speaking user names a file in Russian, so this is the
+    common case, not an edge case.
+
+    The decoding is byte-exact: escapes are collected as bytes and decoded as
+    UTF-8 at the end, because a multi-byte character is several octal escapes
+    and decoding them one at a time would corrupt it.
+    """
+    text = (token or "").strip()
+    if len(text) < 2 or not (text.startswith('"') and text.endswith('"')):
+        return text
+    body = text[1:-1]
+    out = bytearray()
+    index = 0
+    length = len(body)
+    while index < length:
+        char = body[index]
+        if char != "\\" or index + 1 >= length:
+            out.extend(char.encode("utf-8", "surrogateescape"))
+            index += 1
+            continue
+        nxt = body[index + 1]
+        if nxt in "01234567":
+            # Up to three octal digits, as git writes them.
+            digits = ""
+            cursor = index + 1
+            while cursor < length and len(digits) < 3 and body[cursor] in "01234567":
+                digits += body[cursor]
+                cursor += 1
+            out.append(int(digits, 8) & 0xFF)
+            index = cursor
+            continue
+        if nxt in _GIT_ESCAPES:
+            out.append(_GIT_ESCAPES[nxt])
+            index += 2
+            continue
+        # An escape git does not emit: keep it verbatim rather than guess.
+        out.extend(char.encode("utf-8", "surrogateescape"))
+        index += 1
+    return out.decode("utf-8", "surrogateescape")
+
+
 def normalise_path(path: str) -> str:
     """The comparison form of a path: forward slashes, no ``a/``/``b/``/``./``.
 
@@ -62,7 +123,7 @@ def normalise_path(path: str) -> str:
     ``sub/index.html`` is not, which is why the prefix is stripped only once and
     only when it is exactly ``a/`` or ``b/``.
     """
-    text = (path or "").strip().replace("\\", "/")
+    text = unquote_git_path(path or "").strip().replace("\\", "/")
     if text.startswith(("a/", "b/")):
         text = text[2:]
     while text.startswith("./"):
@@ -75,17 +136,68 @@ def _marker_path(line: str) -> str:
     rest = line[4:].strip()
     if not rest or rest.startswith("/dev/null"):
         return ""
-    # A timestamp may follow a tab; it is not part of the path.
+    # A quoted path may contain spaces, so it is taken whole; an unquoted one
+    # ends at the first tab (a timestamp may follow).
+    if rest.startswith('"'):
+        end = rest.find('"', 1)
+        while end != -1 and rest[end - 1] == "\\":
+            end = rest.find('"', end + 1)
+        if end != -1:
+            return normalise_path(rest[: end + 1])
     rest = rest.split("\t")[0].strip()
     return normalise_path(rest)
 
 
 def _git_header_path(line: str) -> str:
-    """The path named by a ``diff --git a/X b/X`` line."""
-    for token in line.split()[2:]:
-        if token.startswith(("a/", "b/")):
-            return normalise_path(token)
-    return ""
+    """The path named by a ``diff --git a/X b/X`` line, or ``""`` if ambiguous.
+
+    Two shapes reach here:
+
+    * both sides quoted \u2014 ``diff --git "a/\\321\\201.html" "b/\\321\\201.html"``;
+    * neither quoted \u2014 ``diff --git a/my page.html b/my page.html``.
+
+    The unquoted shape is genuinely ambiguous: git does **not** quote a space in
+    this header, so ``str.split()`` cuts ``my page.html`` in half and the block
+    is opened under the path ``my``.  The separator is the literal `` b/``, and
+    the two sides must agree after normalisation \u2014 if they do not, the header
+    is not trusted and ``""`` is returned so the following ``---``/``+++`` pair
+    (which *is* tab-terminated) opens the block instead.
+    """
+    rest = line[len("diff --git "):].strip()
+    if rest.startswith('"'):
+        tokens: list[str] = []
+        index = 0
+        while index < len(rest) and len(tokens) < 2:
+            if rest[index] == '"':
+                end = rest.find('"', index + 1)
+                while end != -1 and rest[end - 1] == "\\":
+                    end = rest.find('"', end + 1)
+                if end == -1:
+                    return ""
+                tokens.append(rest[index: end + 1])
+                index = end + 1
+            else:
+                end = rest.find(" ", index)
+                if end == -1:
+                    tokens.append(rest[index:])
+                    break
+                tokens.append(rest[index:end])
+                index = end + 1
+            while index < len(rest) and rest[index] == " ":
+                index += 1
+        if len(tokens) == 2 and normalise_path(tokens[0]) == normalise_path(tokens[1]):
+            return normalise_path(tokens[1])
+        return ""
+
+    split_at = rest.find(" b/")
+    if split_at == -1:
+        return ""
+    left, right = rest[:split_at], rest[split_at + 1:]
+    if not left.startswith("a/") or not right.startswith("b/"):
+        return ""
+    if normalise_path(left) != normalise_path(right):
+        return ""
+    return normalise_path(right)
 
 
 def split_diff(diff: str) -> list[FileBlock]:

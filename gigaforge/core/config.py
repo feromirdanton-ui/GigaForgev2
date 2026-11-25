@@ -196,6 +196,13 @@ class CoreConfig:
     default_model: str = "GigaChat"
     cheap_model: str = "GigaChat"
     strong_model: str = "GigaChat-Pro"
+    #: The model L3 buys.  It must be a *different* model from ``strong_model``,
+    #: or the ladder's top rung is a no-op: measured on the previous build, L2
+    #: and L3 resolved to ``GigaChat-Pro`` on plan/code/fix/react, so escalating
+    #: a step that had failed twice bought the same model that had just failed
+    #: twice.  Empty means "no flagship is configured", and the ladder then stops
+    #: at L2 rather than pretending to escalate.
+    flagship_model: str = ""
     max_concurrency: int = 4
 
     # ── DAG execution ────────────────────────────────────────────────────────
@@ -345,6 +352,7 @@ class CoreConfig:
             default_model=text("default_model", "GigaChat"),
             cheap_model=text("cheap_model", "GigaChat"),
             strong_model=text("strong_model", "GigaChat-Pro"),
+            flagship_model=text("flagship_model", ""),
             max_concurrency=integer("max_concurrency", 4),
             node_timeout=number("node_timeout", 120.0),
             react_timeout=number("react_timeout", 480.0),
@@ -403,6 +411,7 @@ class CoreConfig:
             "default_model": self.default_model,
             "cheap_model": self.cheap_model,
             "strong_model": self.strong_model,
+            "flagship_model": self.flagship_model,
             "max_concurrency": self.max_concurrency,
             "node_timeout": self.node_timeout,
             "react_timeout": self.react_timeout,

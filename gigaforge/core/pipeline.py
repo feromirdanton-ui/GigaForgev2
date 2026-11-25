@@ -3894,6 +3894,39 @@ class TaskPipeline:
         return {"persisted": {"cache_key": key, "cached": bool(key)}}
 
     # ── helpers ──────────────────────────────────────────────────────────────
+    def _note_phase_attempt(
+        self, ctx: RunContext, phase: str, prompt: str
+    ) -> tuple[int, int]:
+        """Record this call against the phase's counters; return ``(attempt, repeats)``.
+
+        **Why the counters live here.**  ``_ask`` is the single door every phase
+        call goes through, so a counter written here cannot be forgotten by a
+        new loop.  The previous version read ``phase_attempts``/``phase_repeats``
+        from ``ctx.extras`` and nothing ever wrote them, so the ladder was asked
+        "how many times has this failed?" and always heard "zero" — escalation
+        was physically impossible.
+
+        ``attempt`` is the number of *prior* calls to this phase, so the first
+        call sees 0 and the ladder's ``attempts_before_escalation`` threshold
+        means what it says.  ``repeats`` counts consecutive calls whose prompt
+        is byte-identical: the same question against the same context produces
+        the same answer, so asking it again at the same level proves nothing.
+        A different prompt resets the streak, because new information is a
+        genuinely new attempt.
+        """
+        attempts = ctx.extras.setdefault("phase_attempts", {})
+        repeats = ctx.extras.setdefault("phase_repeats", {})
+        seen = ctx.extras.setdefault("phase_prompts", {})
+        prior = int(attempts.get(phase, 0))
+        previous_prompt = seen.get(phase)
+        if previous_prompt is not None and previous_prompt == prompt:
+            repeats[phase] = int(repeats.get(phase, 0)) + 1
+        else:
+            repeats[phase] = 0
+        seen[phase] = prompt
+        attempts[phase] = prior + 1
+        return prior, int(repeats.get(phase, 0))
+
     def _ask(self, phase: str, prompt: str, ctx: RunContext,
              *, temperature: Optional[float] = None) -> str:
         """Route a phase call through the router and return the answer text.
@@ -3938,17 +3971,29 @@ class TaskPipeline:
         # that had already failed twice was retried on the model that had just
         # failed twice.  Asking it here is what makes the ladder a decision
         # rather than a label.
+        #
+        # The counters it reads are written here, and only here, because this is
+        # the one place every phase call passes through.  They used to be read
+        # and never written: ``attempt`` and ``repeats`` were always zero, so
+        # the ladder could not escalate on evidence at all — a scale with no
+        # drive.  A repeat is measured, not guessed: the same phase asked the
+        # same question twice is the same prompt against the same context, and
+        # repeating it at the same level produces the same answer.
+        attempt, repeats = self._note_phase_attempt(ctx, phase, prompt)
         level = None
         decide = getattr(self.router, "decide_level", None)
         if callable(decide):
             try:
                 decision = decide(
                     phase,
-                    attempt=int(ctx.extras.get("phase_attempts", {}).get(phase, 0)),
-                    repeats=int(ctx.extras.get("phase_repeats", {}).get(phase, 0)),
+                    attempt=attempt,
+                    repeats=repeats,
                     contract_rejected=bool(ctx.extras.get("contract_unmet")),
                     files_touched=len(ctx.extras.get("changed_files") or ()),
                     task_kind=str((ctx.extras.get("task_kind") or {}).get("kind", "")),
+                    deterministic_available=bool(
+                        ctx.extras.get("deterministic_available")
+                    ),
                 )
                 level = getattr(decision, "level", None)
                 self._event(
@@ -3960,6 +4005,30 @@ class TaskPipeline:
                 )
             except Exception as exc:  # noqa: BLE001 - a ladder must not fail a run
                 self._degraded("ladder", exc, "ask")
+        # L0 is not "a cheaper model" — it is *no model call*.  The ladder can
+        # only say that when the harness has a deterministic implementation for
+        # the phase, and the caller registers it in ``deterministic_handlers``.
+        # Without this branch the level was unreachable: ``route(L0)`` raises
+        # ``NoModelForPhaseError`` and nothing caught it, so the one level that
+        # saves a whole call could never be used.
+        if level is not None and int(level) == 0:
+            handlers = ctx.extras.get("deterministic_handlers") or {}
+            handler = handlers.get(phase) if isinstance(handlers, Mapping) else None
+            if callable(handler):
+                self._event(
+                    "pipeline.ladder.deterministic", run_id=ctx.run_id, phase=phase
+                )
+                produced = handler(prompt, ctx)
+                return produced if isinstance(produced, str) else str(produced or "")
+            # The ladder claimed a deterministic path that does not exist.  That
+            # is a harness bug, not a reason to fail the run: record it and buy
+            # the model the phase would have used anyway.
+            self._degraded(
+                "ladder",
+                RuntimeError(f"phase {phase!r} was decided L0 with no handler"),
+                "ask",
+            )
+            level = None
         result = self.router.complete(
             phase,
             messages,
