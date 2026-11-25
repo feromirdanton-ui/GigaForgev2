@@ -109,3 +109,38 @@ def test_a_ctx_without_a_worktree_attribute_still_works(tree) -> None:
     ctx = _Bare()
     _pipeline(tree)._build_prefix(ctx)
     assert "## Task brief" in ctx.state.prefix.text
+
+
+def test_the_real_run_context_builds_a_full_prefix(tree) -> None:
+    """The defect the fake context hid: ``RunContext`` has no ``task``.
+
+    Every test above used a stand-in with a ``task`` attribute, so they all
+    passed while the product raised ``AttributeError: 'RunContext' object has
+    no attribute 'task'`` on every single run — twice, once for the skills and
+    once for the brief, each swallowed by its own ``except``.  A test double
+    that is more permissive than the real object is a test that cannot fail for
+    the reason the product fails.
+    """
+    from gigaforge.core.contracts import RunContext
+
+    ctx = RunContext(run_id="t")
+    ctx.state = TaskState(
+        goal="Write a design note to docs/design.md explaining the decision ladder",
+        task_id="t",
+    )
+    _pipeline(tree)._build_prefix(ctx)
+    text = ctx.state.prefix.text
+    assert "## Task brief" in text
+    assert "## Skill:" in text
+    assert "L0_DETERMINISTIC" in text
+    assert not ctx.state.degraded
+
+
+def test_the_goal_resolver_reads_the_state_not_a_task_attribute() -> None:
+    """One resolver, so the next reader cannot pick a different attribute."""
+    from gigaforge.core.contracts import RunContext
+    from gigaforge.core.pipeline import _goal_of
+
+    ctx = RunContext(run_id="t")
+    ctx.state = TaskState(goal="the real goal", task_id="t")
+    assert _goal_of(ctx) == "the real goal"

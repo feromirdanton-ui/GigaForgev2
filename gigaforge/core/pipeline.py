@@ -254,6 +254,27 @@ class PipelineResult:
         return self.to_dict()
 
 
+def _goal_of(ctx: Any) -> str:
+    """The goal text of a run, from wherever the context actually keeps it.
+
+    ``RunContext`` has no ``task`` attribute — it never did.  The goal lives on
+    ``ctx.state.goal``, and the prefix builder read ``ctx.task``, so both the
+    skills block and the task brief raised ``AttributeError`` on every run and
+    were swallowed by their own ``except`` clauses.  Measured live: a
+    2 742-character prefix where 9 514 were expected, and a document goal that
+    invented the system it was supposed to describe.
+
+    One resolver, so the next reader of the goal cannot pick a different
+    attribute and reintroduce the same silent failure.
+    """
+    state = getattr(ctx, "state", None)
+    goal = getattr(state, "goal", "") if state is not None else ""
+    if goal:
+        return str(goal)
+    # Older call sites and tests pass a bare object with ``task``.
+    return str(getattr(ctx, "task", "") or "")
+
+
 class TaskPipeline:
     """Builds and runs the task DAG over the client / L0 / firewall layers."""
 
@@ -862,7 +883,7 @@ class TaskPipeline:
             except Exception:  # noqa: BLE001 - a prefix must not fail a run
                 kind = ""
             chosen = select_skills(
-                kind=kind, goal=str(ctx.task or ""), budget_tokens=1200
+                kind=kind, goal=_goal_of(ctx), budget_tokens=1200
             )
             skills_text = render_skills(chosen)
             self._event(
@@ -892,7 +913,7 @@ class TaskPipeline:
             except Exception:  # noqa: BLE001 - a brief must not fail a run
                 kind_obj = None
             brief = build_brief(
-                str(ctx.task or ""),
+                _goal_of(ctx),
                 # ``RunContext`` has no ``worktree`` attribute — it never did.
                 # The brief was therefore always built against ``None``, which
                 # means "no tree": no named-path resolution, no file count, and
