@@ -460,6 +460,21 @@ class TaskPipeline:
         #: fresh ``TaskState`` and cannot see the pipeline's, so the brief and
         #: the skills are published here for it to pick up.
         self._prefixes: dict[str, Any] = {}
+        #: Phases the harness can compute itself, keyed by phase name.
+        #:
+        #: **Why a registry and not a flag.**  ``_ask`` used to read a single
+        #: boolean ``ctx.extras["deterministic_available"]``, and nothing in
+        #: ``gigaforge/`` ever wrote it — only tests did.  So L0 was a branch that
+        #: could not be reached in the product: the one level that saves a whole
+        #: model call was dead code with a green test.
+        #:
+        #: A single boolean is also the wrong shape.  It says "some phase is
+        #: deterministic", and the ladder turns that into "*this* phase is L0" —
+        #: so registering one handler would have sent every phase to L0 and
+        #: skipped the model for planning and coding too.  The registry is keyed
+        #: by phase, so a handler can only ever claim its own phase.
+        self.deterministic_handlers: dict[str, Any] = {}
+        self._register_deterministic_handlers()
         self.indexer = indexer if indexer is not None else index
         self.index = self.indexer
         self.git = git
@@ -4032,6 +4047,13 @@ class TaskPipeline:
             goal=ctx.state.goal,
             extra_blocks=[("Outcome", f"accepted={accepted}"), ("Diff", diff[:4000])],
         )
+        # Publish the facts the deterministic handler reads.  The handler is
+        # consulted inside ``_ask``, which only sees ``ctx`` — so a fact that
+        # lives in this node's ``inputs`` is invisible to it.  Without this the
+        # L0 handler would decline every time (no ``final_diff`` in extras) and
+        # the registry would be as dead as the flag it replaced.
+        ctx.extras["final_diff"] = diff
+        ctx.extras["accepted"] = accepted
         try:
             summary = self._ask("summarize", prompt.render(), ctx).strip()
         except Exception as exc:  # noqa: BLE001 - a summary is never critical
@@ -4077,6 +4099,55 @@ class TaskPipeline:
         self._event("pipeline.persist", run_id=ctx.run_id, cached=bool(key),
                     accepted=accepted)
         return {"persisted": {"cache_key": key, "cached": bool(key)}}
+
+    # ── deterministic steps (L0) ─────────────────────────────────────────────
+    def _register_deterministic_handlers(self) -> None:
+        """Register the phases this harness can compute without a model call.
+
+        **What belongs here.**  A phase qualifies only when the harness already
+        knows the answer and the model would be *guessing at a computation*.
+        That is the whole thesis of the ladder: anything with a deterministically
+        correct answer is the harness's job, and paying tokens for it is waste.
+
+        ``summarize`` is the honest first entry.  When the run has an accepted
+        diff, the summary is a description of a fact the harness holds — the
+        files it changed and how much.  ``_fallback_summary`` already computes
+        exactly that, and it is what the pipeline falls back to when the model
+        call fails.  So the model call was buying a paraphrase of a string the
+        harness could write itself.
+
+        What is deliberately **not** here: ``plan``, ``code``, ``fix``,
+        ``review``.  Those need judgement, and a handler that pretends otherwise
+        would be a worse harness, not a cheaper one.
+        """
+        self.deterministic_handlers = {
+            "summarize": _deterministic_summary,
+        }
+
+    def _deterministic_handler(
+        self, phase: str, prompt: str, ctx: RunContext
+    ) -> Optional[Callable[[str, RunContext], str]]:
+        """The handler for ``phase``, or ``None`` when the model must be asked.
+
+        A handler may decline a specific input by exposing ``can_serve``.  That
+        matters: ``summarize`` is deterministic for a diff summary and *not*
+        deterministic for an answer goal, where the summary is the deliverable
+        itself.  Without the decline, registering the phase would have replaced
+        a real answer with "Proposed a change (N chars of unified diff)."
+        """
+        handler = getattr(self, "deterministic_handlers", None) or {}
+        handler = handler.get(phase) if isinstance(handler, Mapping) else None
+        if handler is None:
+            return None
+        can_serve = getattr(handler, "can_serve", None)
+        if callable(can_serve):
+            try:
+                if not can_serve(prompt, ctx):
+                    return None
+            except Exception as exc:  # noqa: BLE001 - a decline is not a failure
+                self._degraded("deterministic_can_serve", exc, "ask")
+                return None
+        return handler
 
     # ── helpers ──────────────────────────────────────────────────────────────
     def _note_phase_attempt(
@@ -4216,6 +4287,11 @@ class TaskPipeline:
         # same question twice is the same prompt against the same context, and
         # repeating it at the same level produces the same answer.
         attempt, repeats = self._note_phase_attempt(ctx, phase, prompt)
+        # Ask the registry whether *this* phase, for *this* prompt, has a
+        # deterministic implementation.  A handler that cannot serve the input
+        # declines (``can_serve``), so "a handler exists" never becomes "skip the
+        # model for a step the harness cannot actually compute".
+        handler = self._deterministic_handler(phase, prompt, ctx)
         level = None
         decide = getattr(self.router, "decide_level", None)
         if callable(decide):
@@ -4227,9 +4303,7 @@ class TaskPipeline:
                     contract_rejected=bool(ctx.extras.get("contract_unmet")),
                     files_touched=len(ctx.extras.get("changed_files") or ()),
                     task_kind=str((ctx.extras.get("task_kind") or {}).get("kind", "")),
-                    deterministic_available=bool(
-                        ctx.extras.get("deterministic_available")
-                    ),
+                    deterministic_available=handler is not None,
                 )
                 level = getattr(decision, "level", None)
                 self._event(
@@ -4248,9 +4322,7 @@ class TaskPipeline:
         # ``NoModelForPhaseError`` and nothing caught it, so the one level that
         # saves a whole call could never be used.
         if level is not None and int(level) == 0:
-            handlers = ctx.extras.get("deterministic_handlers") or {}
-            handler = handlers.get(phase) if isinstance(handlers, Mapping) else None
-            if callable(handler):
+            if handler is not None:
                 self._event(
                     "pipeline.ladder.deterministic", run_id=ctx.run_id, phase=phase
                 )
@@ -5187,6 +5259,91 @@ def _fallback_summary(accepted: bool, diff: str) -> str:
         return "No change was produced."
     verb = "Proposed a change" if accepted else "Produced a change that could not be validated"
     return f"{verb} ({len(diff)} chars of unified diff)."
+
+
+def _deterministic_summary(prompt: str, ctx: RunContext) -> str:
+    """The L0 handler for ``summarize``: describe the diff the harness holds.
+
+    **Why this is not a model call.**  The summary of an accepted diff is a
+    statement about data the harness already has — which files changed and how
+    much.  Asking a model to write it is asking it to *guess at a computation*,
+    which is exactly what the ladder exists to stop.  Measured: this phase cost
+    a call on every run, and its output was a paraphrase of
+    ``_fallback_summary``.
+
+    **What it must not do.**  An answer goal's summary *is* the answer, so this
+    handler declines those (``can_serve`` returns ``False``) and the model is
+    asked.  A rejected diff is also declined: describing a change that failed
+    validation buys a paragraph that contradicts the run's own verdict, and the
+    pipeline already has a deterministic string for that case.
+    """
+    diff = str(ctx.extras.get("final_diff") or "")
+    accepted = bool(ctx.extras.get("accepted"))
+    if not diff or not accepted:
+        # Nothing to describe, or nothing worth describing.  Declining lets the
+        # caller keep its own fallback, which is the same string — but the
+        # decision stays with the code that knows the run's verdict.
+        return _fallback_summary(accepted, diff)
+    # Read the file names out of the diff itself rather than from a separate
+    # ``changed_files`` key.  The diff is the artifact the summary describes, so
+    # deriving from it cannot disagree with it — and it does not depend on a
+    # caller remembering to publish a second fact.  Measured: the first version
+    # read ``changed_files``, which the summarize node never sets, so the
+    # handler silently degraded to the generic fallback on every run.
+    files = _files_in_diff(diff)
+    if not files:
+        return _fallback_summary(accepted, diff)
+    shown = ", ".join(files[:6])
+    more = f" and {len(files) - 6} more" if len(files) > 6 else ""
+    return (
+        f"Changed {len(files)} file(s): {shown}{more}. "
+        f"{len(diff)} chars of unified diff, validated and accepted."
+    )
+
+
+def _files_in_diff(diff: str) -> list[str]:
+    """The paths a unified diff touches, in first-seen order.
+
+    Reads ``+++ b/<path>`` and falls back to ``diff --git a/x b/x``.  ``/dev/null``
+    is skipped: it is the *absence* of a file, not a file.
+    """
+    import re as _re
+
+    seen: list[str] = []
+    for line in diff.splitlines():
+        path = ""
+        if line.startswith("+++ "):
+            path = line[4:].strip()
+        elif line.startswith("diff --git "):
+            parts = line.split(" b/")
+            if len(parts) == 2:
+                path = "b/" + parts[1].strip()
+        if not path or path == "/dev/null":
+            continue
+        if path.startswith("b/"):
+            path = path[2:]
+        path = _re.sub(r"\t.*$", "", path).strip()
+        if path and path not in seen:
+            seen.append(path)
+    return seen
+
+
+def _summary_can_serve(prompt: str, ctx: RunContext) -> bool:
+    """``summarize`` is deterministic only when the summary is not the product.
+
+    An answer goal's summary is the reply the person asked for, so a computed
+    string would replace the deliverable.  Everything else — a diff summary — is
+    a description of harness state.
+    """
+    if str(ctx.extras.get("answer_text") or "").strip():
+        return False
+    kind = str((ctx.extras.get("task_kind") or {}).get("kind", "") or "")
+    if kind in {"answer", "analysis", "document"}:
+        return False
+    return bool(str(ctx.extras.get("final_diff") or "").strip())
+
+
+_deterministic_summary.can_serve = _summary_can_serve  # type: ignore[attr-defined]
 
 
 #: ``Pipeline`` is the name older code imports.  It used to be a second, async

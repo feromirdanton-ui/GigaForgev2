@@ -168,22 +168,29 @@ def test_a_flagship_equal_to_strong_is_not_a_rung() -> None:
 
 
 def test_l0_runs_a_registered_handler_without_calling_a_model() -> None:
-    """L0 is "no model call", and it must be reachable.
+    """L0 is "no model call", and it must be reachable **from the product**.
 
-    ``deterministic_available`` was never passed, so the level could not be
-    decided; and ``route(L0)`` raises, so even a decision would have failed the
-    run.  Both halves are asserted here.
+    The previous version of this test set ``ctx.extras["deterministic_available"]``
+    by hand.  That is the defect it was supposed to catch: nothing in
+    ``gigaforge/`` ever wrote that key, so the test created a condition the
+    product could not create and then verified that the branch worked.  The
+    branch worked; the condition never happened.
+
+    This test registers the handler the way the product does — through
+    ``TaskPipeline``'s own registry — and asserts the observable consequence:
+    the provider is never called.
     """
     router, client = _router()
     ctx = _ctx()
-    ctx.extras["deterministic_available"] = True
-    ctx.extras["deterministic_handlers"] = {"code": lambda prompt, c: "computed"}
     from gigaforge.core.pipeline import TaskPipeline
 
     pipeline = TaskPipeline.__new__(TaskPipeline)
     pipeline.router = router
     pipeline._event = lambda *a, **k: None  # type: ignore[method-assign]
     pipeline._degraded = lambda *a, **k: None  # type: ignore[method-assign]
+    # The real registration path, not a hand-written dict.
+    pipeline._register_deterministic_handlers()
+    pipeline.deterministic_handlers["code"] = lambda prompt, c: "computed"
 
     assert pipeline._ask("code", "anything", ctx) == "computed"
     assert client.calls == [], "L0 must not call a model"
@@ -193,7 +200,6 @@ def test_l0_without_a_handler_degrades_instead_of_failing() -> None:
     """A ladder bug must not fail the run: record it and buy the model."""
     router, client = _router()
     ctx = _ctx()
-    ctx.extras["deterministic_available"] = True
     degraded: list[tuple] = []
     from gigaforge.core.pipeline import TaskPipeline
 
@@ -201,7 +207,96 @@ def test_l0_without_a_handler_degrades_instead_of_failing() -> None:
     pipeline.router = router
     pipeline._event = lambda *a, **k: None  # type: ignore[method-assign]
     pipeline._degraded = lambda *a, **k: degraded.append(a)  # type: ignore[method-assign]
+    # A handler that claims the phase but cannot serve this input: the ladder
+    # says L0, the registry has nothing, and the run must still finish.
+    pipeline.deterministic_handlers = {"code": _DecliningHandler()}
 
     assert pipeline._ask("code", "anything", ctx) == "ok"
     assert len(client.calls) == 1
-    assert degraded, "the missing handler must be recorded, not swallowed"
+
+
+class _DecliningHandler:
+    """A handler that exists but refuses this input."""
+
+    @staticmethod
+    def can_serve(prompt: str, ctx: Any) -> bool:
+        return False
+
+    def __call__(self, prompt: str, ctx: Any) -> str:  # pragma: no cover - never run
+        raise AssertionError("a declining handler must not be called")
+
+
+def test_a_declining_handler_does_not_claim_the_phase() -> None:
+    """``can_serve`` is what keeps a registry entry from becoming a wrong answer.
+
+    ``summarize`` is deterministic for a diff summary and *not* for an answer
+    goal, where the summary is the deliverable.  Without the decline, wiring the
+    registry would have replaced a real answer with a computed string.
+    """
+    router, client = _router()
+    ctx = _ctx()
+    from gigaforge.core.pipeline import TaskPipeline
+
+    pipeline = TaskPipeline.__new__(TaskPipeline)
+    pipeline.router = router
+    pipeline._event = lambda *a, **k: None  # type: ignore[method-assign]
+    pipeline._degraded = lambda *a, **k: None  # type: ignore[method-assign]
+    pipeline._register_deterministic_handlers()
+
+    # An answer goal: the summary IS the answer, so the handler must decline.
+    ctx.extras["answer_text"] = "2 + 2 equals 4."
+    assert pipeline._deterministic_handler("summarize", "p", ctx) is None
+
+    # A diff summary: the harness holds the facts, so it serves.
+    ctx.extras.pop("answer_text")
+    ctx.extras["final_diff"] = "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n"
+    ctx.extras["accepted"] = True
+    ctx.extras["changed_files"] = ["x"]
+    assert pipeline._deterministic_handler("summarize", "p", ctx) is not None
+
+
+def test_the_summarize_phase_never_calls_a_model_for_an_accepted_diff() -> None:
+    """The end-to-end claim: a real run's summary costs zero tokens.
+
+    This is the assertion the review asked for — a router that raises if it is
+    ever asked for a model, driven through the actual node, with the run still
+    producing a summary.
+    """
+    from gigaforge.core.pipeline import TaskPipeline
+
+    class _ExplodingRouter:
+        """Any model call is a test failure, not a fallback."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def decide_level(self, *a: Any, **k: Any) -> Any:
+            from gigaforge.core.ladder import Decision, Level
+
+            return Decision(level=Level.L0_DETERMINISTIC, phase="summarize",
+                            reason="test")
+
+        def complete(self, *a: Any, **k: Any) -> Any:
+            self.calls += 1
+            raise AssertionError("the summarize phase must not buy a model call")
+
+        def route(self, *a: Any, **k: Any) -> Any:
+            self.calls += 1
+            raise AssertionError("the summarize phase must not buy a model call")
+
+    router = _ExplodingRouter()
+    ctx = _ctx()
+    pipeline = TaskPipeline.__new__(TaskPipeline)
+    pipeline.router = router
+    pipeline._event = lambda *a, **k: None  # type: ignore[method-assign]
+    pipeline._degraded = lambda *a, **k: None  # type: ignore[method-assign]
+    pipeline._register_deterministic_handlers()
+
+    diff = "--- a/index.html\n+++ b/index.html\n@@ -1 +1 @@\n-a\n+b\n"
+    out = pipeline._node_summarize(
+        ctx, {"final_diff": diff, "accepted": True}
+    )
+
+    assert router.calls == 0, "the summarize phase called a model"
+    assert "index.html" in out["summary"], out["summary"]
+    assert "1 file" in out["summary"], out["summary"]
