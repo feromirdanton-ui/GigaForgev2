@@ -453,7 +453,28 @@ class GigaClient:
         if not requested:
             return requested
         catalogue = self._catalogue()
-        if not catalogue or requested in catalogue:
+        if catalogue and requested in catalogue:
+            return requested
+        # **The mapping is knowledge, not a network call.**  ``_catalogue()``
+        # returns empty when the catalogue fetch fails -- and it fails exactly
+        # when the account is rate-limited, which is when a run is most likely
+        # to be retried.  Measured: after a series of live runs the catalogue
+        # answered 429, the remap was skipped, ``GigaChat`` went to the provider
+        # unchanged, and every SWE-bench instance reported "did not produce an
+        # executable plan" with 0 tokens -- a stale model name in ``.env``
+        # presented as a planning defect.
+        #
+        # A static table cannot be rate-limited.  It is used only when the
+        # catalogue is unavailable, and only for names that are known to have
+        # been renamed, so a genuinely wrong model still fails loudly.
+        if not catalogue:
+            alias = _LEGACY_MODEL_ALIASES.get(requested)
+            if alias:
+                self.metrics.incr(
+                    "client.model.remapped", 1,
+                    {"from": requested, "to": alias, "source": "static"},
+                )
+                return alias
             return requested
         # Same family, newest generation: strip a trailing "-<n>" and try the
         # highest generation the catalogue lists for that family.
@@ -698,3 +719,15 @@ def _safe_json(response: Response) -> Any:
 
 
 __all__ = ["GigaClient", "RequestPlan", "DEFAULT_MAX_TOKENS", "DEFAULT_TEMPERATURE"]
+
+#: Model names that were renamed, and what they are called now.
+#:
+#: Used only when the account's catalogue cannot be fetched.  The catalogue is
+#: the authority; this table exists because the catalogue is a network call and
+#: a network call can be rate-limited, and a stale name in ``.env`` must not
+#: become a hard outage at exactly the moment a run is being retried.
+_LEGACY_MODEL_ALIASES: dict[str, str] = {
+    "GigaChat": "GigaChat-2",
+    "GigaChat-Pro": "GigaChat-2-Pro",
+    "GigaChat-Max": "GigaChat-2-Max",
+}
