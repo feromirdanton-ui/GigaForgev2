@@ -255,7 +255,7 @@ class DashboardView(tk.Frame):
                      font=fonts.small_bold, anchor="w").pack(anchor="w")
             tk.Label(copy_tile, text=desc, bg=Palette.panel, fg=Palette.text_muted,
                      font=fonts.tiny, anchor="w").pack(anchor="w", pady=(2, 0))
-            tk.Label(tile, text="→", bg=Palette.panel, fg=Palette.accent,
+            tk.Label(tile, text="→", bg=Palette.panel, fg=Palette.accent_ink,
                      font=fonts.small_bold).pack(side="right", padx=(6, 0))
             command = lambda value=prompt: self._use_scenario(value)
             tile.bind("<Button-1>", lambda _e, fn=command: fn())
@@ -489,7 +489,7 @@ class DashboardView(tk.Frame):
             else:
                 canvas.create_oval(cx - 30, cy - 30, cx + 30, cy + 30,
                                    fill=Palette.accent_soft, outline=Palette.accent)
-                canvas.create_text(cx, cy, text="GF", fill=Palette.accent,
+                canvas.create_text(cx, cy, text="GF", fill=Palette.accent_ink,
                                    font=fonts.h3)
             nodes = ((cx - orbit_w * 0.43, cy - orbit_h * 0.27,
                       "PLAN", Palette.blue, "scenarios"),
@@ -742,7 +742,7 @@ class DashboardView(tk.Frame):
         tone = "ok" if status in {"accepted", "succeeded", "completed", "success"} else (
             "failed" if status in {"failed", "rejected", "error"} else "idle"
         )
-        tk.Label(line, text="◈", bg=Palette.panel, fg=Palette.accent,
+        tk.Label(line, text="◈", bg=Palette.panel, fg=Palette.accent_ink,
                  font=fonts.small).pack(side="left", anchor="n", padx=(0, 8))
         body = tk.Frame(line, bg=Palette.panel)
         body.pack(side="left", fill="x", expand=True)
@@ -903,10 +903,10 @@ class ProductPage(tk.Frame):
         stats = tk.Frame(body, bg=Palette.bg)
         stats.pack(fill="x", pady=(0, 12))
         for index, (label, value, color) in enumerate((
-            ("TOKENS", f"{int(tokens or 0):,}", Palette.accent),
-            ("MODEL CALLS", f"{int(calls or 0):,}", Palette.blue),
+            ("TOKENS", f"{int(tokens or 0):,}", Palette.accent_ink),
+            ("MODEL CALLS", f"{int(calls or 0):,}", Palette.blue_ink),
             ("CACHE HIT", f"{float(cache or 0):.0%}", Palette.ok),
-            ("ERROR SIGNALS", f"{int(health.get('router_errors') or 0):,}", Palette.violet),
+            ("ERROR SIGNALS", f"{int(health.get('router_errors') or 0):,}", Palette.violet_ink),
         )):
             stats.grid_columnconfigure(index, weight=1, uniform="stats")
             tile = _card(stats)
@@ -1149,7 +1149,7 @@ class FileWorkspacePage(tk.Frame):
         diff_y.pack(side="right", fill="y")
         self.diff_text.tag_configure("added", foreground=Palette.ok)
         self.diff_text.tag_configure("removed", foreground=Palette.err)
-        self.diff_text.tag_configure("meta", foreground=Palette.accent)
+        self.diff_text.tag_configure("meta", foreground=Palette.accent_ink)
 
     def _clear_filter_hint(self, _event: Any = None) -> None:
         if self.search.get() == "Фильтр файлов…":
@@ -1572,7 +1572,7 @@ class FileWorkspacePage(tk.Frame):
             row = tk.Frame(self.diff_list, bg=Palette.panel)
             row.pack(fill="x", pady=3)
             name = _display(item.get("path") or item.get("file"), "измененный файл")
-            tk.Label(row, text="▤", bg=Palette.panel, fg=Palette.accent,
+            tk.Label(row, text="▤", bg=Palette.panel, fg=Palette.accent_ink,
                      font=fonts.tiny).pack(side="left", padx=(0, 6))
             tk.Label(row, text=name, bg=Palette.panel, fg=Palette.text_dim,
                      font=fonts.tiny, anchor="w", justify="left", wraplength=200).pack(

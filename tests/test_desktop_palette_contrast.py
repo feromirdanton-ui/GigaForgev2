@@ -35,15 +35,20 @@ SURFACES = {
 }
 
 #: The tokens that are used as text somewhere in the desktop UI.
+#:
+#: ``accent``/``violet``/``blue`` are NOT here: they are fills (bars, carets,
+#: outlines, chart tones).  Their text roles use ``accent_ink``/``violet_ink``/
+#: ``blue_ink``.  Listing the fills here is what forced ``5e0842e`` to darken
+#: every bar in the product to make a label readable.
 TEXT_TOKENS = {
     "text": Palette.text,
     "text_dim": Palette.text_dim,
     "text_muted": Palette.text_muted,
     "text_faint": Palette.text_faint,
-    "accent": Palette.accent,
+    "accent_ink": Palette.accent_ink,
     "accent_dim": Palette.accent_dim,
-    "violet": Palette.violet,
-    "blue": Palette.blue,
+    "violet_ink": Palette.violet_ink,
+    "blue_ink": Palette.blue_ink,
     "ok": Palette.ok,
     "warn": Palette.warn,
     "err": Palette.err,
@@ -60,6 +65,14 @@ def _rgb(hex_colour: str) -> str:
     return "rgb(%d,%d,%d)" % (
         int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
     )
+
+
+def _luminance(hex_colour: str) -> float:
+    """WCAG relative luminance of an opaque colour."""
+    value = hex_colour.lstrip("#")
+    channels = [int(value[i : i + 2], 16) / 255.0 for i in (0, 2, 4)]
+    linear = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
 
 
 @pytest.mark.parametrize("token", sorted(TEXT_TOKENS))
@@ -91,7 +104,14 @@ def test_the_soft_tints_stay_light() -> None:
 
     If someone "fixes" contrast by darkening ``ok_soft``/``accent_soft``, the
     badges lose their soft look and the whole surface turns muddy.  The tints
-    stay light and the foreground carries the contrast -- this pins that.
+    stay light and the foreground carries the contrast.
+
+    The metric is the tint's own luminance, not its contrast against ``text``.
+    The old version compared each tint with the dark body colour and asserted
+    >= 4.5 -- which is true of *any* pale tint and of a mid-grey one too, so it
+    passed on every mutation of a tint and measured nothing.  A soft tint is
+    defined by being near-white: relative luminance >= 0.80, which a darkened
+    tint cannot reach.
     """
     for name, tint in (
         ("ok_soft", Palette.ok_soft),
@@ -101,6 +121,66 @@ def test_the_soft_tints_stay_light() -> None:
         ("accent_soft", Palette.accent_soft),
         ("violet_soft", Palette.violet_soft),
     ):
-        # A soft tint is a near-white: it must be far lighter than the text it
-        # sits behind, which is what makes the pair readable.
-        assert contrast_ratio(_rgb(tint), _rgb(Palette.text)) >= 4.5, name
+        luminance = _luminance(tint)
+        assert luminance >= 0.80, (
+            f"{name} ({tint}) has luminance {luminance:.3f}; a soft tint must stay "
+            "near-white (>= 0.80) -- darkening it is not a contrast fix"
+        )
+
+
+def test_the_soft_tint_metric_catches_a_darkened_tint() -> None:
+    """The negative control for the metric above.
+
+    Without this, a metric that passes everything looks identical to a metric
+    that works.  A tint darkened to mid-grey must fail.
+    """
+    assert _luminance("#7a8a86") < 0.80
+    assert _luminance("#4b6b94") < 0.80
+
+
+def test_the_text_ladder_is_ordered_by_brightness() -> None:
+    """``text`` > ``text_dim`` > ``text_muted`` > ``text_faint``.
+
+    ``5e0842e`` cleared the AA floor but left ``text_faint`` (#556a80, 5.18)
+    darker than ``text_muted`` (#5a6f85, 4.81), so the quietest rung shouted
+    louder than the one above it.  A floor without an order is half a fix.
+    """
+    ratios = [
+        contrast_ratio(_rgb(colour), _rgb(Palette.bg))
+        for colour in (Palette.text, Palette.text_dim, Palette.text_muted, Palette.text_faint)
+    ]
+    assert ratios == sorted(ratios, reverse=True), (
+        "text ladder is out of order: "
+        + ", ".join(
+            f"{n}={r:.2f}"
+            for n, r in zip(("text", "text_dim", "text_muted", "text_faint"), ratios)
+        )
+    )
+
+
+def test_the_action_fill_carries_white_text() -> None:
+    """The primary button is a fill with a white label, so it is measured as one.
+
+    ``accent`` is now a light fill again (#4b9fea, 2.82 against white) and must
+    never be used behind white text.  ``action`` is the darker value that can
+    be: 5.65.
+    """
+    assert contrast_ratio(_rgb(Palette.action), _rgb("#ffffff")) >= 4.5
+    assert contrast_ratio(_rgb(Palette.accent), _rgb("#ffffff")) < 4.5, (
+        "accent is a fill for bars and carets, not a button background"
+    )
+
+
+def test_the_fill_and_text_accents_are_different_tokens() -> None:
+    """The split is the fix, so it is asserted directly."""
+    for fill, ink in (
+        ("accent", "accent_ink"),
+        ("violet", "violet_ink"),
+        ("blue", "blue_ink"),
+    ):
+        fill_value = getattr(Palette, fill)
+        ink_value = getattr(Palette, ink)
+        assert fill_value != ink_value, f"{fill} and {ink} collapsed back into one value"
+        assert contrast_ratio(_rgb(ink_value), _rgb(Palette.bg)) > contrast_ratio(
+            _rgb(fill_value), _rgb(Palette.bg)
+        ), f"{ink} is not the darker (readable) value"

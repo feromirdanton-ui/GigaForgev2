@@ -832,7 +832,7 @@ class NavButton(tk.Frame):
         self._label.configure(bg=bg, fg=self.palette.text if active else self.palette.text_dim,
                               font=self.fonts.body_bold if active else self.fonts.body)
         self._glyph.configure(bg=bg)
-        self._glyph.set_tone(self.palette.accent if active else self.palette.text_muted,
+        self._glyph.set_tone(self.palette.accent_ink if active else self.palette.text_muted,
                              self.palette.accent_soft if active else self.palette.panel_alt)
         for widget in self._content.winfo_children():
             if isinstance(widget, tk.Frame):

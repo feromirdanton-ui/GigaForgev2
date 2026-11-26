@@ -36,31 +36,47 @@ class Palette:
 
     # text
     text = "#183b66"
-    text_dim = "#4d6b91"
+    text_dim = "#486891"
     # The muted/faint rungs are TEXT -- tile labels, table headings, key/value
     # rows, the chat bar -- and at their old values they were 3.24 and 2.18 on
-    # ``bg``, below the 4.5 AA floor.  Re-spaced to clear AA on every surface
-    # this palette paints (the darkest is ``raised``): 4.81 and 4.86, while
-    # still reading as quieter than ``text`` (10.48).
-    text_muted = "#5a6f85"
-    text_faint = "#556a80"
+    # ``bg``, below the 4.5 AA floor.  They are re-spaced to clear AA on every
+    # surface this palette paints (the darkest is ``raised``) AND to stay in
+    # order: 5.31 > 5.08 > 4.83 on ``bg``.
+    #
+    # The order is the point.  ``5e0842e`` fixed the floor but left
+    # ``text_faint`` (#556a80, 5.18) *darker* than ``text_muted`` (#5a6f85,
+    # 4.81), so the quietest rung shouted louder than the one above it and the
+    # ladder stopped being a hierarchy.  A floor without an order is half a
+    # fix.
+    text_muted = "#4b6b94"
+    text_faint = "#546f8c"
 
     # accents
-    # ``accent`` is used BOTH as a fill (a meter bar, a caret, an outline) and
-    # as text (the wordmark, the "show" toggle, chat role labels, code spans).
-    # A single value cannot be a light fill and readable text at once, and the
-    # old ``#4b9fea`` was 2.61 as text on ``bg``.  It is therefore set to the
-    # darker value that clears AA in every role (5.24 on ``bg``, 4.98 on
-    # ``accent_soft``, 4.92 on the darkest surface) -- the fills stay the same
-    # hue, just a shade deeper, and the text becomes readable.
-    accent = "#1766c2"
+    # ``5e0842e`` fixed the contrast by darkening the fill: ``accent`` went from
+    # #4b9fea to #1766c2 and every bar, caret and outline went with it.  That is
+    # the lesson that commit itself taught -- a colour chosen to be *seen* is
+    # not a colour chosen to be *read* -- applied backwards.  The split is now
+    # explicit, the same one ``webui.py`` carries:
+    #
+    #   accent      FILL   bars, carets, outlines, gradient stops, focus rings
+    #   accent_ink  TEXT   the wordmark, the "show" toggle, role labels, code
+    #   action      FILL   the primary button, which carries white text
+    #
+    # ``action`` is separate because a fill light enough to look like a button
+    # is too light for white text: #4b9fea is 2.82 against white.  #1766c2 is
+    # 5.65, so the button keeps its readable label without darkening the bars.
+    accent = "#4b9fea"
+    accent_ink = "#1766c2"
+    action = "#1766c2"
     accent_dim = "#15559f"
     accent_soft = "#e4f3fb"
-    # ``violet`` and ``blue`` are text too (role labels, run tags, KPI values),
-    # so they carry the readable value; the soft tints stay light.
-    violet = "#6d28d9"
+    # ``violet`` and ``blue`` are fills too (chart tones, run tags); the text
+    # roles use the ``*_ink`` values.
+    violet = "#817ce6"
+    violet_ink = "#6d28d9"
     violet_soft = "#f1f0ff"
-    blue = "#17737f"
+    blue = "#48b7c7"
+    blue_ink = "#17737f"
 
     # status
     # These are drawn as text badges (``Palette.status``), so the foreground is
@@ -107,7 +123,7 @@ class Palette:
             "failed": (cls.err, cls.err_soft),
             "fail": (cls.err, cls.err_soft),
             "error": (cls.err, cls.err_soft),
-            "cached": (cls.violet, cls.violet_soft),
+            "cached": (cls.violet_ink, cls.violet_soft),
             "idle": (cls.text_muted, cls.panel_alt),
             "skipped": (cls.text_muted, cls.panel_alt),
         }.get(name.lower(), (cls.text_dim, cls.panel_alt))
@@ -213,7 +229,7 @@ def apply_theme(root: tk.Misc) -> tuple[Palette, Fonts]:
     style.configure("H1.TLabel", background=palette.bg, foreground=palette.text, font=fonts.h1)
     style.configure("H2.TLabel", background=palette.bg, foreground=palette.text, font=fonts.h2)
     style.configure("H3.TLabel", background=palette.bg, foreground=palette.text, font=fonts.h3)
-    style.configure("Accent.TLabel", background=palette.bg, foreground=palette.accent,
+    style.configure("Accent.TLabel", background=palette.bg, foreground=palette.accent_ink,
                     font=fonts.body_bold)
 
     # ── buttons ──────────────────────────────────────────────────────────────
@@ -233,7 +249,7 @@ def apply_theme(root: tk.Misc) -> tuple[Palette, Fonts]:
                     ("disabled", palette.panel)],
         foreground=[("disabled", palette.text_faint)],
     )
-    style.configure("Accent.TButton", background=palette.accent, foreground="#ffffff",
+    style.configure("Accent.TButton", background=palette.action, foreground="#ffffff",
                     font=fonts.body_bold, padding=(14, 8))
     style.map("Accent.TButton",
               background=[("active", "#48a2fa"), ("pressed", palette.accent_dim),
@@ -336,6 +352,6 @@ def apply_theme(root: tk.Misc) -> tuple[Palette, Fonts]:
                     padding=(14, 7), font=fonts.small, borderwidth=0)
     style.map("TNotebook.Tab",
               background=[("selected", palette.panel)],
-              foreground=[("selected", palette.accent)])
+              foreground=[("selected", palette.accent_ink)])
 
     return palette, fonts

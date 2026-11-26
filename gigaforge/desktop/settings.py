@@ -400,7 +400,7 @@ class CredentialsDialog(tk.Toplevel):
             self._vars[key] = var
             self._entries[key] = entry
             if secret:
-                toggle = tk.Label(line, text="show", bg=Palette.bg, fg=Palette.accent,
+                toggle = tk.Label(line, text="show", bg=Palette.bg, fg=Palette.accent_ink,
                                   font=app.fonts.tiny, cursor="hand2")
                 toggle.pack(side="left", padx=(6, 0))
                 toggle.bind("<Button-1>", lambda _e, k=key: self._toggle(k))

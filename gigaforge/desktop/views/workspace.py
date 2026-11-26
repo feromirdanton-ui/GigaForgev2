@@ -397,9 +397,9 @@ class WorkspaceView(tk.Frame):
             return
 
     def _tags(self) -> None:
-        self.text.tag_configure("role_user", foreground=Palette.accent,
+        self.text.tag_configure("role_user", foreground=Palette.accent_ink,
                                 font=self.fonts.small_bold, spacing1=12)
-        self.text.tag_configure("role_assistant", foreground=Palette.violet,
+        self.text.tag_configure("role_assistant", foreground=Palette.violet_ink,
                                 font=self.fonts.small_bold, spacing1=12)
         self.text.tag_configure("role_tool", foreground=Palette.text_muted,
                                 font=self.fonts.small_bold, spacing1=8)
@@ -408,10 +408,10 @@ class WorkspaceView(tk.Frame):
         self.text.tag_configure("role_system", foreground=Palette.text_faint,
                                 font=self.fonts.small, spacing1=8)
         self.text.tag_configure("body", foreground=Palette.text, lmargin1=2, lmargin2=2)
-        self.text.tag_configure("code", foreground=Palette.accent, font=self.fonts.code)
+        self.text.tag_configure("code", foreground=Palette.accent_ink, font=self.fonts.code)
         self.text.tag_configure("muted", foreground=Palette.text_faint, font=self.fonts.tiny)
         self.text.tag_configure("ok", foreground=Palette.ok, font=self.fonts.code_small)
-        self.text.tag_configure("run", foreground=Palette.blue, font=self.fonts.code_small)
+        self.text.tag_configure("run", foreground=Palette.blue_ink, font=self.fonts.code_small)
         self.text.tag_configure("fail", foreground=Palette.err, font=self.fonts.code_small)
         self.text.tag_configure("diff_add", foreground=Palette.diff_add_fg,
                                 background=Palette.diff_add_bg, font=self.fonts.code_small)
@@ -600,7 +600,7 @@ class WorkspaceView(tk.Frame):
             chip = tk.Frame(self._chips_row, bg=Palette.panel_alt)
             chip.pack(side="left", padx=(0, 5))
             tk.Label(chip, text=f"📎 {Path(item).name}", bg=Palette.panel_alt,
-                     fg=Palette.accent, font=self.fonts.tiny, padx=6, pady=1).pack(side="left")
+                     fg=Palette.accent_ink, font=self.fonts.tiny, padx=6, pady=1).pack(side="left")
             remove = tk.Label(chip, text="×", bg=Palette.panel_alt, fg=Palette.text_faint,
                               font=self.fonts.tiny, padx=4, cursor="hand2")
             remove.pack(side="left")

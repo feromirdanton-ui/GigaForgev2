@@ -280,7 +280,7 @@ class GigaForgeWindow(tk.Tk):
         self._status = tk.Label(bar, text="ready", bg=Palette.surface,
                                 fg=Palette.text_muted, font=self.fonts.tiny, anchor="w")
         self._status.pack(side="left")
-        self._busy = tk.Label(bar, text="", bg=Palette.surface, fg=Palette.accent,
+        self._busy = tk.Label(bar, text="", bg=Palette.surface, fg=Palette.accent_ink,
                               font=self.fonts.tiny)
         self._busy.pack(side="right", padx=(0, 10))
         tk.Label(bar, text="ctrl+1…8 navigation · ctrl+n new chat · ctrl+, settings · ctrl+q quit",
