@@ -43,8 +43,11 @@ __all__ = [
     "Proposal",
     "ProbeResult",
     "ComposeVerdict",
+    "RoundOutcome",
     "propose",
     "compose",
+    "probe",
+    "run_round",
     "EDITABLE_COMPONENTS",
 ]
 
@@ -374,3 +377,142 @@ def probe(
         tokens_total=int(raw.get("tokens_total") or 0),
         cost_micros=int(raw.get("cost_micros") or 0),
     )
+
+
+@dataclass
+class RoundOutcome:
+    """One Propose–Probe–Compose round, with the trajectory it advanced.
+
+    **Why a round is a value and not a side effect.**  The search's whole claim
+    is that a change was measured and attributed.  A round that returns nothing
+    but a boolean cannot be audited: it cannot say which component moved, what
+    the hypothesis was, or whether the budget allowed the bundle.  Returning the
+    record makes the history a by-product of running, not a second thing to
+    remember to write.
+    """
+
+    round_index: int
+    budget: int
+    proposal: Proposal | None = None
+    candidate: SurfaceSpec | None = None
+    probe: ProbeResult | None = None
+    verdict: ComposeVerdict | None = None
+    pruned: list[str] = field(default_factory=list)
+    directives: list[str] = field(default_factory=list)
+    rejected_reason: str = ""
+
+    @property
+    def adopted(self) -> bool:
+        return bool(self.verdict and self.verdict.accepted and not self.pruned)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "round": self.round_index,
+            "budget": self.budget,
+            "components": sorted(self.proposal.changes) if self.proposal else [],
+            "hypothesis": self.proposal.rationale if self.proposal else "",
+            "adopted": self.adopted,
+            "pruned": list(self.pruned),
+            "directives": list(self.directives),
+            "rejected_reason": self.rejected_reason,
+            "verdict": self.verdict.to_dict() if self.verdict else None,
+            "probe": self.probe.to_dict() if self.probe else None,
+        }
+
+
+def run_round(
+    incumbent_surface: SurfaceSpec,
+    incumbent_probe: ProbeResult,
+    changes: Mapping[str, Any],
+    *,
+    round_index: int,
+    total_rounds: int,
+    run_bench: Callable[[SurfaceSpec], Mapping[str, Any]],
+    history: Any = None,
+    observation: Mapping[str, Any] | None = None,
+    rationale: str = "",
+    floor: float = 0.0,
+    allow_regressions: bool = False,
+) -> RoundOutcome:
+    """One full round: budget, screen, propose, probe, compose, record.
+
+    **The order is the mechanism.**  Each step can end the round, and the order
+    is chosen so the cheapest rejection comes first:
+
+    1. *Budget* — a bundle larger than the round allows is refused before any
+       model call.  This is the annealed constraint: late rounds are
+       single-variable experiments.
+    2. *Prune* — a candidate that trips the prune set is rejected **before** it
+       is probed.  Probing it first and rejecting after would spend the bench on
+       a candidate whose score must not be read, and — worse — the score would
+       exist, and a score that exists gets averaged in by someone.
+    3. *Propose* — validated against the declared surface, values included.
+    4. *Probe* — measured; a crash is a rejection, not a zero.
+    5. *Compose* — accepted only above the noise floor and with no regression.
+
+    ``history`` is optional so the function is usable in a test without one, but
+    when given it is advanced: the round's edit is recorded with its hypothesis
+    and its verdict, which is what makes the next round's directives possible.
+    """
+    from gigaforge.harness.prune import check_prune
+    from gigaforge.harness.search import edit_budget, enforce_budget
+
+    budget = edit_budget(round_index, total_rounds)
+    outcome = RoundOutcome(round_index=round_index, budget=budget)
+
+    # 1. The annealed budget.
+    try:
+        enforce_budget(changes, budget)
+    except ValueError as exc:
+        outcome.rejected_reason = str(exc)
+        return outcome
+
+    # 2. The prune set, before the bench.
+    if observation is not None:
+        prune_verdict = check_prune(observation)
+        if prune_verdict.pruned:
+            outcome.pruned = list(prune_verdict.tripped)
+            outcome.rejected_reason = "; ".join(prune_verdict.details)
+            if history is not None:
+                for component in changes:
+                    history.record(
+                        round=round_index, component=str(component),
+                        hypothesis=rationale, verdict="pruned", adopted=False,
+                    )
+            return outcome
+
+    # 3. Propose.
+    try:
+        proposal = propose(incumbent_surface, changes, rationale=rationale)
+    except ValueError as exc:
+        outcome.rejected_reason = str(exc)
+        return outcome
+    outcome.proposal = proposal
+    candidate = compose_surface(incumbent_surface, proposal)
+    outcome.candidate = candidate
+
+    # 4. Probe.
+    probed = probe(candidate, run_bench)
+    outcome.probe = probed
+
+    # 5. Compose.
+    verdict = compose(
+        incumbent_probe, probed, floor=floor, allow_regressions=allow_regressions,
+    )
+    outcome.verdict = verdict
+
+    if history is not None:
+        for component in proposal.changes:
+            history.record(
+                round=round_index,
+                component=str(component),
+                hypothesis=rationale,
+                score_before=incumbent_probe.mean_pass_rate,
+                score_after=probed.mean_pass_rate,
+                cost_before=incumbent_probe.cost_micros,
+                cost_after=probed.cost_micros,
+                verdict="accepted" if verdict.accepted else "rejected",
+                adopted=outcome.adopted,
+            )
+        outcome.directives = history.exploration_directives(EDITABLE_COMPONENTS)
+    return outcome

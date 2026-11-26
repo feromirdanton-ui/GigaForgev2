@@ -1357,6 +1357,52 @@ def evolve(
         typer.echo(f"rationale: {proposal.rationale}")
 
 
+@app.command()
+def search(
+    history: Annotated[
+        Optional[Path], typer.Option("--history", help="Edit-history JSONL to read.")
+    ] = None,
+    round_index: Annotated[
+        int, typer.Option("--round", help="The round about to run (0-based).")
+    ] = 0,
+    total_rounds: Annotated[
+        int, typer.Option("--rounds", help="How many rounds the search will run.")
+    ] = 10,
+) -> None:
+    """Show the search trajectory: budget, stall, directives, prune set, novelty.
+
+    The edit space and the screen were both implemented and neither could say
+    *where the search is*.  This prints the four regularizers RRSI applies to the
+    trajectory — the annealed budget for this round, whether the search has
+    stalled, which components it must explore next, which have been tried and
+    never helped, and how much of the structural space has never won.
+    """
+    from gigaforge.harness.evolve import EDITABLE_COMPONENTS
+    from gigaforge.harness.search import History, edit_budget, novelty
+
+    hist = History.load(history) if history else History()
+    budget = edit_budget(round_index, total_rounds)
+    typer.echo(f"round {round_index} of {total_rounds}: budget {budget} edit(s)")
+    typer.echo(f"edits recorded: {len(hist.records)}")
+    typer.echo(f"recent yield: {hist.recent_yield():.2f}")
+    typer.echo(f"stalled: {'yes' if hist.stall_flag() else 'no'}")
+    directives = hist.exploration_directives(EDITABLE_COMPONENTS)
+    if directives:
+        typer.echo("must explore: " + ", ".join(directives))
+    untried = hist.untried(EDITABLE_COMPONENTS)
+    if untried:
+        typer.echo("never tried: " + ", ".join(untried))
+    prunable = hist.prune_set()
+    if prunable:
+        typer.echo("prune set (tried, never helped): " + ", ".join(prunable))
+    typer.echo(f"structural novelty: {novelty(hist):.2f}")
+    falsified = hist.falsified()
+    if falsified:
+        typer.echo("already falsified (do not redraw):")
+        for item in falsified[:6]:
+            typer.echo(f"  - {item}")
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # desktop application
 # ══════════════════════════════════════════════════════════════════════════

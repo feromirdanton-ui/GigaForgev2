@@ -2526,6 +2526,35 @@ class TaskPipeline:
             "proposal_source": "answer",
         }
 
+    def _document_search(self, ctx: RunContext):
+        """A search callable for the document's literature stage, or ``None``.
+
+        **Why ``None`` and not a stub that returns "".**  A stub would make every
+        section look like a search that found nothing, and the pipeline would
+        report "no results" for a run that never searched.  ``None`` says "this
+        run has no search tool", which is a different fact and is reported as
+        one.
+
+        The tool is the harness's own ``web_search``: bounded, cached, and
+        honest about returning nothing.  It is constructed per run so its budget
+        is the run's, not the process's.
+        """
+        try:
+            from gigaforge.agents.web_search_tool import WebSearchTool
+        except Exception:  # noqa: BLE001 - no search tool is a valid configuration
+            return None
+        tool = WebSearchTool()
+        # The tool is async; the pipeline is sync.  ``asyncio.run`` is safe here
+        # because the document path is not inside a running loop -- and if it
+        # ever is, the exception is caught by ``gather`` and reported as an
+        # ungrounded section rather than crashing the run.
+        import asyncio
+
+        def _search(query: str) -> str:
+            return asyncio.run(tool.run({"query": query}, ctx=ctx))
+
+        return _search
+
     def _document_proposal(self, ctx: RunContext) -> Mapping[str, Any]:
         """Write a document through the four-stage pipeline, not one prompt.
 
@@ -2593,7 +2622,30 @@ class TaskPipeline:
                 self._degraded("document", exc, "document")
 
         # ── Literature: what each section may assert ────────────────────────
+        #
+        # **Grounded, not remembered.**  This stage used to ask the model "list
+        # the concrete facts needed to write section X" -- a request for its
+        # memory, and a model asked for facts produces them whether or not it
+        # has them.  The citation gate caught the invented ones after the fact;
+        # this prevents them, by searching first and writing from what the
+        # search returned.  A section whose search found nothing is marked
+        # ungrounded, so the acceptance gate can say "no evidence" instead of
+        # "too short" -- two different defects with two different fixes.
+        from gigaforge.harness.evidence import evidence_prompt_block, gather
+
+        search_fn = self._document_search(ctx)
         for section in plan.outline.sections:
+            query = f"{plan.outline.title} {section.title}".strip()
+            evidence = gather(query, search_fn) if search_fn else None
+            if evidence is not None and evidence.grounded:
+                section.evidence = [item.render() for item in evidence.sourced]
+                self._event(
+                    "pipeline.document_evidence", run_id=ctx.run_id,
+                    section=section.title, sources=len(evidence.sourced),
+                )
+                continue
+            # No search, or a search that found nothing: fall back to the model,
+            # but record that the section is ungrounded so the gate can see it.
             try:
                 gathered = self._ask(
                     "research",
@@ -2613,6 +2665,11 @@ class TaskPipeline:
                 for line in str(gathered or "").splitlines()
                 if line.strip(" -*\t")
             ][:12]
+            self._event(
+                "pipeline.document_evidence", run_id=ctx.run_id,
+                section=section.title, sources=0,
+                detail=(evidence.error if evidence is not None else "no search tool"),
+            )
 
         # ── Sections: one call each, against its own evidence ───────────────
         bodies: dict[str, str] = {}
