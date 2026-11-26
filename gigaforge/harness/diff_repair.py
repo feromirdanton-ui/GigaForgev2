@@ -31,12 +31,13 @@ a wrong diff, never silently rewritten into a different change.
 """
 from __future__ import annotations
 
+import ast
 import difflib
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
-__all__ = ["normalize_creation_hunks", "RepairReport"]
+__all__ = ["normalize_creation_hunks", "normalize_hunk_indentation", "RepairReport"]
 
 #: ``--- /dev/null`` followed by ``+++ b/<path>`` and one or more hunks.
 _CREATION_BLOCK = re.compile(
@@ -86,6 +87,157 @@ def _modify_diff(rel: str, old: list[str], new: list[str]) -> str:
         n=3,
     )
     return "\n".join(diff) + "\n"
+
+
+#: ``@@ -a,b +c,d @@`` — the hunk header.
+_HUNK_HEADER = re.compile(r"^@@")
+
+
+def _indent_of(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def _reindent_hunk(
+    header: str, body: list[str], target: Path
+) -> tuple[str, list[str], bool]:
+    """Re-indent one hunk to the file's real indentation.
+
+    The live bench found this: asked to fix ``validate_email``, the model emitted
+    a hunk whose *context* lines carried ten spaces where the file has four, and
+    whose added line carried the same ten.  ``git apply`` accepts that (it
+    matches on content, not on indentation, and fuzzes the offset), so the diff
+    "applies" and the file no longer parses — ``unexpected indent`` at the line
+    the model just wrote.
+
+    The repair is deterministic and needs no model call: locate the hunk's old
+    side in the file by *stripped* content, read the real indentation of each
+    matched line, and shift the added lines by the same delta.  The result is
+    accepted only if the reconstructed file parses — a repair that does not
+    make the file valid is not a repair, and the original hunk is returned.
+    """
+    try:
+        original = target.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return header, body, False
+    file_lines = original.splitlines()
+
+    old_idx = [k for k, line in enumerate(body) if line[:1] in (" ", "-")]
+    old_text = [body[k][1:] for k in old_idx]
+    if not old_text:
+        return header, body, False
+
+    stripped_old = [line.strip() for line in old_text]
+    best_pos, best_score = -1, 0
+    span = max(1, len(file_lines) - len(old_text) + 1)
+    for start in range(span):
+        score = 0
+        for off, want in enumerate(stripped_old):
+            if start + off < len(file_lines) and file_lines[start + off].strip() == want:
+                score += 1
+        if score > best_score:
+            best_score, best_pos = score, start
+    # A hunk that does not mostly match the file is a different change; leave it.
+    if best_score < max(1, int(len(old_text) * 0.6)):
+        return header, body, False
+
+    deltas: dict[int, int] = {}
+    for off, k in enumerate(old_idx):
+        if best_pos + off < len(file_lines):
+            deltas[k] = _indent_of(file_lines[best_pos + off]) - _indent_of(body[k][1:])
+
+    def _shift(content: str, delta: int) -> str:
+        if not content.strip() or not delta:
+            return content
+        if delta > 0:
+            return " " * delta + content
+        return content[min(-delta, _indent_of(content)):]
+
+    # Every line of the hunk is rewritten, not only the added ones.  A context
+    # line left at the diff's indentation would still be written into the file
+    # by ``git apply``, so repairing only the ``+`` lines produced a file whose
+    # docstring sat at 11 spaces and whose body sat at 4 — still a syntax error.
+    new_body: list[str] = []
+    for k, line in enumerate(body):
+        marker, content = line[:1], line[1:]
+        if marker not in (" ", "-", "+"):
+            new_body.append(line)
+            continue
+        delta = 0
+        for back in range(k, -1, -1):
+            if back in deltas:
+                delta = deltas[back]
+                break
+        new_body.append(marker + _shift(content, delta))
+
+    if new_body == body:
+        return header, body, False
+
+    # Accept only a repair that makes the file parse.  Simulate the apply against
+    # the matched window, then hand the result to the same gate the product uses.
+    new_side = [line[1:] for line in new_body if line[:1] in (" ", "+")]
+    candidate = (
+        file_lines[:best_pos] + new_side + file_lines[best_pos + len(old_text):]
+    )
+    try:
+        ast.parse("\n".join(candidate) + "\n")
+    except SyntaxError:
+        return header, body, False
+    return header, new_body, True
+
+
+def normalize_hunk_indentation(diff: str, root: Path) -> tuple[str, RepairReport]:
+    """Re-indent every hunk whose context does not match the file's indentation.
+
+    A diff with no ``@@`` header, or one whose hunks already match, is returned
+    byte for byte — the normaliser must not perturb the common case.
+    """
+    report = RepairReport(repaired=[], skipped=[])
+    if not diff or "@@" not in diff:
+        return diff, report
+    root = Path(root)
+    lines = diff.splitlines(keepends=True)
+    out: list[str] = []
+    current_path: str | None = None
+    changed_any = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("+++ "):
+            raw = line[4:].strip()
+            if raw.startswith("b/"):
+                raw = raw[2:]
+            current_path = raw.split("\t")[0]
+            out.append(line)
+            i += 1
+            continue
+        if _HUNK_HEADER.match(line) and current_path:
+            j = i + 1
+            body: list[str] = []
+            while j < len(lines) and not lines[j].startswith(
+                ("@@", "diff --git", "--- ", "+++ ")
+            ):
+                body.append(lines[j])
+                j += 1
+            target = root / current_path
+            if target.is_file():
+                new_header, new_body, ok = _reindent_hunk(line, body, target)
+                if ok:
+                    out.append(new_header)
+                    out.extend(new_body)
+                    changed_any = True
+                    if current_path not in report.repaired:
+                        report.repaired.append(current_path)
+                    i = j
+                    continue
+            out.append(line)
+            out.extend(body)
+            i = j
+            continue
+        out.append(line)
+        i += 1
+    if not changed_any:
+        return diff, RepairReport(repaired=[], skipped=[])
+    return "".join(out), report
 
 
 def normalize_creation_hunks(diff: str, root: Path) -> tuple[str, RepairReport]:

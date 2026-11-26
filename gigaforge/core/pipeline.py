@@ -2811,10 +2811,26 @@ class TaskPipeline:
         if not diff:
             return diff
         try:
-            from gigaforge.harness.diff_repair import normalize_creation_hunks
+            from gigaforge.harness.diff_repair import (
+                RepairReport,
+                normalize_creation_hunks,
+            )
 
             root = Path(str(getattr(self.config, "repo_root", ".") or ".")).resolve()
             repaired, report = normalize_creation_hunks(diff, root)
+            # Then the indentation pass.  A hunk whose context lines carry the
+            # wrong indentation still *applies* (git matches content, not
+            # indentation) and leaves a file that does not parse — the live
+            # bench's "unexpected indent" failures.  Deterministic, no model call.
+            from gigaforge.harness.diff_repair import normalize_hunk_indentation
+
+            reindented, indent_report = normalize_hunk_indentation(repaired, root)
+            if indent_report.changed:
+                repaired = reindented
+                report = RepairReport(
+                    repaired=list(report.repaired) + list(indent_report.repaired),
+                    skipped=list(report.skipped) + list(indent_report.skipped),
+                )
         except Exception as exc:  # noqa: BLE001 - a repair must never fail a run
             self._event("pipeline.diff_repair_error", run_id=ctx.run_id,
                         error=str(exc)[:200])

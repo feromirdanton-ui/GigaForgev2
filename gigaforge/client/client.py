@@ -22,6 +22,7 @@ global session   injected transport, sized pool, explicit ``close()``
 """
 from __future__ import annotations
 
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -433,6 +434,51 @@ class GigaClient:
     # ------------------------------------------------------------------ #
     # Request construction
     # ------------------------------------------------------------------ #
+    def _resolve_model(self, requested: str) -> str:
+        """Map a requested model onto one the account actually serves.
+
+        The live bench found this: ``.env`` named ``GigaChat``, which is not in
+        the account's catalogue (``GigaChat-2``, ``-2-Pro``, ``-2-Max``,
+        ``-3-Lightning``, ``-3-Pro``, ``-3-Ultra``), so every call answered
+        ``404 model-not-found`` while the tests passed — they never reached the
+        provider.  A stale name in a config file must not be a hard outage.
+
+        Deterministic, one catalogue fetch per client, and only when the name
+        looks like it may be stale: an exact catalogue hit costs nothing, and a
+        name the catalogue does not list is mapped to the closest generation
+        (``GigaChat`` → ``GigaChat-2``, ``GigaChat-Pro`` → ``GigaChat-2-Pro``).
+        A name that cannot be mapped is passed through unchanged, so a genuinely
+        wrong model still fails loudly instead of being silently swapped.
+        """
+        if not requested:
+            return requested
+        catalogue = self._catalogue()
+        if not catalogue or requested in catalogue:
+            return requested
+        # Same family, newest generation: strip a trailing "-<n>" and try the
+        # highest generation the catalogue lists for that family.
+        base = re.sub(r"-\d+$", "", requested)
+        candidates = [m for m in catalogue if re.sub(r"-\d+$", "", m) == base]
+        if candidates:
+            best = max(candidates, key=lambda m: int((re.search(r"-(\d+)$", m) or [0, 0])[1] or 0))
+            self.metrics.incr("client.model.remapped", 1, {"from": requested, "to": best})
+            return best
+        return requested
+
+    def _catalogue(self) -> set[str]:
+        """The account's model ids, fetched once and cached for the client."""
+        cached = getattr(self, "_catalogue_cache", None)
+        if cached is not None:
+            return cached
+        try:
+            models = self.list_models()
+            ids = {str(getattr(m, "id", "") or "") for m in (models or [])}
+            ids.discard("")
+        except Exception:  # noqa: BLE001 - a catalogue miss must not fail a call
+            ids = set()
+        self._catalogue_cache = ids
+        return ids
+
     def _build_plan(
         self,
         messages: Sequence[Any],
@@ -452,6 +498,7 @@ class GigaClient:
         resolved_model = (model or self.config.default_model or "").strip()
         if not resolved_model:
             raise ConfigurationError("a model is required (set default_model or pass model=)")
+        resolved_model = self._resolve_model(resolved_model)
 
         coerced = coerce_messages(messages)
         payload: Dict[str, Any] = {

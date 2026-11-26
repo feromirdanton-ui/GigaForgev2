@@ -177,6 +177,12 @@ class SyncChatClient:
         self._timeout = float(timeout)
         self._closed = False
         self._calls = 0
+        #: Accumulated usage across every call.  The bench reads these to report
+        #: tokens for a live run: the real client accounts per call and exposes
+        #: no running total, so a live bench reported ``0 / 0`` tokens for work
+        #: that had really been paid for.
+        self._usage_in = 0
+        self._usage_out = 0
 
     # -- identity ----------------------------------------------------------
     @property
@@ -186,6 +192,14 @@ class SyncChatClient:
     @property
     def calls(self) -> int:
         return self._calls
+
+    @property
+    def usage_in(self) -> int:
+        return self._usage_in
+
+    @property
+    def usage_out(self) -> int:
+        return self._usage_out
 
     def capabilities(self) -> Any:
         getter = getattr(self._provider, "capabilities", None)
@@ -217,7 +231,7 @@ class SyncChatClient:
         self._calls += 1
         if response_format is not None:
             kwargs["response_format"] = response_format
-        return await_blocking(
+        result = await_blocking(
             self._provider.chat(
                 payload,
                 model=model or "",
@@ -227,6 +241,19 @@ class SyncChatClient:
             ),
             timeout=self._timeout,
         )
+        usage = getattr(result, "usage", None)
+        # ``usage`` is a ``Usage`` pydantic model on the real client and a plain
+        # dict on the fake.  Checking only for ``dict`` left the live bench
+        # reporting 0/0 tokens for work that had really been paid for.
+        if usage is not None:
+            prompt = getattr(usage, "prompt_tokens", None)
+            completion = getattr(usage, "completion_tokens", None)
+            if prompt is None and isinstance(usage, dict):
+                prompt = usage.get("prompt_tokens")
+                completion = usage.get("completion_tokens")
+            self._usage_in += int(prompt or 0)
+            self._usage_out += int(completion or 0)
+        return result
 
     async def chat(
         self,

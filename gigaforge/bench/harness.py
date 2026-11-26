@@ -1153,8 +1153,10 @@ class BenchRunner:
             success=bool(result.accepted) and artifact_ok and text_ok,
             cache_hit=bool(result.cache_hit),
             llm_calls=llm_calls,
-            tokens_in=_bench_tokens(provider, "usage_in"),
-            tokens_out=_bench_tokens(provider, "usage_out"),
+            # The adapter accumulates usage across calls; the fake keeps its own
+            # counters.  Reading only the provider reported 0/0 for a live run.
+            tokens_in=_bench_tokens(client, "usage_in") or _bench_tokens(provider, "usage_in"),
+            tokens_out=_bench_tokens(client, "usage_out") or _bench_tokens(provider, "usage_out"),
             latency_s=latency,
             applied_files=list(result.changed_files),
             diff_substring_found=diff_substring_found,
