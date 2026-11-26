@@ -1,0 +1,114 @@
+name: bench-live
+
+# The nightly run against the real model.
+#
+# **Why this file has to exist.**  `ci.yml` runs the bench with the scripted
+# fake provider, which is the right thing for a push gate: it is fast, it is
+# deterministic, and it catches a regression in the harness.  But it says
+# nothing about generation quality, because the fake answers per section from a
+# script.  A green CI therefore meant "the plumbing works", and every claim
+# about the model's output rested on someone remembering to run the bench by
+# hand.  This workflow is that memory.
+#
+# It is deliberately NOT a push gate.  A live run costs tokens, takes minutes,
+# and is stochastic — gating a merge on it would make the suite flaky and
+# expensive.  It runs nightly, and on demand.
+#
+# `--repeats 3` is not decoration.  One run of a stochastic pipeline is a coin
+# flip reported as a fact: "5/5 passed" cannot distinguish a harness that works
+# every time from one that works four times in five, and that difference is the
+# whole question.  Three attempts per task give `pass_at_k` a denominator.
+
+on:
+  schedule:
+    # 03:17 UTC — off the hour, so it does not queue behind every other nightly
+    # job on the shared runners.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      repeats:
+        description: "Independent attempts per task (pass@k)"
+        required: false
+        default: "3"
+      tasks:
+        description: "Comma-separated task names (empty = all)"
+        required: false
+        default: ""
+
+concurrency:
+  # A nightly run that is still going when the next one starts is a run that
+  # will be killed halfway and report a partial result as a failure.
+  group: bench-live
+  cancel-in-progress: false
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]" || pip install -e .
+
+      - name: Check the credential is present
+        # Fail loudly and early.  A live bench that silently falls back to the
+        # fake provider is worse than no bench: it reports a green result for a
+        # run that never touched the model.
+        env:
+          GIGAFORGE_AUTH_KEY: ${{ secrets.GIGAFORGE_AUTH_KEY }}
+        run: |
+          if [ -z "$GIGAFORGE_AUTH_KEY" ]; then
+            echo "::error::GIGAFORGE_AUTH_KEY is not set. Add it under Settings → Secrets → Actions."
+            echo "Without it the live bench would fall back to the scripted fake and report a green result for a run that never called the model."
+            exit 1
+          fi
+          echo "credential present (${#GIGAFORGE_AUTH_KEY} chars)"
+
+      - name: Live bench
+        env:
+          GIGAFORGE_AUTH_KEY: ${{ secrets.GIGAFORGE_AUTH_KEY }}
+          GIGAFORGE_SCOPE: ${{ secrets.GIGAFORGE_SCOPE || 'GIGACHAT_API_PERS' }}
+          GIGAFORGE_VERIFY_SSL: "false"
+        run: |
+          REPEATS="${{ github.event.inputs.repeats || '3' }}"
+          python -m gigaforge.cli bench --live --repeats "$REPEATS" --out bench-live.json -v
+
+      - name: Summarise
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, os, sys
+          path = "bench-live.json"
+          if not os.path.exists(path):
+              print("no bench-live.json was written — the run died before reporting")
+              sys.exit(0)
+          rows = json.load(open(path))
+          print(f"{'task':<28} {'pass@k':>8} {'tokens':>8}  error")
+          print("-" * 78)
+          for r in rows:
+              k = r.get("repeats", 1) or 1
+              passed = r.get("passes", 1 if r.get("success") else 0)
+              print(f"{r['name']:<28} {passed}/{k:<6} {r.get('tokens_total', 0):>8}  "
+                    f"{str(r.get('error') or '')[:40]}")
+          total = len(rows)
+          ok = sum(1 for r in rows if r.get("success"))
+          print("-" * 78)
+          print(f"{ok}/{total} tasks passed")
+          PY
+
+      - name: Upload the live report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-live-${{ github.run_id }}
+          path: bench-live.json
+          if-no-files-found: warn
+          retention-days: 30
