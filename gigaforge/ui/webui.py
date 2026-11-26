@@ -52,7 +52,7 @@ def is_loopback_host(host: str) -> bool:
 _CSS = """
 :root{
   --bg:#f3f8fd; --bg2:#ffffff; --panel:#ffffffd9; --panel-solid:#ffffff;
-  --line:#dce9f5; --line2:#bfd7eb; --fg:#183b66; --fg-dim:#718bad;
+  --line:#dce9f5; --line2:#bfd7eb; --fg:#183b66; --fg-dim:#55708f;
   --accent:#328df2; --accent2:#21b6d2; --ok:#1da96a; --warn:#bd7b11; --bad:#d64d63;
   --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
   --sans:system-ui,-apple-system,"Segoe UI",Roboto,Inter,Arial,sans-serif;
@@ -130,6 +130,13 @@ th{color:var(--fg-dim);font-family:var(--mono);font-size:10.5px;text-transform:u
 tbody tr:hover{background:#f0f7fd}
 td.num{text-align:right;font-variant-numeric:tabular-nums;font-family:var(--mono)}
 .scroll{max-height:380px;overflow:auto}
+/* A grid item's default ``min-width:auto`` refuses to shrink below its
+   content, so a seven-column table pushed the whole page 111px past a 375px
+   viewport.  ``min-width:0`` lets the column shrink and the table scroll
+   inside its own box -- reflow, not clipping.  Measured: overflow 375px=yes
+   before, no after. */
+.cols > *{min-width:0}
+.scroll{overflow-x:auto}
 .steps{display:flex;flex-direction:column;gap:7px}
 .step{display:grid;grid-template-columns:26px 1fr auto auto;gap:10px;align-items:center;padding:9px 11px;border:1px solid var(--line);border-radius:11px;background:#f9fcff}
 .step .name{font-family:var(--mono);font-weight:600}
@@ -149,7 +156,7 @@ pre.diff .a{color:#157b4d;background:#e8f8ef}
 pre.diff .d{color:#b83d51;background:#fff0f1}
 pre.diff .h{color:var(--accent)}
 pre.diff .m{color:#665ce7;font-weight:600}
-pre.diff .c{color:#718bad}
+pre.diff .c{color:#55708f}
 .trace{font-family:var(--mono);font-size:12px}
 .trace .row{display:grid;grid-template-columns:96px 158px 1fr;gap:10px;padding:6px 4px;border-bottom:1px solid var(--line)}
 .trace .ts{color:var(--fg-dim)}

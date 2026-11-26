@@ -167,3 +167,56 @@ def test_the_harness_styles_do_not_clip_horizontally():
     # The reflow that replaces it must still be there, or the removal is just
     # a deletion: one column on a phone is the actual fix.
     assert "grid-template-columns: 1fr" in css
+
+
+@pytest.mark.skipif(not _playwright_available(), reason="playwright is not installed")
+def test_a_scroll_box_is_reflow_not_overflow(tmp_path):
+    """A wide table in ``overflow-x:auto`` is reachable, so it is not a defect.
+
+    The gate had only two states: a clipped page and a fitting page.  A correct
+    responsive page -- wide table inside a scroll box -- measured as overflow,
+    so the gate could not pass the very layout WCAG asks for.  A gate that can
+    only fail is a gate people switch off, which returns the project to having
+    no gate at all.
+
+    The control is the next test: the same geometry with ``overflow:hidden``
+    must still fail, or this change turned the detector off instead of teaching
+    it the difference.
+    """
+    from gigaforge.harness.wcag import measure
+
+    page = tmp_path / "scrollbox.html"
+    page.write_text(
+        "<!doctype html><html><head><style>"
+        "html,body{margin:0} .scroll{overflow-x:auto;max-width:100%}"
+        "table{width:465px;border-collapse:collapse}"
+        "</style></head><body>"
+        "<div class='scroll'><table><tr><th>a</th><th>b</th><th>c</th></tr>"
+        "<tr><td>1</td><td>2</td><td>3</td></tr></table></div>"
+        "</body></html>",
+        encoding="utf-8",
+    )
+    report = measure(page)
+    assert not report.error, report.error
+    assert report.overflow_375 is False, report.overflow_375_offenders
+
+
+@pytest.mark.skipif(not _playwright_available(), reason="playwright is not installed")
+def test_the_same_geometry_clipped_still_fails(tmp_path):
+    """``overflow:hidden`` hides the content instead of letting the reader reach it."""
+    from gigaforge.harness.wcag import measure
+
+    page = tmp_path / "clipped.html"
+    page.write_text(
+        "<!doctype html><html><head><style>"
+        "html,body{margin:0} .clip{overflow:hidden;max-width:100%}"
+        "table{width:900px;border-collapse:collapse}"
+        "</style></head><body>"
+        "<div class='clip'><table><tr><th>a</th><th>b</th><th>c</th></tr>"
+        "<tr><td>1</td><td>2</td><td>3</td></tr></table></div>"
+        "</body></html>",
+        encoding="utf-8",
+    )
+    report = measure(page)
+    assert not report.error, report.error
+    assert report.overflow_375 is True, "clipped content must still count"

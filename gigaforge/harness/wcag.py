@@ -92,6 +92,33 @@ _OVERFLOW_JS = r"""
   const vw = window.innerWidth;
   const out = [];
   const all = document.querySelectorAll('body *');
+
+  // **Reachable is not overflow.**  A wide table inside
+  // ``.scroll{overflow-x:auto}`` sticks out past the element's own box, and
+  // that is reflow: the reader scrolls to it, which is exactly what WCAG 1.4.10
+  // asks for.  Counting it made the gate unable to pass a correct responsive
+  // page -- and a gate that can only fail is a gate people switch off.
+  //
+  // The distinction is the ancestor chain: an element is *unreachable* only
+  // when every scrolling ancestor is itself outside the viewport, or when the
+  // clipping ancestor does not scroll at all (``hidden``/``clip`` -- the
+  // defect the review reproduced).
+  const reachable = (el) => {
+    let node = el.parentElement;
+    while (node && node !== document.body) {
+      const cs = getComputedStyle(node);
+      const ox = cs.overflowX;
+      const scrolls = ox === 'auto' || ox === 'scroll';
+      if (scrolls) {
+        const nr = node.getBoundingClientRect();
+        // A scroll box that itself fits on screen makes its content reachable.
+        if (nr.right <= vw + 1 && nr.left >= -1) return true;
+      }
+      node = node.parentElement;
+    }
+    return false;
+  };
+
   for (const el of all) {
     const cs = getComputedStyle(el);
     if (cs.display === 'none' || cs.visibility === 'hidden') continue;
@@ -99,7 +126,7 @@ _OVERFLOW_JS = r"""
     if (r.width <= 0 && r.height <= 0) continue;
     // A right edge past the viewport is the defect.  A 1px tolerance absorbs
     // sub-pixel rounding, which is not a layout bug.
-    if (r.right > vw + 1) {
+    if (r.right > vw + 1 && !reachable(el)) {
       out.push({
         tag: el.tagName.toLowerCase(),
         cls: (el.className && String(el.className).slice(0, 60)) || '',
