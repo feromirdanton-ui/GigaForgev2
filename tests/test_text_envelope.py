@@ -71,3 +71,21 @@ def test_a_fenced_block_that_is_not_a_diff_is_unchanged() -> None:
 
 def test_an_empty_reply_is_unchanged() -> None:
     assert _unwrap_text_envelope("") == ""
+
+
+def test_a_json_call_record_is_unwrapped() -> None:
+    """Measured live on the analysis goal: a correct diagnosis inside a record."""
+    text = (
+        '[{"tool": "chat-answer", "args": {"response": "The issue with the '
+        "'mul' function in calc.py is that it incorrectly implements addition "
+        '(a+b) instead of multiplication (a*b)."}}]'
+    )
+    out = _unwrap_text_envelope(text)
+    assert out.startswith("The issue with the 'mul' function")
+    assert "chat-answer" not in out
+
+
+def test_a_plain_json_object_is_not_mangled() -> None:
+    """A reply that is not a call record comes back unchanged."""
+    text = '{"answer": "short"}'
+    assert _unwrap_text_envelope(text) == text

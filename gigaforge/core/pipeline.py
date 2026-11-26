@@ -5327,6 +5327,14 @@ def _unwrap_text_envelope(text: str) -> str:
     import re as _re
 
     stripped = text.strip()
+    # A JSON tool-call envelope: measured live on the analysis goal, the reply
+    # was [{"tool": "chat-answer", "args": {"response": "The issue with mul
+    # is..."}}] — a correct diagnosis inside a call record.  The content is
+    # there and extraction is exact, so the harness extracts it.
+    if stripped[:1] in "[{":
+        unwrapped = _unwrap_json_envelope(stripped)
+        if unwrapped:
+            return unwrapped
     fence = _re.match(r"^```(?:diff|patch)\s*\n(.*?)\n```\s*$", stripped, _re.DOTALL)
     if not fence:
         return text
@@ -5391,6 +5399,50 @@ def _unwrap_call_envelope(body: str) -> str:
     if len(content) < 80:
         return ""
     return content
+
+
+def _unwrap_json_envelope(text: str) -> str:
+    """The prose inside a JSON tool-call record, or ``""``.
+
+    **The failure.**  Measured live on the analysis goal: the reply was
+
+        [{"tool": "chat-answer", "args": {"response": "The issue with the 'mul'
+        function in calc.py is that it incorrectly implements addition..."}}]
+
+    A correct diagnosis, inside a call record.  The model is answering through
+    the only channel it has been shown — a tool call — and the harness was
+    delivering the record instead of the answer.
+
+    **The rule.**  Walk the JSON for the first string that is long enough to be
+    prose and is not a tool name or a key.  Extraction is exact; a reply that is
+    not a call record returns ``""`` and the caller keeps it unchanged.
+    """
+    import json as _json
+
+    try:
+        data = _json.loads(text)
+    except (TypeError, ValueError):
+        return ""
+    candidates: list[str] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, str):
+            candidates.append(node)
+        elif isinstance(node, Mapping):
+            for key, value in node.items():
+                if str(key).lower() in {"tool", "name", "action", "type", "path"}:
+                    continue
+                walk(value)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                walk(item)
+
+    walk(data)
+    for candidate in candidates:
+        body = candidate.strip()
+        if len(body) >= 40 and "\n" in body or len(body) >= 120:
+            return body
+    return ""
 
 
 def _tool_envelope_issue(text: str) -> str:
