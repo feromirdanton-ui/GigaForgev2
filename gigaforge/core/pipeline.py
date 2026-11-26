@@ -3957,6 +3957,14 @@ class TaskPipeline:
         if render_unmet:
             accepted = False
             ctx.extras["contract_unmet"] = list(ctx.extras.get("contract_unmet") or []) + render_unmet
+        # Contrast is part of "the page works".  A run that ships white text on
+        # a white card has produced a page a reader cannot read, and the render
+        # check cannot see it: it counts structure, not legibility.  Measured
+        # live in --subagents mode at 1.10 against a 3.0 floor, accepted.
+        wcag_unmet = self._check_wcag(ctx, changed)
+        if wcag_unmet:
+            accepted = False
+            ctx.extras["contract_unmet"] = list(ctx.extras.get("contract_unmet") or []) + wcag_unmet
         # A code change is graded by a contract too.  "The tests passed" is both
         # too weak (a diff that touches files the goal never named, or deletes a
         # public function, passes as long as some test is green) and too strong
@@ -4146,6 +4154,66 @@ class TaskPipeline:
                     css_leak=facts.get("css_leak_chars"),
                     unmet=unmet[:4])
         return [f"render: {item}" for item in unmet]
+
+    def _check_wcag(self, ctx: RunContext, changed: Sequence[str]) -> list[str]:
+        """Measure the page's contrast and return what fails WCAG AA.
+
+        **Why this is a gate and not a report.**  ``wcag.py`` existed, was
+        covered by tests, and was called by nothing — so a run could ship white
+        text on a white card and settle as accepted.  Measured live in
+        ``--subagents`` mode: ``h3 rgb(232,246,255) on rgb(255,255,255): 1.10``
+        against a 3.0 floor, accepted.  A check that does not affect the verdict
+        is a check that does not exist.
+
+        Only contrast is gated.  Overflow is measured and recorded but not
+        fatal: a wide table in a scroll box is reflow, and failing a run for it
+        would be the same mistake in the other direction.
+
+        A missing browser is a **degradation**, not a pass: the run records that
+        contrast was not measured, so the report can say "not checked" rather
+        than implying "checked and fine".
+        """
+        kind = ctx.extras.get("task_kind") or {}
+        if not kind.get("kind") or kind.get("kind") == "code":
+            return []
+        pages = [p for p in changed if str(p).lower().endswith((".html", ".htm"))]
+        if not pages:
+            return []
+        root = self._repo_root()
+        page = (root / str(pages[0])).resolve()
+        try:
+            page.relative_to(root)
+        except ValueError:
+            return []
+        if not page.is_file():
+            return []
+        try:
+            from gigaforge.harness.wcag import measure
+        except Exception as exc:  # noqa: BLE001 - an optional module
+            self._degraded("wcag_import", exc, "settle")
+            return []
+        report = measure(page)
+        ctx.extras["wcag"] = report.to_dict()
+        if report.error:
+            note = getattr(ctx.state, "note_degraded", None)
+            if callable(note):
+                note(what="wcag", why=str(report.error)[:200], where="settle")
+            self._event("pipeline.wcag_unavailable", run_id=ctx.run_id,
+                        reason=str(report.error)[:200])
+            return []
+        self._event(
+            "pipeline.wcag", run_id=ctx.run_id,
+            min_ratio=report.min_ratio, failures=len(report.failures),
+            overflow_375=report.overflow_375,
+        )
+        return [
+            "contrast: {tag} {fg} on {bg}: {ratio:.2f} < {need:.1f} ({text})".format(
+                tag=item.tag, fg=item.fg, bg=item.bg,
+                ratio=item.ratio, need=item.required,
+                text=(item.sample or "")[:48],
+            )
+            for item in report.failures
+        ]
 
     def _check_html_structure(self, changed: Sequence[str]) -> list[str]:
         """Return structural HTML defects that deterministic repair could not fix."""
