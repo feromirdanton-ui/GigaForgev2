@@ -263,6 +263,31 @@ gigaforge bench           # offline benchmark across toy tasks
 gigaforge run "<goal>" --dry-run    # full DAG, nothing written to the workspace
 ```
 
+### The panel's own gates
+
+`gigaforge wcag <page>` measures one rendered page. The control room is four
+views in one page and three of them are `display:none` until a tab is opened,
+so a single `wcag` run checks Overview and silently skips Steps, Trace and
+Diff. These two scripts close that gap, and CI runs both:
+
+```bash
+python scripts/_render_panel.py /tmp/panel.html        # populated snapshot -> HTML
+python scripts/ui_design_audit.py --label ci           # all 4 views x 1440/375/320
+python scripts/ui_state_check.py /tmp/panel.html       # tablist, focus ring, aria-busy
+```
+
+`ui_design_audit.py` fails on any text pair below AA and writes a screenshot
+per view, so a before/after pair is reproducible instead of anecdotal.
+`ui_state_check.py` checks what a colour probe cannot see: that the tab strip
+is a real ARIA tablist, that arrow keys move between tabs, that a focus ring is
+painted, and that the page logs no console error.
+
+The QML surface has its own gate, because it is the primary one:
+
+```bash
+python -m pytest tests/test_qml_tokens.py    # every token, all three themes
+```
+
 ## Docs
 
 - [`docs/DESKTOP.md`](docs/DESKTOP.md) — the window: structure, threading, theming
