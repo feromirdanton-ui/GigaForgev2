@@ -255,7 +255,16 @@ class FirewallConfig:
     #: Codes that hard-fail verification. ``WEB`` covers the structural HTML checks
     #: (no <html>/<body>/<title>, or a page that is a stub) — the only gate that
     #: exists for markup, since neither ruff nor tree-sitter parses it.
-    ruff_fatal_select: tuple[str, ...] = ("E9", "F82", "WEB")
+    #: Diagnostic prefixes that make a diff fatal.
+    #:
+    #: ``E9`` covered syntax errors until ruff renamed the code from ``E999`` to
+    #: ``invalid-syntax``.  ``_is_fatal`` matches by *prefix*, and no prefix in
+    #: this tuple matches ``invalid-syntax``, so a file that does not parse
+    #: stopped being fatal -- measured on ``psf__requests-1142``: ruff reported
+    #: ``invalid-syntax: Expected an indented block after 'if' statement`` and the
+    #: diff was accepted.  The explicit name is listed rather than relying on the
+    #: numeric prefix, which no longer describes the code.
+    ruff_fatal_select: tuple[str, ...] = ("E9", "F82", "WEB", "invalid-syntax")
 
     # ── misc ─────────────────────────────────────────────────────────────
     repo_root: str = "."

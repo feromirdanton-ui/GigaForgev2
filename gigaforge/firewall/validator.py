@@ -669,6 +669,18 @@ class DiffValidator:
         assert self.store is not None
         if not self.config.check_missing_symbols:
             return []
+        # **A file that does not parse has no call graph.**  tree-sitter recovers
+        # from a syntax error by reading whatever tokens it can find, and on a
+        # broken file those "calls" are garbage -- measured on
+        # ``psf__requests-1142``, where the reported names were literally
+        # ``E501``, ``W293`` and ``invalid-syntax``.  The syntax error is already
+        # reported as its own fatal diagnostic; adding invented symbol names on
+        # top of it sends the repair loop after names that do not exist.
+        try:
+            if not self.linter.syntax_ok(text, path):
+                return []
+        except Exception:  # noqa: BLE001 - the check is an optimisation
+            pass
         try:
             parsed_now = self.parser.parse_source(text, path)
         except Exception:  # noqa: BLE001
