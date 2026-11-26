@@ -977,7 +977,47 @@ class ReActPlan:
                     "plan guard produced no steps; salvaged %d written file(s)",
                     len(steps),
                 )
+        if not steps:
+            # Last resort, and still a fact rather than an invention: the
+            # episode's own action log.  Measured on SWE-bench: the model read
+            # the file, attempted the edit, and stopped at max_steps without
+            # calling ``finish`` — so ``plan`` was empty and the run reported
+            # "did not produce an executable plan" although six real actions
+            # had been taken.  The actions are what happened; a plan built from
+            # them is a record, not a guess.
+            steps = self._steps_from_action_log(getattr(result, "steps", None) or [])
+            if steps:
+                log.info(
+                    "plan guard produced no steps; salvaged %d step(s) from the action log",
+                    len(steps),
+                )
         return steps, verdict
+
+    @staticmethod
+    def _steps_from_action_log(actions: list[Any]) -> list[str]:
+        """Render the episode's performed actions as DAG steps.
+
+        Only actions that actually ran are included, and only the ones that
+        changed or inspected the tree — a ``finish`` or a failed call is not a
+        step.  Deterministic, model-free.
+        """
+        out: list[str] = []
+        for item in actions:
+            if not isinstance(item, dict):
+                continue
+            action = str(item.get("action") or "").strip()
+            if not action or action in {"finish", "think"}:
+                continue
+            observation = str(item.get("observation") or "")
+            if observation.startswith("ERROR"):
+                continue
+            raw = str(item.get("action_input") or "").strip()
+            if len(raw) > 160:
+                raw = raw[:157] + "..."
+            out.append(f"{action}: {raw}" if raw else action)
+            if len(out) >= 8:
+                break
+        return out
 
     @staticmethod
     def _record_failed_usage(state: Any, ledger: Any) -> None:

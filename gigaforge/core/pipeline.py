@@ -3872,10 +3872,17 @@ class TaskPipeline:
         facts = render_facts(page, screenshot=shot)
         ctx.extras["render"] = facts
         if not facts.get("available"):
-            ctx.state.note_degraded(
-                what="render_check", why=str(facts.get("reason") or "unavailable"),
-                where="settle",
-            )
+            # ``note_degraded`` is on the real RunState; a test stub may not
+            # have it, and CI (no headless browser) takes this branch while a
+            # developer machine does not — so the same test passed locally and
+            # failed in CI with "'S' object has no attribute 'note_degraded'".
+            # A degradation note is bookkeeping, never a reason to fail a run.
+            note = getattr(ctx.state, "note_degraded", None)
+            if callable(note):
+                note(
+                    what="render_check", why=str(facts.get("reason") or "unavailable"),
+                    where="settle",
+                )
             self._event("pipeline.render_unavailable", run_id=ctx.run_id,
                         reason=str(facts.get("reason"))[:200])
             return []
