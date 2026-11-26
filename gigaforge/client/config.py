@@ -27,6 +27,12 @@ _ENV_ALIASES: Dict[str, tuple] = {
         "GF_CLIENT__CREDENTIALS",
         "GIGACHAT_AUTH_KEY",
         "GIGACHAT_CREDENTIALS",
+        # The name the CI workflow exports.  Without it the nightly bench
+        # reported 0/7 with "auth_key is empty" while the credential was
+        # present in the environment under this name — the workflow and the
+        # client disagreed about the variable, and the run looked like a
+        # model failure.
+        "GIGAFORGE_AUTH_KEY",
     ),
     "api_base": ("GF_CLIENT__API_BASE", "GIGACHAT_API_BASE"),
     "oauth_url": ("GF_CLIENT__OAUTH_URL", "GIGACHAT_OAUTH_URL"),
