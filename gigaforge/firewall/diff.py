@@ -610,12 +610,60 @@ def _normalise_path(diff_file: DiffFile, config: Optional[FirewallConfig],
             if len(parts) > 1 and parts[0].lower() == root.name.lower():
                 fixed = "/".join(parts[1:])
                 patch_note = "stripped a leading repository-folder segment"
+            # A traceback in the issue names the file by its *installed* path:
+            # ``/home/bbt/.virtualenvs/ispnext/lib/python3.6/site-packages/
+            # django/db/utils.py``.  The model copies that path into the diff
+            # header, and the applier then tries to create a directory tree
+            # named ``home/bbt/...`` inside the repository.  Measured on
+            # django__django-10554: the run burned its whole code budget on a
+            # path that could never exist.  The file is in the repo under a
+            # suffix of that path, so resolve it by suffix — deterministically,
+            # and only when exactly one file matches.
+            resolved = _resolve_by_suffix(fixed, root)
+            if resolved and resolved != fixed:
+                patch_note = f"resolved an installed path to {resolved}"
+                fixed = resolved
         setattr(diff_file, attr, fixed)
     if patch_note:
         parsed.warnings.append(
             f"{diff_file.path}: {patch_note} (the model copied the folder name or "
             "an absolute path into the diff header)"
         )
+
+
+def _resolve_by_suffix(path: str, root: Path) -> str:
+    """Map an installed-file path onto the repository file it names.
+
+    ``home/bbt/.virtualenvs/ispnext/lib/python3.6/site-packages/django/db/
+    utils.py`` is not a repository path, but its tail is: ``django/db/utils.py``.
+    The longest tail that exists in the repository wins, and only when exactly
+    one file matches — a guess between two candidates would be worse than the
+    error it replaces.
+    """
+    if not path or not root or not root.is_dir():
+        return ""
+    parts = [p for p in path.replace("\\", "/").split("/") if p and p != "."]
+    if len(parts) < 2:
+        return ""
+    # Try the longest tail first: ``django/db/utils.py`` before ``db/utils.py``.
+    for start in range(0, len(parts) - 1):
+        tail = "/".join(parts[start:])
+        candidate = root / tail
+        if candidate.is_file():
+            return tail
+    # No exact tail: look for a unique file with the same basename and the same
+    # last directory, which is what a site-packages path usually leaves.
+    if len(parts) >= 2:
+        wanted_dir, wanted_name = parts[-2], parts[-1]
+        matches = [
+            p.relative_to(root).as_posix()
+            for p in root.rglob(wanted_name)
+            if p.is_file() and p.parent.name == wanted_dir
+            and not any(part in {".git", "node_modules", "__pycache__"} for part in p.parts)
+        ]
+        if len(matches) == 1:
+            return matches[0]
+    return ""
 
 
 def _definitions(text: str) -> list[str]:

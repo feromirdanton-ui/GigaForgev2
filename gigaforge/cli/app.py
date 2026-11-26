@@ -1003,6 +1003,13 @@ def bench(
             help="Use the real provider instead of the scripted fake (nightly).",
         ),
     ] = False,
+    baseline: Annotated[
+        str,
+        typer.Option(
+            "--baseline",
+            help="Compare against this earlier --out JSON and apply the noise floor.",
+        ),
+    ] = "",
 ) -> None:
     """Run the offline benchmark suite across tasks.
 
@@ -1020,6 +1027,36 @@ def bench(
 
     runner = BenchRunner(repeats=repeats, live=live)
     results = runner.run_all()
+    if baseline:
+        # ``noise_floor`` existed and was covered by tests, but nothing in the
+        # product called it: a comparison between two live runs was a person
+        # reading two tables.  A stochastic pipeline moves by one task between
+        # runs for no reason, and the floor is what separates that from a real
+        # change.
+        import json as _json
+        from pathlib import Path as _Path
+
+        from gigaforge.bench.report import delta_report, noise_floor
+        from gigaforge.bench.harness import BenchResult as _BenchResult
+
+        rows = _json.loads(_Path(baseline).read_text(encoding="utf-8"))
+        before = [
+            _BenchResult(
+                name=row["name"],
+                task=row.get("task", ""),
+                success=bool(row.get("success")),
+                cache_hit=bool(row.get("cache_hit")),
+                llm_calls=int(row.get("llm_calls", 0) or 0),
+                tokens_in=int(row.get("tokens_in", 0) or 0),
+                tokens_out=int(row.get("tokens_out", 0) or 0),
+                latency_s=float(row.get("latency_s", 0.0) or 0.0),
+                error=str(row.get("error") or ""),
+                attempts=int(row.get("attempts", 1) or 1),
+                passes=int(row.get("passes", 1 if row.get("success") else 0) or 0),
+            )
+            for row in rows
+        ]
+        typer.echo(delta_report(noise_floor(before, results)))
     if out:
         import json as _json
         from pathlib import Path

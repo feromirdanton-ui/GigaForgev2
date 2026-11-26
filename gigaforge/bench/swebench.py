@@ -271,6 +271,16 @@ def _pytest_node_ids(tests: Iterable[str]) -> list[str]:
 def _run_tests(nodes: Sequence[str], cwd: Path, timeout: int = 600) -> tuple[bool, str]:
     if not nodes:
         return True, "no tests named"
+    # Django names its tests as dotted paths (``auth_tests.test_validators.
+    # UsernameValidatorsTests.test_ascii_validator``) and runs them through its
+    # own ``tests/runtests.py``; pytest answers "file or directory not found"
+    # for every one of them.  Measured on django__django-10097 and -10554: both
+    # were reported as environment errors while the model's diff was fine.
+    runtests = cwd / "tests" / "runtests.py"
+    if runtests.is_file() and all("::" not in n for n in nodes):
+        cmd = [sys.executable, str(runtests), "--verbosity", "1", *nodes]
+        code, out = _run(cmd, cwd=cwd, timeout=timeout)
+        return code == 0, out[-1500:]
     cmd = [sys.executable, "-m", "pytest", "-q", "--no-header", "-p", "no:cacheprovider", *nodes]
     code, out = _run(cmd, cwd, timeout=timeout)
     return code == 0, out[-1500:]
@@ -288,6 +298,7 @@ _ENV_FAILURE_MARKERS = (
     "No module named",
     "error: command 'gcc' failed",
     "ERROR: file or directory not found",
+    "no tests ran",
     "INTERNALERROR",
 )
 
@@ -337,13 +348,30 @@ def _install_test_requirements(cwd: Path) -> str:
     # (setuptools_scm writes ``version.py`` at build time).  Without this the
     # tests die on "could not determine astropy package version" — an
     # environment error that reads like a broken model change.
+    #
+    # A full editable install is not always possible: astropy 5.1's setup.py
+    # imports ``setuptools.dep_util``, removed in modern setuptools, so the
+    # build fails for a reason that has nothing to do with the model.  The
+    # version file is the only thing the tests actually need from the build,
+    # and setuptools_scm can produce it directly.
     code, out = _run(
         [sys.executable, "-m", "pip", "install", "--quiet", "--no-input",
          "--no-deps", "--no-build-isolation", "-e", "."],
         cwd=cwd,
         timeout=900,
     )
-    notes.append(f"editable install: {'ok' if code == 0 else out[-200:]}")
+    notes.append(f"editable install: {'ok' if code == 0 else 'failed'}")
+    if code != 0:
+        code, out = _run(
+            [sys.executable, "-c",
+             "import pathlib, setuptools_scm;"
+             "v = setuptools_scm.get_version(root='.');"
+             "pathlib.Path('astropy/version.py').write_text("
+             "f'version = {v!r}\\n__version__ = {v!r}\\n')"],
+            cwd=cwd,
+            timeout=120,
+        )
+        notes.append(f"version.py: {'ok' if code == 0 else out[-200:]}")
     return "; ".join(notes)
 
 
