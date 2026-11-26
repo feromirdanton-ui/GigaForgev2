@@ -41,6 +41,31 @@ class Token:
         return self.expires_at - (time.time() if now is None else now)
 
 
+def _bare_auth_key(value: str) -> str:
+    """The credential without a scheme prefix the operator may have left on it.
+
+    **The defect this fixes.**  ``.env`` files in the wild — including the one
+    this project is tested against — carry the key as ``Basic MDE5...``, because
+    that is how the provider's own docs and Postman collections show it.  The
+    client then sent ``Basic Basic MDE5...`` and the provider answered 401.  The
+    failure looks like a bad credential, so it sends the operator hunting for a
+    new key; measured live, it cost the whole first live run.
+
+    Accepting both spellings is the only sane answer: the prefix is not part of
+    the secret, and a credential is not more correct for having it stripped by
+    hand.
+    """
+    text = (value or "").strip()
+    # A bare scheme word is not a key either; stripping the trailing space first
+    # would otherwise leave "Basic" standing as the credential.
+    if text.lower() == "basic":
+        return ""
+    for prefix in ("Basic ", "basic ", "BASIC "):
+        if text.startswith(prefix):
+            return text[len(prefix):].strip()
+    return text
+
+
 class TokenProvider:
     """Thread-safe, proactively refreshing OAuth token provider."""
 
@@ -174,7 +199,7 @@ class TokenProvider:
             "Accept": "application/json",
             # RqUID is a per-request correlation id the provider logs; keep it.
             "RqUID": str(uuid.uuid4()),
-            "Authorization": f"Basic {cfg.auth_key}",
+            "Authorization": f"Basic {_bare_auth_key(cfg.auth_key)}",
         }
         transport = self._transport
         if transport is None:

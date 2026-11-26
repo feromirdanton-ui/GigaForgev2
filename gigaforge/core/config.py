@@ -193,16 +193,22 @@ class CoreConfig:
     log_level: str = "INFO"
 
     # ── routing ──────────────────────────────────────────────────────────────
-    default_model: str = "GigaChat"
-    cheap_model: str = "GigaChat"
-    strong_model: str = "GigaChat-Pro"
+    default_model: str = "GigaChat-2"
+    cheap_model: str = "GigaChat-2"
+    strong_model: str = "GigaChat-2-Pro"
     #: The model L3 buys.  It must be a *different* model from ``strong_model``,
     #: or the ladder's top rung is a no-op: measured on the previous build, L2
     #: and L3 resolved to ``GigaChat-Pro`` on plan/code/fix/react, so escalating
     #: a step that had failed twice bought the same model that had just failed
     #: twice.  Empty means "no flagship is configured", and the ladder then stops
     #: at L2 rather than pretending to escalate.
-    flagship_model: str = ""
+    #:
+    #: The defaults are the account's real catalogue, not a guess: the provider
+    #: lists GigaChat-2, -2-Pro, -2-Max, -3-Lightning, -3-Pro, -3-Ultra.  The
+    #: previous defaults named ``GigaChat`` / ``GigaChat-Pro``, which are *not* in
+    #: the catalogue, so every live call answered 404 model-not-found while the
+    #: tests passed — they never reached the provider.
+    flagship_model: str = "GigaChat-2-Max"
     max_concurrency: int = 4
 
     # ── DAG execution ────────────────────────────────────────────────────────
@@ -349,10 +355,10 @@ class CoreConfig:
             db_path=text("db_path", ".gigaforge/core.sqlite3"),
             trace_path=text("trace_path", ".gigaforge/traces/core.jsonl"),
             log_level=text("log_level", "INFO"),
-            default_model=text("default_model", "GigaChat"),
-            cheap_model=text("cheap_model", "GigaChat"),
-            strong_model=text("strong_model", "GigaChat-Pro"),
-            flagship_model=text("flagship_model", ""),
+            default_model=text("default_model", "GigaChat-2"),
+            cheap_model=text("cheap_model", "GigaChat-2"),
+            strong_model=text("strong_model", "GigaChat-2-Pro"),
+            flagship_model=text("flagship_model", "GigaChat-2-Max"),
             max_concurrency=integer("max_concurrency", 4),
             node_timeout=number("node_timeout", 120.0),
             react_timeout=number("react_timeout", 480.0),
