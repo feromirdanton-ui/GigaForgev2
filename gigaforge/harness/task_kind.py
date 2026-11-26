@@ -153,6 +153,30 @@ PAGE_PHRASES: tuple[str, ...] = (
     "homepage",
     "one-page site",
     "one page site",
+    # Measured live: "Build a one-page landing site for GigaForge ..." was
+    # classified ``code`` because only "landing page" was listed.  The run went
+    # through the coder, which wrote ``landing_page.html`` full of
+    # "Feature 1 / Description of feature 1" in 2 202 bytes and was rejected —
+    # the correct output for this goal is the sectional page builder, and the
+    # task class is what chooses it.  A phrase list that knows one spelling of
+    # "site" is a list that routes half the real goals to the wrong executor.
+    "landing site",
+    "one-page landing",
+    "one page landing",
+    "single-page site",
+    "single page site",
+    "marketing site",
+    "promo site",
+    "promo page",
+    "product page",
+    "portfolio site",
+    "portfolio page",
+    "лендинг",
+    "лендинговая страница",
+    "веб-страниц",
+    "веб-сайт",
+    "сайт-визитк",
+    "одностраничный сайт",
 )
 
 
