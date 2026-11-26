@@ -101,6 +101,15 @@ class TaskFixture:
     #: review named as "held up by crutches around the patch" were the two the
     #: bench could not measure at all.
     text_responses: dict[str, str] = field(default_factory=dict)
+    #: Section bodies for the document pipeline, keyed by section title.
+    #:
+    #: **Why keyed by title and not by position.**  The document pipeline asks
+    #: for one section per call, and the prompt names the section
+    #: (``Write the section 'Intake' of the document ...``).  A positional list
+    #: would hand the wrong body to a section as soon as the plan's order
+    #: changed, and the bench would then measure the fixture's ordering rather
+    #: than the pipeline's assembly.
+    document_sections: dict[str, str] = field(default_factory=dict)
     #: What the finished text must contain.  The text analogue of
     #: ``artifact_must_contain``: a document has no tests, so its acceptance is a
     #: set of facts about the prose.
@@ -540,6 +549,33 @@ TASK7 = TaskFixture(
     test_command=[],
     expected_diff_substring="",
     text_responses={"summarize": _TASK7_DOC},
+    document_sections={
+        "Intake": (
+            "The goal is classified before any model is called. A page goal, a "
+            "patch goal, a question and a document take different paths, and the "
+            "classifier decides which one from the goal text alone. The verdict "
+            "carries its evidence, so the ledger can show why a path was chosen "
+            "instead of asserting it."
+        ),
+        "Plan": (
+            "The planner produces steps. A step that names a tool the harness does "
+            "not have is dropped, and a plan with no executable step is legal for "
+            "a read-only task. For a page the plan is its sections, which the "
+            "harness decides rather than the model."
+        ),
+        "Act": (
+            "The executor writes a diff, a page section, or a reply. The shape is "
+            "chosen by the task class, not by the model. A document is written one "
+            "section at a time, each against the facts gathered for it, so a "
+            "section cannot pad itself with invented detail."
+        ),
+        "Verify": (
+            "The artifact is checked against the goal: structure for a page, tests "
+            "for a patch, citations for an answer, and a placeholder check for a "
+            "document. A run that cannot prove its work has failed, and the "
+            "failure names the check that refused it."
+        ),
+    },
     text_must_contain=("## Intake", "## Plan", "## Act", "## Verify"),
     text_min_chars=400,
 )
@@ -687,6 +723,16 @@ class BenchFakeGigaClient:
                 else (self._fixture.review_responses[0] if self._fixture.review_responses
                       else _TASK1_REVIEW_OK)
             )
+        elif phase == "research":
+            # The document pipeline's gathering stage.  The fake returns a short
+            # fact list: the point of the stage is that the writer is given
+            # facts, and the bench checks the assembled document, not the list.
+            content = "- the harness classifies the goal first\n- the plan is computed, not asked"
+        elif phase == "document":
+            # One section per call; the prompt names which one.
+            match = re.search(r"Write the section '([^']+)'", prompt)
+            title = match.group(1) if match else ""
+            content = self._fixture.document_sections.get(title, "")
         elif phase in self._fixture.text_responses:
             # A text product: the fixture answers the writing phase directly.
             content = self._fixture.text_responses[phase]
@@ -732,6 +778,14 @@ _PHASE_HINTS = (
     ("plan", ("декомпозиц", "разложи", "decompos", "step-by-step plan")),
     ("review", ("ревьюер", "reviewer", "конституц")),
     ("summarize", ("суммар", "summar", "итог")),
+    # The document pipeline's two phases.  Without these the fake inferred
+    # ``code`` for both, answered with an empty ``code_responses`` entry, and
+    # the assembled document was four "No content was produced" placeholders —
+    # the bench then reported a 273-char document and blamed the harness.
+    # ``document`` is listed before the default so "Write the section 'X'"
+    # resolves to the section writer rather than to the coder.
+    ("document", ("write the section",)),
+    ("research", ("list the concrete facts", "facts needed to write")),
 )
 
 

@@ -1164,6 +1164,51 @@ def swebench(
 
 
 @app.command()
+def wcag(
+    page: Annotated[str, typer.Argument(help="Path to the rendered HTML page.")],
+    as_json: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """Measure WCAG 2.1 contrast and 375px overflow on a rendered page.
+
+    The render check answers "is the layout right"; this answers "can a person
+    read it, and does it fit a phone".  They are different questions: a page
+    with a correct 4-card grid and ``#00ffcc`` on ``#ffffff`` passes every
+    structural check and is unreadable.
+
+    Deterministic — it reads computed colours out of headless Chromium and
+    computes the ratio, so the number is the same every run.  Exit code 1 when
+    a pair fails AA or the page overflows at 375px, so CI can gate on it.
+    """
+    import json as _json
+    from pathlib import Path
+
+    from gigaforge.harness.wcag import measure
+
+    report = measure(Path(page))
+    if as_json:
+        typer.echo(_json.dumps(report.to_dict(), indent=2))
+    else:
+        if report.error:
+            typer.echo(f"cannot measure: {report.error}", err=True)
+        else:
+            typer.echo(
+                f"checked {len(report.pairs)} text/background pair(s); "
+                f"min ratio {report.min_ratio:.2f}"
+            )
+            for pair in report.failures:
+                typer.echo(
+                    f"  FAIL {pair.tag} {pair.fg} on {pair.bg}: "
+                    f"{pair.ratio:.2f} < {pair.required} ({pair.sample!r})"
+                )
+            typer.echo(
+                f"overflow: 375px={'yes' if report.overflow_375 else 'no'} "
+                f"1440px={'yes' if report.overflow_1440 else 'no'}"
+            )
+            typer.echo("PASS" if report.ok else "FAIL")
+    raise typer.Exit(code=0 if report.ok else 1)
+
+
+@app.command()
 def outline(
     goal: Annotated[str, typer.Argument(help="What the document is about.")],
     sections: Annotated[

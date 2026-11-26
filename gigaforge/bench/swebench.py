@@ -268,7 +268,17 @@ def _pytest_node_ids(tests: Iterable[str]) -> list[str]:
     return [t for t in tests if t.strip()]
 
 
-def _run_tests(nodes: Sequence[str], cwd: Path, timeout: int = 600) -> tuple[bool, str]:
+def _run_tests(
+    nodes: Sequence[str], cwd: Path, timeout: int = 600, python: str = ""
+) -> tuple[bool, str]:
+    """Run the named tests with the *instance's* interpreter.
+
+    ``python`` is the per-instance venv (see :func:`_make_venv`).  Running the
+    tests with the sandbox's own interpreter was the second half of the same
+    isolation defect: even with a clean install, ``python -m pytest`` resolved
+    to whatever pytest the sandbox had, not the one the repo declares.
+    """
+    py = python or sys.executable
     if not nodes:
         return True, "no tests named"
     # Django names its tests as dotted paths (``auth_tests.test_validators.
@@ -278,10 +288,10 @@ def _run_tests(nodes: Sequence[str], cwd: Path, timeout: int = 600) -> tuple[boo
     # were reported as environment errors while the model's diff was fine.
     runtests = cwd / "tests" / "runtests.py"
     if runtests.is_file() and all("::" not in n for n in nodes):
-        cmd = [sys.executable, str(runtests), "--verbosity", "1", *nodes]
+        cmd = [py, str(runtests), "--verbosity", "1", *nodes]
         code, out = _run(cmd, cwd=cwd, timeout=timeout)
         return code == 0, out[-1500:]
-    cmd = [sys.executable, "-m", "pytest", "-q", "--no-header", "-p", "no:cacheprovider", *nodes]
+    cmd = [py, "-m", "pytest", "-q", "--no-header", "-p", "no:cacheprovider", *nodes]
     code, out = _run(cmd, cwd, timeout=timeout)
     return code == 0, out[-1500:]
 
@@ -311,15 +321,55 @@ def _looks_like_environment_failure(output: str) -> bool:
     return any(marker in text for marker in _ENV_FAILURE_MARKERS)
 
 
-def _install_test_requirements(cwd: Path) -> str:
+def _make_venv(dest: Path) -> tuple[str, str]:
+    """A private interpreter for one instance, or ``("", reason)``.
+
+    **Why this is not optional.**  Measured live: ``_install_test_requirements``
+    ran ``pip install -e .`` with ``sys.executable`` — the *sandbox's* python.
+    Installing ``pytest-dev__pytest-7571`` therefore replaced the system
+    ``pytest`` with pytest 6.0-dev, and every later instance in the same run
+    imported ``_pytest`` from that checkout.  The probe run showed it plainly:
+    four ``psf/requests`` instances all failed with a traceback pointing into
+    ``/tmp/gigaforge_swe/pytest-dev__pytest-7571/src/_pytest/...``.  One
+    instance's dependency set had become every instance's dependency set, and
+    the bench reported it as four environment errors.
+
+    SWE-bench's own harness gets this for free: each instance is a container.
+    Without containers, a venv per instance is the same isolation at a fraction
+    of the cost.  ``--system-site-packages`` keeps the sandbox's already-built
+    wheels (numpy, pyarrow) visible so the venv is cheap, while anything the
+    repo installs shadows them inside that venv only.
+    """
+    venv = dest.parent / f"{dest.name}.venv"
+    if venv.exists():
+        shutil.rmtree(venv, ignore_errors=True)
+    code, out = _run(
+        [sys.executable, "-m", "venv", "--system-site-packages", str(venv)],
+        cwd=dest.parent,
+        timeout=300,
+    )
+    if code != 0:
+        return "", f"venv failed: {out[-200:]}"
+    python = str(venv / "bin" / "python")
+    if not Path(python).is_file():
+        return "", "venv has no bin/python"
+    return python, ""
+
+
+def _install_test_requirements(cwd: Path, python: str = "") -> str:
     """Best-effort install of the repo's own test dependencies.
 
     SWE-bench's reference harness builds a per-instance Docker image from the
     repo's spec.  There is no Docker here, so the closest honest equivalent is
-    to install what the repo declares and report what could not be installed —
-    an instance that still cannot import its own conftest is an environment
-    error, not a wrong answer.
+    a per-instance venv (see :func:`_make_venv`) plus the repo's declared
+    requirements — and a report of what could not be installed, because an
+    instance that still cannot import its own conftest is an environment error,
+    not a wrong answer.
+
+    ``python`` is the instance's interpreter.  It defaults to the sandbox's own
+    only for the direct-call path in tests; the real run always passes a venv.
     """
+    py = python or sys.executable
     notes: list[str] = []
     for name in ("requirements-dev.txt", "requirements_test.txt", "test-requirements.txt",
                  "requirements/tests.txt", "dev-requirements.txt"):
@@ -327,17 +377,17 @@ def _install_test_requirements(cwd: Path) -> str:
         if not path.is_file():
             continue
         code, out = _run(
-            [sys.executable, "-m", "pip", "install", "--quiet", "--no-input", "-r", str(path)],
+            [py, "-m", "pip", "install", "--quiet", "--no-input", "-r", str(path)],
             cwd=cwd,
             timeout=600,
         )
         notes.append(f"{name}: {'ok' if code == 0 else out[-200:]}")
     # ``hypothesis`` is imported by astropy's conftest and is not in every
     # requirements file; it is a test-only dependency with no build cost.
-    code, _ = _run([sys.executable, "-c", "import hypothesis"], cwd=cwd, timeout=60)
+    code, _ = _run([py, "-c", "import hypothesis"], cwd=cwd, timeout=60)
     if code != 0:
         code, out = _run(
-            [sys.executable, "-m", "pip", "install", "--quiet", "--no-input", "hypothesis"],
+            [py, "-m", "pip", "install", "--quiet", "--no-input", "hypothesis"],
             cwd=cwd,
             timeout=300,
         )
@@ -349,21 +399,33 @@ def _install_test_requirements(cwd: Path) -> str:
     # tests die on "could not determine astropy package version" — an
     # environment error that reads like a broken model change.
     #
-    # A full editable install is not always possible: astropy 5.1's setup.py
-    # imports ``setuptools.dep_util``, removed in modern setuptools, so the
-    # build fails for a reason that has nothing to do with the model.  The
-    # version file is the only thing the tests actually need from the build,
-    # and setuptools_scm can produce it directly.
+    # **Dependencies are installed, not skipped.**  The earlier ``--no-deps``
+    # was added so astropy 5.1's setup.py (which imports the removed
+    # ``setuptools.dep_util``) would not abort the install.  It also meant the
+    # repo's own runtime dependencies were never installed: measured on
+    # ``pytest-dev__pytest-7571``, ``pip install --no-deps -e .`` succeeded and
+    # the tests then died on ``ModuleNotFoundError: No module named 'py'`` —
+    # a dependency the repo declares in ``install_requires``.  Inside a venv
+    # the real install is safe, so it is tried first and ``--no-deps`` is only
+    # the fallback for a repo whose build is genuinely broken.
     code, out = _run(
-        [sys.executable, "-m", "pip", "install", "--quiet", "--no-input",
-         "--no-deps", "--no-build-isolation", "-e", "."],
+        [py, "-m", "pip", "install", "--quiet", "--no-input",
+         "--no-build-isolation", "-e", "."],
         cwd=cwd,
         timeout=900,
     )
     notes.append(f"editable install: {'ok' if code == 0 else 'failed'}")
     if code != 0:
         code, out = _run(
-            [sys.executable, "-c",
+            [py, "-m", "pip", "install", "--quiet", "--no-input",
+             "--no-deps", "--no-build-isolation", "-e", "."],
+            cwd=cwd,
+            timeout=900,
+        )
+        notes.append(f"editable install (no-deps): {'ok' if code == 0 else 'failed'}")
+    if code != 0:
+        code, out = _run(
+            [py, "-c",
              "import pathlib, setuptools_scm;"
              "v = setuptools_scm.get_version(root='.');"
              "pathlib.Path('astropy/version.py').write_text("
@@ -399,6 +461,18 @@ def run_instance(
         result.detail = err
         result.latency_s = time.monotonic() - started
         return result
+
+    # The instance's own interpreter, built before anything is installed.
+    # Without it every ``pip install`` in this function wrote into the sandbox's
+    # site-packages and the *next* instance inherited it (measured: pytest
+    # 6.0-dev from one checkout broke four unrelated ``psf/requests`` runs).
+    python, venv_err = _make_venv(dest)
+    if not python:
+        result.status = "environment_error"
+        result.detail = venv_err
+        result.latency_s = time.monotonic() - started
+        return result
+    install_note = _install_test_requirements(dest, python)
 
     try:
         # The harness solves the issue; it never sees the gold patch.
@@ -453,11 +527,15 @@ def run_instance(
             result.detail = f"test patch did not apply: {test_note}"
             return result
 
-        f2p_ok, f2p_out = _run_tests(_pytest_node_ids(instance.fail_to_pass), dest)
+        f2p_ok, f2p_out = _run_tests(
+            _pytest_node_ids(instance.fail_to_pass), dest, python=python
+        )
         if not f2p_ok and _looks_like_environment_failure(f2p_out):
             # The tests never ran: install what the repo declares and retry once.
-            install_note = _install_test_requirements(dest)
-            f2p_ok, f2p_out = _run_tests(_pytest_node_ids(instance.fail_to_pass), dest)
+            install_note = _install_test_requirements(dest, python)
+            f2p_ok, f2p_out = _run_tests(
+                _pytest_node_ids(instance.fail_to_pass), dest, python=python
+            )
             if not f2p_ok and _looks_like_environment_failure(f2p_out):
                 result.status = "environment_error"
                 result.detail = (
@@ -472,7 +550,9 @@ def run_instance(
             result.detail = f"FAIL_TO_PASS did not pass: {f2p_out[-400:]}"
             return result
 
-        p2p_ok, p2p_out = _run_tests(_pytest_node_ids(instance.pass_to_pass), dest)
+        p2p_ok, p2p_out = _run_tests(
+            _pytest_node_ids(instance.pass_to_pass), dest, python=python
+        )
         if not p2p_ok:
             result.status = "failed"
             result.pass_to_pass_regressed = 1
@@ -490,6 +570,9 @@ def run_instance(
         result.latency_s = time.monotonic() - started
         if not keep:
             shutil.rmtree(dest, ignore_errors=True)
+            # The venv is the instance's, not the sandbox's: leaving it behind
+            # would fill the 4 GB disk after a handful of instances.
+            shutil.rmtree(dest.parent / f"{dest.name}.venv", ignore_errors=True)
 
 
 def run_swebench(

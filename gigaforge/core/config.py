@@ -445,6 +445,14 @@ PHASES: tuple[str, ...] = (
     "fix",        # repair a rejected diff
     "review",     # critique / sanity triage
     "summarize",  # compress results for the user
+    # The document pipeline's two authoring phases.  They are declared here
+    # because a phase that is not in this tuple has no route and no budget, and
+    # ``_ask`` would then fall back to the default model with the default
+    # budget — which is how a per-section call silently became a whole-document
+    # call's cost.  ``research`` gathers the facts a section may assert;
+    # ``document`` writes one section against them.
+    "research",   # gather the facts a document section may assert
+    "document",   # write one document section
 )
 
 
@@ -500,6 +508,22 @@ def default_routes(cfg: CoreConfig) -> dict[str, PhaseRoute]:
             temperature=0.3,
             rationale="summarisation is cheap and user-facing",
         ),
+        # Gathering facts is a retrieval-shaped task: it wants breadth, not
+        # reasoning, and it is called once per section, so it must be cheap.
+        "research": PhaseRoute(
+            model=cfg.default_model,
+            fallbacks=(cfg.cheap_model,),
+            temperature=0.1,
+            rationale="fact gathering is retrieval-shaped and runs once per section",
+        ),
+        # Writing a section is authoring: it needs the strong model, and the
+        # low temperature keeps a re-asked section from drifting.
+        "document": PhaseRoute(
+            model=cfg.strong_model,
+            fallbacks=(cfg.default_model,),
+            temperature=0.2,
+            rationale="section authoring is prose that must say something",
+        ),
     }
 
 
@@ -538,6 +562,11 @@ def default_budgets() -> dict[str, PhaseBudget]:
         # The call budget is what actually binds here, so it is the one that
         # grows.
         "react": PhaseBudget(max_tokens=200_000, max_calls=24, max_output_tokens=4_000),
+        # One call per section, plus one refinement pass over the failing ones.
+        # The call budget is what binds: a four-section document is 4 research
+        # calls + 4 section calls + up to 4 refinements.
+        "research": PhaseBudget(max_tokens=40_000, max_calls=12, max_output_tokens=1_200),
+        "document": PhaseBudget(max_tokens=120_000, max_calls=16, max_output_tokens=3_000),
     }
 
 

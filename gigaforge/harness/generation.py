@@ -977,6 +977,33 @@ def _layout_invariants() -> str:
         # is restored without touching the child's markup.
         "h1 { color: var(--accent) !important; }\n"
         "h2 { color: var(--secondary) !important; }\n"
+        # A page that is correct at 1440px and scrolls sideways at 375px is not
+        # responsive, and no structural check sees it: measured live with
+        # ``harness/wcag.py``, the cyberpunk landing page had a 6.46 contrast
+        # ratio (AA passes) and ``documentElement.scrollWidth > innerWidth`` at
+        # 375px.  The cause is always the same shape — a fixed width, a
+        # ``min-width`` larger than the viewport, or a grid whose minimum column
+        # is wider than the phone.  The harness owns the layout, so the
+        # invariants are stated here rather than hoped for in a child's CSS.
+        "@media (max-width: 480px) {\n"
+        "    html, body { max-width: 100%; overflow-x: hidden; }\n"
+        "    .feature-grid, .features-grid, .features:not(section),\n"
+        "    .grid, .row {\n"
+        "        grid-template-columns: 1fr !important;\n"
+        "    }\n"
+        "    img, video, iframe, table, pre { max-width: 100% !important; }\n"
+        "    pre, code { white-space: pre-wrap !important; word-break: break-word; }\n"
+        "}\n"
+        # A single element wider than the viewport is the other half of the same
+        # defect: a long unbroken token (a URL, a hash) or a fixed ``width:
+        # 1200px`` on a container.  ``overflow-wrap`` on the body is the
+        # cheapest global guard, and ``max-width: 100%`` on block containers
+        # stops a fixed width from escaping.
+        "body { overflow-wrap: break-word; }\n"
+        "section, header, footer, main, .container, .wrapper {\n"
+        "    max-width: 100%;\n"
+        "    box-sizing: border-box;\n"
+        "}\n"
     )
 
 

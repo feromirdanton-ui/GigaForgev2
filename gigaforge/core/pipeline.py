@@ -2526,6 +2526,135 @@ class TaskPipeline:
             "proposal_source": "answer",
         }
 
+    def _document_proposal(self, ctx: RunContext) -> Mapping[str, Any]:
+        """Write a document through the four-stage pipeline, not one prompt.
+
+        **Why the product path needed this.**  ``harness/document_pipeline.py``
+        had the whole mechanism — outline, per-section evidence, per-section
+        writing, a refinement pass with deterministic checks — and the product
+        called only ``plan_document`` (the ``outline`` CLI command).  A document
+        goal therefore still went through the ReAct episode plus envelope
+        unwrapping: one call asked for the whole document, which is exactly the
+        shape that produced "This section provides an overview of X" in every
+        section.  The checks existed; the pipeline that satisfies them did not
+        run.
+
+        **What each stage buys, and why it is a separate call.**
+
+        * *Outline* — computed by the harness from the goal (``plan_document``),
+          never asked of the model: structure is a computation, and a model
+          asked for it answers differently each run, which makes the document
+          unmeasurable.
+        * *Literature* — one call per section that gathers the facts the section
+          will assert.  Separating gathering from writing is what stops a
+          section from inventing a fact to fill its word count: the writer is
+          given a list and told to use only it.
+        * *Section* — one call per section, each with the same attention budget.
+          A single call for the whole document lets the model spend its budget
+          on the first section and pad the rest.
+        * *Refinement* — ``refinement_issues`` is deterministic, so a failure is
+          named ("section 'Details' is a placeholder") instead of being a vague
+          "the document is bad", and only the failing sections are re-asked.
+
+        The product is ``text`` with an empty ``diff``: a document that names no
+        file is prose, and grading it as a patch is what made it die in the
+        planner with ``steps: 0``.
+        """
+        from gigaforge.harness.document_pipeline import (
+            assemble,
+            plan_document,
+            refinement_issues,
+            section_prompt,
+        )
+
+        goal = _original_goal(ctx.state.goal)
+        plan = plan_document(goal)
+        self._event(
+            "pipeline.document_plan", run_id=ctx.run_id,
+            title=plan.outline.title, sections=len(plan.outline.sections),
+            min_chars=plan.min_chars,
+        )
+
+        # ── Literature: what each section may assert ────────────────────────
+        for section in plan.outline.sections:
+            try:
+                gathered = self._ask(
+                    "research",
+                    f"List the concrete facts needed to write the section "
+                    f"{section.title!r} of a document titled {plan.outline.title!r}.\n"
+                    f"The section's purpose: {section.purpose}\n"
+                    "Answer as a short bullet list of facts, one per line, no "
+                    "preamble. If you do not know a fact, omit it rather than "
+                    "guessing.",
+                    ctx,
+                )
+            except Exception as exc:  # noqa: BLE001 - evidence is best-effort
+                self._degraded("document", exc, "research")
+                gathered = ""
+            section.evidence = [
+                line.strip(" -*\t")
+                for line in str(gathered or "").splitlines()
+                if line.strip(" -*\t")
+            ][:12]
+
+        # ── Sections: one call each, against its own evidence ───────────────
+        bodies: dict[str, str] = {}
+        for section in plan.outline.sections:
+            try:
+                body = self._ask(
+                    "document", section_prompt(section, document_title=plan.outline.title), ctx
+                )
+            except Exception as exc:  # noqa: BLE001 - one section must not kill the doc
+                self._degraded("document", exc, "document")
+                body = ""
+            section.body = str(body or "").strip()
+            bodies[section.title] = section.body
+
+        document = assemble(plan, bodies)
+
+        # ── Refinement: re-ask only the sections the checks name ────────────
+        issues = refinement_issues(document, plan)
+        self._event(
+            "pipeline.document_refine", run_id=ctx.run_id,
+            issues=len(issues), detail=issues[:4],
+        )
+        if issues:
+            for section in plan.outline.sections:
+                if not any(section.title in issue for issue in issues):
+                    continue
+                try:
+                    body = self._ask(
+                        "document",
+                        section_prompt(section, document_title=plan.outline.title)
+                        + "\n\nThe previous attempt was rejected: "
+                        + "; ".join(i for i in issues if section.title in i)
+                        + "\nWrite real prose about the subject this time.",
+                        ctx,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self._degraded("document", exc, "document")
+                    continue
+                section.body = str(body or "").strip()
+                bodies[section.title] = section.body
+            document = assemble(plan, bodies)
+            issues = refinement_issues(document, plan)
+
+        ctx.extras["document_text"] = document
+        ctx.extras["document_issues"] = issues
+        ctx.extras["answer_text"] = document
+        self._event(
+            "pipeline.document", run_id=ctx.run_id,
+            chars=len(document), sections=len(plan.outline.sections),
+            remaining_issues=len(issues),
+        )
+        return {
+            "proposal": ProposeResult(
+                text=document, diff="", phase="document",
+                model=str(getattr(self.router, "last_model", "") or ""),
+            ),
+            "proposal_source": "document-pipeline",
+        }
+
     def _synthesize_answer(self, ctx: RunContext, goal: str, narration: str,
                            citations: Sequence[str], searched: bool,
                            episode: Any) -> str:
@@ -2597,6 +2726,9 @@ class TaskPipeline:
         # has the repository tools AND ``web_search``, and its ``finish`` prose
         # is the deliverable.
         if _task_kind_for(self, ctx).is_text_product:
+            kind_obj = _task_kind_for(self, ctx)
+            if getattr(kind_obj, "is_document", False):
+                return self._document_proposal(ctx)
             return self._answer_proposal(ctx)
 
         slice_obj = inputs.get("slice")
