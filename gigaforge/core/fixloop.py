@@ -282,8 +282,15 @@ class FixLoop:
                     break
                 except BaseException as exc:  # noqa: BLE001 - reported, not raised
                     iteration.error = str(exc)[:1000]
-                    iteration.reason = "proposer failed"
+                    # The reason must carry the cause.  Measured live: two bench
+                    # tasks reported only "proposer failed" with 0 tokens, which
+                    # reads as a model that produced nothing — the truth was an
+                    # exception raised *before* the call (a 429 that outlived the
+                    # retry budget).  A reason without the error text sends the
+                    # next investigation after the wrong component.
+                    iteration.reason = f"proposer failed: {type(exc).__name__}: {str(exc)[:300]}"
                     result.iterations.append(iteration)
+                    result.reason = iteration.reason
                     break
 
                 propose = _as_propose(produced)

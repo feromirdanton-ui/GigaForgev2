@@ -308,9 +308,27 @@ class TaskKind:
 
 
 def _named_paths(goal: str) -> list[str]:
-    """Path-like tokens in the goal, normalised and de-duplicated, in order."""
+    """Path-like tokens in the goal, normalised and de-duplicated, in order.
+
+    **A URL is not a path.**  Measured on SWE-bench: the problem statement for
+    ``pytest-dev__pytest-10051`` contains
+    ``https://github.com/pytest-dev/pytest/blob/28e8c85.../src/_pytest/logging.py``,
+    and the path regex matched the whole thing.  The run then treated
+    ``github.com/pytest-dev/pytest/blob/.../logging.py`` as a file it had to
+    create, spent a model call on it, hit a 429, and reported
+    ``could not generate required file github.com/...`` — a failure invented by
+    the harness out of a citation.  Every issue that links to its own source
+    would have hit this.
+
+    So URLs are removed before the scan, and a token whose first segment is a
+    domain is dropped: a repository path never starts with a host.
+    """
+    text = goal or ""
+    # Strip URLs first: the path regex would otherwise match inside them.
+    text = re.sub(r"https?://\S+", " ", text)
+    text = re.sub(r"\bwww\.\S+", " ", text)
     out: list[str] = []
-    for match in _PATH_RE.finditer(goal or ""):
+    for match in _PATH_RE.finditer(text):
         raw = match.group(0).replace("\\", "/").strip()
         # ``e.g.`` and ``i.e.`` are prose, not paths.
         if raw.lower() in {"e.g", "i.e", "etc"}:
@@ -321,6 +339,12 @@ def _named_paths(goal: str) -> list[str]:
         # A leading ``./`` or ``/`` is noise for a repo-relative path.
         cleaned = raw.lstrip("./")
         if not cleaned or cleaned in out:
+            continue
+        # A domain-shaped first segment means this is a host, not a path.
+        first = cleaned.split("/", 1)[0].lower()
+        if first in {"github.com", "gitlab.com", "bitbucket.org"} or first.endswith(
+            (".com", ".org", ".io", ".net", ".dev")
+        ):
             continue
         out.append(cleaned)
     return out

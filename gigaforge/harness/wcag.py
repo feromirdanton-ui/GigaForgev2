@@ -197,3 +197,119 @@ def measure(page: Path, *, timeout_ms: int = 30000) -> WcagReport:
     report.overflow_375 = bool(narrow)
     report.min_ratio = min((p.ratio for p in report.pairs), default=0.0)
     return report
+
+
+#: In-page repair.  For every element whose text fails AA, walk the foreground
+#: toward black or white — whichever direction the background allows — until the
+#: ratio clears the threshold, then write the colour onto the element.
+#:
+#: **Why in the DOM and not in the CSS text.**  The failing colour is usually an
+#: inline style or a rule the model wrote for a specific button; a text-level
+#: rewrite would have to parse CSS, resolve specificity and guess which rule
+#: won.  The browser has already done all of that, so the computed colour is the
+#: only thing worth changing — and setting it inline is exactly what a designer
+#: would do to override it.
+_REPAIR_JS = r"""
+() => {
+  const parse = (c) => {
+    const m = c.match(/rgba?\(([^)]+)\)/);
+    if (!m) return null;
+    const p = m[1].split(',').map(x => parseFloat(x.trim()));
+    return {r: p[0], g: p[1], b: p[2], a: p.length > 3 ? p[3] : 1};
+  };
+  const lum = (c) => {
+    const f = (v) => { v /= 255; return v <= 0.03928 ? v/12.92 : Math.pow((v+0.055)/1.055, 2.4); };
+    return 0.2126*f(c.r) + 0.7152*f(c.g) + 0.0722*f(c.b);
+  };
+  const ratio = (a, b) => {
+    const l1 = lum(a), l2 = lum(b);
+    const hi = Math.max(l1, l2), lo = Math.min(l1, l2);
+    return (hi + 0.05) / (lo + 0.05);
+  };
+  const bgOf = (el) => {
+    let n = el;
+    while (n && n !== document.documentElement) {
+      const c = parse(getComputedStyle(n).backgroundColor);
+      if (c && c.a > 0.05) return c;
+      n = n.parentElement;
+    }
+    return {r: 255, g: 255, b: 255, a: 1};
+  };
+  const fixed = [];
+  document.querySelectorAll('h1,h2,h3,h4,p,li,a,button,span,label,td,th').forEach(el => {
+    const text = (el.textContent || '').trim();
+    if (!text || text.length < 2) return;
+    const cs = getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) < 0.1) return;
+    const fg = parse(cs.color);
+    if (!fg) return;
+    // ``cs`` is a *live* CSSStyleDeclaration: reading ``cs.color`` after the
+    // ``setProperty`` below returns the new value, so the report said
+    // "rgb(51,51,51) -> rgb(51,51,51)" for a change that really happened.
+    // Capture the original string now.
+    const original = cs.color;
+    const bg = bgOf(el);
+    const size = parseFloat(cs.fontSize) || 16;
+    const bold = (parseInt(cs.fontWeight) || 400) >= 700;
+    const need = (size >= 24 || (bold && size >= 18.66)) ? 3.0 : 4.5;
+    if (ratio(fg, bg) >= need) return;
+    // Try both directions and keep the first that clears the threshold with the
+    // least movement: a dark page should stay dark, a light one light.
+    const candidates = [];
+    for (let t = 0; t <= 1.0001; t += 0.05) {
+      candidates.push({r: fg.r + (0 - fg.r) * t, g: fg.g + (0 - fg.g) * t, b: fg.b + (0 - fg.b) * t, t});
+      candidates.push({r: fg.r + (255 - fg.r) * t, g: fg.g + (255 - fg.g) * t, b: fg.b + (255 - fg.b) * t, t});
+    }
+    let best = null;
+    for (const c of candidates) {
+      if (ratio(c, bg) >= need) { if (!best || c.t < best.t) best = c; }
+    }
+    if (!best) return;
+    const css = `rgb(${Math.round(best.r)}, ${Math.round(best.g)}, ${Math.round(best.b)})`;
+    el.style.setProperty('color', css, 'important');
+    fixed.push({tag: el.tagName.toLowerCase(), sample: text.slice(0, 40), from: original, to: css});
+  });
+  return fixed;
+}
+"""
+
+
+def repair(page: Path, *, out: Path | None = None, timeout_ms: int = 30000) -> dict[str, Any]:
+    """Rewrite failing text colours in ``page`` until AA is met.
+
+    Deterministic: the same page produces the same colours, because the search
+    is a fixed walk over the luminance axis and the browser's computed values
+    are the input.  Returns the list of changes so the caller can report them
+    instead of silently editing the artifact.
+
+    The page is written back to ``out`` (default: in place).  Only ``color`` is
+    touched — layout, structure and every other declaration are left alone, so
+    a repair cannot introduce the overflow it was not asked to fix.
+    """
+    result: dict[str, Any] = {"fixed": [], "error": "", "out": str(out or page)}
+    if not Path(page).is_file():
+        result["error"] = f"page not found: {page}"
+        return result
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        result["error"] = f"playwright is not installed: {exc}"
+        return result
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch()
+            try:
+                view = browser.new_page(viewport={"width": 1440, "height": 900})
+                view.goto(Path(page).resolve().as_uri(), timeout=timeout_ms)
+                result["fixed"] = view.evaluate(_REPAIR_JS) or []
+                html = view.content()
+            finally:
+                browser.close()
+    except Exception as exc:  # noqa: BLE001 - a render failure is a report, not a crash
+        result["error"] = f"{type(exc).__name__}: {exc}"[:400]
+        return result
+
+    target = Path(out) if out else Path(page)
+    target.write_text(html, encoding="utf-8")
+    return result

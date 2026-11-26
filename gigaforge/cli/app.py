@@ -1167,6 +1167,10 @@ def swebench(
 def wcag(
     page: Annotated[str, typer.Argument(help="Path to the rendered HTML page.")],
     as_json: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+    fix: Annotated[
+        bool,
+        typer.Option("--fix", help="Rewrite failing text colours until AA is met, then re-measure."),
+    ] = False,
 ) -> None:
     """Measure WCAG 2.1 contrast and 375px overflow on a rendered page.
 
@@ -1182,7 +1186,18 @@ def wcag(
     import json as _json
     from pathlib import Path
 
-    from gigaforge.harness.wcag import measure
+    from gigaforge.harness.wcag import measure, repair
+
+    if fix:
+        # Repair first, then measure the repaired file: the number reported is
+        # the number a reader would get, not the one before the edit.
+        changed = repair(Path(page))
+        if changed.get("error"):
+            typer.echo(f"cannot repair: {changed['error']}", err=True)
+        else:
+            typer.echo(f"repaired {len(changed['fixed'])} text colour(s)")
+            for row in changed["fixed"]:
+                typer.echo(f"  {row['tag']} {row['from']} -> {row['to']} ({row['sample']!r})")
 
     report = measure(Path(page))
     if as_json:
