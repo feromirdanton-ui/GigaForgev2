@@ -705,6 +705,14 @@ class DiffValidator:
         # ``ast`` cannot make that mistake: it either parses or it does not, and
         # an unbound name in a parsed function body is a fact about the code.
         python_calls = self._python_free_calls(text)
+        if python_calls is None and str(path).endswith((".py", ".pyi")):
+            # **A Python file that does not parse has no call graph.**  Falling
+            # back to the tree-sitter walk here is what produced "undefined
+            # symbol(s): E501: Line too long; invalid-syntax: Unexpected
+            # indentation" -- the recovery pass reads lint codes as calls.  The
+            # syntax error is already its own fatal diagnostic; inventing names
+            # on top of it sends the repair loop after names that do not exist.
+            return []
         calls = (
             python_calls if python_calls is not None
             else [(c.callee, bool(c.is_method or c.receiver)) for c in parsed_now.calls]

@@ -66,3 +66,30 @@ def test_a_non_python_file_falls_back_to_the_other_walk() -> None:
 
 def test_empty_text_falls_back_rather_than_crashing() -> None:
     assert DiffValidator._python_free_calls("") is None
+
+
+def test_a_python_file_that_does_not_parse_reports_no_symbols() -> None:
+    """The fallback is for other languages, not for broken Python.
+
+    Measured on psf__requests-1142: the file did not parse, ``ast`` returned
+    None, the code fell back to the tree-sitter walk, and the rejection read
+    "2 undefined symbol(s): E501: Line too long; invalid-syntax: Unexpected
+    indentation".  A Python file that does not parse has no call graph.
+    """
+    from gigaforge.firewall.config import FirewallConfig
+    from gigaforge.l0.config import L0Config
+    from gigaforge.l0.store import L0Store
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "mod.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+        store = L0Store(config=L0Config(db_path=str(root / "l0.db"), repo_root=str(root)))
+        try:
+            validator = DiffValidator(store, config=FirewallConfig(repo_root=str(root)))
+            broken = "def f():\n    x = 1\n        return E501\n"
+            parsed = validator.parser.parse_source(broken, "mod.py")
+            assert validator._missing_symbols("mod.py", broken, parsed) == []
+        finally:
+            store.close()
