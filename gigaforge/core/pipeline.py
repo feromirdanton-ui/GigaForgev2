@@ -2690,6 +2690,14 @@ class TaskPipeline:
             section.body = clean_section_body(str(body or ""), title=section.title)
             bodies[section.title] = section.body
 
+        # The document's own shape, as a figure.  Computed from the outline the
+        # harness built, so it cannot describe a document that was not written
+        # -- which is what a model asked to "include a table" produces.
+        from gigaforge.harness.document_pipeline import build_outline_table
+
+        if plan.outline.sections:
+            plan.outline.sections[0].table = build_outline_table(plan.outline)
+
         document = assemble(plan, bodies)
 
         # ── Refinement: re-ask only the sections the checks name ────────────

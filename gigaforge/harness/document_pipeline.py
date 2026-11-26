@@ -30,11 +30,13 @@ from typing import Any, Iterable, Mapping, Sequence
 __all__ = [
     "Outline",
     "Section",
+    "Table",
     "DocumentPlan",
     "plan_document",
     "section_prompt",
     "refinement_issues",
     "assemble",
+    "build_outline_table",
 ]
 
 
@@ -63,6 +65,11 @@ class Section:
     purpose: str = ""
     evidence: list[str] = field(default_factory=list)
     body: str = ""
+    #: A table the section carries, rendered from data rather than described.
+    #: PaperOrchestra's plotting agent produces figures; a document about a
+    #: codebase needs tables, and a table is the one figure that can be built
+    #: deterministically from what the harness already holds.
+    table: "Table | None" = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -70,7 +77,79 @@ class Section:
             "purpose": self.purpose,
             "evidence": list(self.evidence),
             "chars": len(self.body),
+            "table": self.table.to_dict() if self.table else None,
         }
+
+
+@dataclass
+class Table:
+    """A figure built from data, not from prose.
+
+    **Why a table and not a chart.**  A chart needs a plotting library and a
+    numeric series; a document about a system has neither, and a model asked to
+    "include a chart" writes a description of one.  A table is the figure that
+    can be *computed* from what the run already knows — the sections, their
+    evidence counts, their lengths — so it is true by construction.
+
+    ``rows`` are already strings: formatting is a decision, and a decision made
+    once here is the same in every render.
+    """
+
+    caption: str
+    headers: list[str] = field(default_factory=list)
+    rows: list[list[str]] = field(default_factory=list)
+
+    def render(self) -> str:
+        """Markdown, because the document is Markdown and a table is Markdown."""
+        if not self.headers:
+            return ""
+        lines = [f"**{self.caption}**", ""]
+        lines.append("| " + " | ".join(self.headers) + " |")
+        lines.append("| " + " | ".join("---" for _ in self.headers) + " |")
+        for row in self.rows:
+            cells = [str(c).replace("|", "\\|") for c in row]
+            # Pad short rows rather than emitting a malformed table: a row with
+            # fewer cells than the header is a broken table in every renderer.
+            cells += [""] * (len(self.headers) - len(cells))
+            lines.append("| " + " | ".join(cells[:len(self.headers)]) + " |")
+        return "\n".join(lines)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "caption": self.caption,
+            "headers": list(self.headers),
+            "rows": [list(r) for r in self.rows],
+        }
+
+
+def build_outline_table(outline: Outline) -> Table | None:
+    """The document's own shape, as a table.
+
+    **Computed, so it cannot be wrong.**  Every cell comes from the outline the
+    harness built: the section's title, how many evidence items it has, and how
+    long its body is.  A model asked to summarise the document's structure
+    produces a plausible table that may not match the document; this one is the
+    document.
+
+    Returns ``None`` for a document with no sections — an empty table is noise,
+    and a caption over no rows is worse than no figure.
+    """
+    if not outline.sections:
+        return None
+    rows = [
+        [
+            str(index),
+            section.title,
+            str(len(section.evidence)),
+            str(len(section.body)),
+        ]
+        for index, section in enumerate(outline.sections, start=1)
+    ]
+    return Table(
+        caption=f"Structure of “{outline.title}”",
+        headers=["#", "Section", "Sources", "Characters"],
+        rows=rows,
+    )
 
 
 @dataclass
@@ -383,4 +462,12 @@ def assemble(plan: DocumentPlan, bodies: Mapping[str, str]) -> str:
         parts.append("")
         parts.append(body or "_No content was produced for this section._")
         parts.append("")
+        # A section's figure goes after its prose: the reader has the argument
+        # first, then the data that supports it.  Rendered from the section's
+        # own record, so it cannot describe a document that was not written.
+        if section.table is not None:
+            rendered = section.table.render()
+            if rendered:
+                parts.append(rendered)
+                parts.append("")
     return "\n".join(parts).rstrip() + "\n"
