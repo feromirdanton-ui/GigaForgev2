@@ -106,6 +106,20 @@ class GenerationPlan:
     #: user wrote ("a grid with 4 cards") from it, so a page that ships three
     #: is rejected instead of passing against the harness's default of three.
     goal: str = ""
+    #: Section words the goal used that the catalogue does not know.
+    #:
+    #: **Why this is a field and not a log line.**  When the goal named sections
+    #: and none of them matched, the planner silently fell back to
+    #: ``_DEFAULT_SHAPE`` and built a hero/features/footer page for a goal that
+    #: asked for something else entirely.  The run then passed its contract,
+    #: because the contract was derived from the same wrong plan — a closed loop
+    #: that cannot notice it is wrong.  Recording the words makes the mismatch a
+    #: fact the caller can refuse on.
+    unresolved_sections: tuple[str, ...] = ()
+    #: True when the plan is the default shape because the goal named nothing
+    #: the catalogue recognises.  A caller that cares can refuse; a caller that
+    #: does not gets the old behaviour, but now it is a decision.
+    used_default_shape: bool = False
 
     @property
     def ok(self) -> bool:
@@ -126,6 +140,48 @@ class GenerationPlan:
 
     def kinds(self) -> list[str]:
         return [section.kind for section in self.sections]
+
+
+#: Words that name a *section* without being in the catalogue.  Used only to
+#: report a mismatch, never to invent a section: a word here means "the goal
+#: asked for something the harness does not know how to build", which is a fact
+#: worth refusing on rather than a shape worth guessing.
+#:
+#: Generic containers ("section", "block", "panel", "table") are deliberately
+#: absent.  "a pricing table" is a pricing section, and listing "table" here
+#: reported a mismatch on a goal the catalogue fully covers — a false alarm that
+#: would teach a caller to ignore the field.
+_SECTION_NOUNS = (
+    "changelog", "roadmap", "timeline", "gallery", "portfolio", "team",
+    "about", "blog", "news", "docs", "documentation", "login", "signup",
+    "dashboard", "sidebar", "carousel", "slider", "accordion", "changelog",
+)
+
+
+def _unresolved_section_words(low: str, chosen: list[str]) -> list[str]:
+    """Section nouns the goal used that the plan does not cover.
+
+    A goal that says "add a pricing table and a changelog" names two sections;
+    the catalogue knows ``pricing`` and not ``changelog``.  The plan covers
+    pricing and silently drops the changelog, and the contract — derived from
+    the same plan — is satisfied by a page with no changelog.  Reporting the
+    word is what lets the caller refuse instead of shipping half the request.
+    """
+    if not low:
+        return []
+    covered = set(chosen)
+    missing: list[str] = []
+    for noun in _SECTION_NOUNS:
+        if not re.search(rf"\b{re.escape(noun)}\b", low):
+            continue
+        # A noun is covered when a chosen section's triggers include it.
+        for kind, triggers, _heading in _SECTION_CATALOGUE:
+            if kind in covered and noun in triggers:
+                break
+        else:
+            if noun not in missing:
+                missing.append(noun)
+    return missing
 
 
 def plan_generation(goal: str, existing_html: str = "") -> GenerationPlan:
@@ -158,7 +214,16 @@ def plan_generation(goal: str, existing_html: str = "") -> GenerationPlan:
                 chosen.append(kind)
 
     if not chosen:
+        # The goal named no section the catalogue knows.  Two very different
+        # situations look identical here: "make me a landing page" (the default
+        # shape is right) and "add a pricing table and a changelog" (the default
+        # shape is wrong, and building it silently is how a run passes a
+        # contract derived from its own mistake).  The words the goal used are
+        # recorded so the caller can tell them apart.
         chosen = list(_DEFAULT_SHAPE)
+        used_default = True
+    else:
+        used_default = False
     # A page always ends with a footer; a brief that names sections but not a
     # footer still needs one, and adding it is not inventing content.
     if "footer" not in chosen:
@@ -193,7 +258,9 @@ def plan_generation(goal: str, existing_html: str = "") -> GenerationPlan:
         if found and found.group(1).strip():
             title = found.group(1).strip()
     return GenerationPlan(
-        path=path, sections=sections, palette=palette, title=title, goal=goal
+        path=path, sections=sections, palette=palette, title=title, goal=goal,
+        unresolved_sections=tuple(_unresolved_section_words(low, chosen)),
+        used_default_shape=used_default,
     )
 
 
