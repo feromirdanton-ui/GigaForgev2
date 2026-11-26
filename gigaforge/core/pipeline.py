@@ -2120,6 +2120,11 @@ class TaskPipeline:
                     use_cache=bool(ctx.extras.get("use_cache", True)),
                     dry_run=bool(ctx.extras.get("dry_run", False)),
                     max_fix_iterations=ctx.extras.get("max_fix_iterations"),
+                    # The parent's decisions travel; its transcript does not.
+                    # A child that has to guess the palette guesses differently
+                    # from its siblings, and the assembled page ends up with one
+                    # colour scheme per section.
+                    shared_context=dict(ctx.extras.get("shared_context") or {}),
                 )
             )
         try:
@@ -4564,7 +4569,7 @@ class TaskPipeline:
         )
         try:
             result = child.run(
-                spec.goal,
+                self._child_goal(spec),
                 run_id=f"{ctx.run_id}:{spec.name}",
                 files=spec.focus_paths,
                 symbols=spec.symbols,
@@ -4582,6 +4587,42 @@ class TaskPipeline:
             "summary": result.summary,
             "error": result.error,
         }
+
+    def _child_goal(self, spec: SubAgentSpec) -> str:
+        """The child's goal, with the parent's decisions attached.
+
+        The transcript is isolated on purpose — a child that inherits the
+        parent's history pays for it and drifts toward the parent's conclusions.
+        The *decisions* are a different thing: the parent already chose the
+        palette, the section names and the page title, and a child that has to
+        guess them guesses differently.  Measured live: four section children
+        each invented their own colour scheme and the assembled page had four.
+
+        So the facts travel in the goal text, which is the child's brief, and
+        not in its history, which stays empty.  The block is short and named, so
+        a child can tell an instruction from a fact.
+        """
+        facts = spec.shared_context or {}
+        if not facts:
+            return spec.goal
+        lines: list[str] = []
+        for key, value in facts.items():
+            if value in (None, "", (), [], {}):
+                continue
+            if isinstance(value, (list, tuple, set)):
+                rendered = ", ".join(str(item) for item in value)
+            elif isinstance(value, Mapping):
+                rendered = "; ".join(f"{k}={v}" for k, v in value.items())
+            else:
+                rendered = str(value)
+            lines.append(f"- {key}: {rendered}")
+        if not lines:
+            return spec.goal
+        return (
+            f"{spec.goal}\n\n"
+            "## Decisions already made by the parent (do not re-decide)\n"
+            + "\n".join(lines)
+        )
 
     def close(self) -> None:
         with self._lock:

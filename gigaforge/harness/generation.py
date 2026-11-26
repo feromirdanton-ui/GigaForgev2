@@ -420,6 +420,28 @@ def section_prompt(plan: GenerationPlan, section: SectionPlan, goal: str) -> str
     came from a model writing a whole document when it was asked for a part.
     """
     palette = ", ".join(plan.palette) if plan.palette else "the palette the brief implies"
+    # The child cannot know its siblings: it sees one section and the brief.
+    # Measured live: the hero wrote `<a href="#features">` while the features
+    # section was emitted without an `id`, so the page shipped a dead anchor and
+    # the contract rejected it after 17 752 tokens.  The harness knows every
+    # section's anchor before any child runs, so it says so.
+    #
+    # Anchors only, never headings.  Naming a sibling's *heading* puts that
+    # section's subject into every other child's prompt, and a child told
+    # "Features" while writing the hero writes features — the exact defect that
+    # shipped a hero containing a whole features grid.  An anchor is enough to
+    # link to and carries no content to copy.
+    siblings = [
+        f"#{other.kind}"
+        for other in plan.sections
+        if other.kind != section.kind
+    ]
+    sibling_line = (
+        "* the page's other sections, which you may link to by these exact "
+        "anchors: " + ", ".join(siblings) + ";\n"
+        if siblings
+        else ""
+    )
     return (
         f"Write ONE section of a single-file landing page: the {section.heading} "
         f"section (kind: {section.kind}).\n\n"
@@ -433,6 +455,7 @@ def section_prompt(plan: GenerationPlan, section: SectionPlan, goal: str) -> str
         "harness owns them and a second copy breaks the page;\n"
         "* do NOT repeat any other section;\n"
         f"* use the palette: {palette};\n"
+        f"{sibling_line}"
         "* write real, specific copy about the subject — no lorem ipsum, no "
         "\"Feature 1\", no placeholder text;\n"
         "* the feature grid needs at least three cards, each with "

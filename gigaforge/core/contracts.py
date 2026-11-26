@@ -257,6 +257,23 @@ class SubAgentSpec:
     dry_run: bool = False
     max_fix_iterations: Optional[int] = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    #: Facts the parent knows that the child cannot derive.
+    #:
+    #: **Why isolation needs this.**  A child runs its own pipeline in its own
+    #: copy, so it starts with an empty context — which is right for the
+    #: transcript (a child that inherits the parent's history pays for it and
+    #: drifts toward the parent's conclusions) and wrong for the *decisions the
+    #: parent already made*.  Measured live: the parent planned a cyan/magenta
+    #: page and named its sections; each section child was told only "write the
+    #: hero", invented its own palette, and the assembled page had four
+    #: different colour schemes.  The harness then had to repaint them, which is
+    #: the harness doing work the child could have done correctly.
+    #:
+    #: So the split is explicit: the transcript is isolated, and a small set of
+    #: named facts travels.  ``shared_context`` is that set — palette, section
+    #: names, the page's title, the sibling anchors — and it is rendered into the
+    #: child's brief, not into its history.
+    shared_context: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
