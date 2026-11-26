@@ -260,11 +260,29 @@ class PipelineResult:
             "cost_per_task_micros": self.cost_per_task_micros,
             "cost_per_task_usd": round(self.cost_per_task_micros / 1_000_000, 6),
             "routing": list(self.routing),
+            "routing_table": self.routing_table(),
             "degraded": list(self.degraded),
         }
 
     def model_dump(self, mode: str = "python") -> dict[str, Any]:
         return self.to_dict()
+
+    def routing_table(self) -> list[dict[str, Any]]:
+        """The routing log grouped by ladder rung, with cost and acceptance.
+
+        The log says what happened; this says whether the decision was worth its
+        price.  Built from the rows already recorded, so it cannot disagree with
+        them and costs nothing at run time.
+        """
+        try:
+            from gigaforge.core.routing_stats import routing_table
+
+            return [
+                entry.to_dict()
+                for entry in routing_table(self.routing, phase_cost=self.phase_cost_micros)
+            ]
+        except Exception:  # noqa: BLE001 - a report must not fail on a metric
+            return []
 
     def dict(self) -> dict[str, Any]:
         return self.to_dict()
