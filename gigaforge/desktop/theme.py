@@ -37,25 +37,42 @@ class Palette:
     # text
     text = "#183b66"
     text_dim = "#4d6b91"
-    text_muted = "#718bad"
-    text_faint = "#96abc5"
+    # The muted/faint rungs are TEXT -- tile labels, table headings, key/value
+    # rows, the chat bar -- and at their old values they were 3.24 and 2.18 on
+    # ``bg``, below the 4.5 AA floor.  Re-spaced to clear AA on every surface
+    # this palette paints (the darkest is ``raised``): 4.81 and 4.86, while
+    # still reading as quieter than ``text`` (10.48).
+    text_muted = "#5a6f85"
+    text_faint = "#556a80"
 
     # accents
-    accent = "#4b9fea"
-    accent_dim = "#3687c9"
+    # ``accent`` is used BOTH as a fill (a meter bar, a caret, an outline) and
+    # as text (the wordmark, the "show" toggle, chat role labels, code spans).
+    # A single value cannot be a light fill and readable text at once, and the
+    # old ``#4b9fea`` was 2.61 as text on ``bg``.  It is therefore set to the
+    # darker value that clears AA in every role (5.24 on ``bg``, 4.98 on
+    # ``accent_soft``, 4.92 on the darkest surface) -- the fills stay the same
+    # hue, just a shade deeper, and the text becomes readable.
+    accent = "#1766c2"
+    accent_dim = "#15559f"
     accent_soft = "#e4f3fb"
-    violet = "#817ce6"
+    # ``violet`` and ``blue`` are text too (role labels, run tags, KPI values),
+    # so they carry the readable value; the soft tints stay light.
+    violet = "#6d28d9"
     violet_soft = "#f1f0ff"
-    blue = "#48b7c7"
+    blue = "#17737f"
 
     # status
-    ok = "#1da96a"
+    # These are drawn as text badges (``Palette.status``), so the foreground is
+    # the readable value: measured before, ``ok`` on ``ok_soft`` was 2.73 and
+    # ``warn`` on ``warn_soft`` 3.21.  The soft backgrounds are unchanged.
+    ok = "#147a4c"
     ok_soft = "#e3f8ed"
-    warn = "#bd7b11"
+    warn = "#8a5a08"
     warn_soft = "#fff4df"
-    err = "#d64d63"
+    err = "#b02a41"
     err_soft = "#ffedf0"
-    info = "#287ed2"
+    info = "#1f6bb8"
     info_soft = "#e8f3ff"
 
     # diff
@@ -63,8 +80,8 @@ class Palette:
     diff_add_fg = "#157b4d"
     diff_del_bg = "#fff0f1"
     diff_del_fg = "#b83d51"
-    diff_hunk = "#456fd1"
-    diff_meta = "#718bad"
+    diff_hunk = "#3f66c4"
+    diff_meta = "#5a6f85"
 
     # selection
     select_bg = "#dceeff"
@@ -72,7 +89,11 @@ class Palette:
 
     @classmethod
     def status(cls, name: str) -> tuple[str, str]:
-        """``(foreground, soft background)`` for a status token."""
+        """``(foreground, soft background)`` for a status token.
+
+        The foreground is a readable value: this pair is drawn as a text badge,
+        so it is read, not just seen.
+        """
         return {
             "ok": (cls.ok, cls.ok_soft),
             "succeeded": (cls.ok, cls.ok_soft),
@@ -195,7 +216,7 @@ def apply_theme(root: tk.Misc) -> tuple[Palette, Fonts]:
     style.configure("Accent.TLabel", background=palette.bg, foreground=palette.accent,
                     font=fonts.body_bold)
 
-    # ── buttons ──────────────────────────────────────────────────────────
+    # ── buttons ──────────────────────────────────────────────────────────────
     style.configure(
         "TButton",
         background=palette.raised,
@@ -227,7 +248,7 @@ def apply_theme(root: tk.Misc) -> tuple[Palette, Fonts]:
                     font=fonts.small_bold, padding=(10, 6))
     style.map("Danger.TButton", background=[("active", "#4d1622")])
 
-    # ── inputs ───────────────────────────────────────────────────────────
+    # ── inputs ───────────────────────────────────────────────────────────────
     style.configure(
         "TEntry",
         fieldbackground=palette.panel_alt,
@@ -262,7 +283,7 @@ def apply_theme(root: tk.Misc) -> tuple[Palette, Fonts]:
                     foreground=palette.text_dim, font=fonts.small)
     style.map("Panel.TCheckbutton", background=[("active", palette.panel)])
 
-    # ── scrollbars ───────────────────────────────────────────────────────
+    # ── scrollbars ───────────────────────────────────────────────────────────
     # The classic ``tk.Scrollbar`` is drawn by the native Windows element and
     # IGNORES bg/troughcolor — it shows up as a white bar in a dark window.  The
     # ttk scrollbar under the ``clam`` theme does honour colours, so it is styled
@@ -287,12 +308,12 @@ def apply_theme(root: tk.Misc) -> tuple[Palette, Fonts]:
             arrowcolor=[("active", palette.accent)],
         )
 
-    # ── separator / progress ─────────────────────────────────────────────
+    # ── separator / progress ─────────────────────────────────────────────────
     style.configure("TSeparator", background=palette.border)
     style.configure("TProgressbar", background=palette.accent, troughcolor=palette.panel_alt,
                     borderwidth=0, thickness=4)
 
-    # ── tree (tables) ────────────────────────────────────────────────────
+    # ── tree (tables) ────────────────────────────────────────────────────────
     style.configure(
         "Treeview",
         background=palette.panel,
@@ -309,7 +330,7 @@ def apply_theme(root: tk.Misc) -> tuple[Palette, Fonts]:
     style.map("Treeview", background=[("selected", palette.select_bg)],
               foreground=[("selected", palette.text)])
 
-    # ── notebook ─────────────────────────────────────────────────────────
+    # ── notebook ─────────────────────────────────────────────────────────────
     style.configure("TNotebook", background=palette.bg, borderwidth=0, tabmargins=(0, 0, 0, 0))
     style.configure("TNotebook.Tab", background=palette.surface, foreground=palette.text_muted,
                     padding=(14, 7), font=fonts.small, borderwidth=0)
