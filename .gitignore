@@ -89,3 +89,7 @@ docs/ui/*.html
 .vscode/
 .DS_Store
 Thumbs.db
+
+# credential dumps
+env.sql
+*.sql.env

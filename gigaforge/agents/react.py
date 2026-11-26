@@ -414,6 +414,21 @@ class GrepTool:
         pattern, scope = _split_grep_input(action_input)
         if not pattern:
             return "ERROR: grep needs a pattern"
+        # ``_split_grep_input`` only treats a trailing token as a path when it
+        # looks like one (``a/b`` or ``x.py``).  A bare directory name — the
+        # model writing ``grep unrelated in pkg`` — has neither separator, so
+        # the whole string became the pattern and nothing matched.  Resolve it
+        # against the worktree instead of guessing from punctuation: if the
+        # last token names something that exists, it is the scope.
+        if not scope:
+            head, _, tail = pattern.rpartition(" ")
+            tail = tail.strip().strip("\"'`")
+            if head and tail and (ctx.worktree / tail).exists():
+                # ``grep unrelated in pkg`` leaves the connector on the pattern;
+                # it is syntax, not something to search for.
+                head = re.sub(r"\s+(?:in|--path|-p|path=)\s*$", "", head.strip(),
+                              flags=re.IGNORECASE)
+                pattern, scope = head.strip(), tail
         # A scoped search is what the tool contract promises; an unscoped one
         # walks the whole worktree, which is the previous behaviour.
         root = ctx.worktree
@@ -454,7 +469,17 @@ class GrepTool:
         return await asyncio.to_thread(self._py_grep, pattern, root, re)
 
     def _py_grep(self, pattern: str, root: Path, re_module: Any) -> str:
-        """Pure-Python grep. Case-insensitive, honouring the skip list."""
+        """Pure-Python grep. Case-insensitive, honouring the skip list.
+
+        ``root`` may be a *file*: the tool contract says ``grep <pattern> in
+        <path>``, and a model that has already found the file scopes the search
+        to it.  ``os.walk`` over a file yields nothing at all, so the scoped
+        search returned "(no matches)" for a pattern that was on line 66 of the
+        file it named.  Measured on ``astropy__astropy-12907``: the model
+        concluded the function had been renamed, invented line numbers, and
+        produced a diff whose hunks could not anchor.  One wrong answer from a
+        tool cost the whole instance.
+        """
         import os
 
         try:
@@ -464,6 +489,20 @@ class GrepTool:
             rx = re_module.compile(re_module.escape(pattern), re_module.IGNORECASE)
 
         hits: list[str] = []
+        if root.is_file():
+            # A single file: report the bare name, which is what the model sees
+            # in the rest of the episode.
+            try:
+                text = root.read_text(encoding="utf-8", errors="ignore")
+            except (OSError, ValueError):
+                text = ""
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                if rx.search(line):
+                    hits.append(f"{root.name}:{lineno}:{line[:300]}")
+            if not hits:
+                return f"(no matches for {pattern!r} in {root.name})"
+            return "\n".join(hits)
+
         for current, dirs, filenames in os.walk(root):
             # Prune before descending.  Filtering files after rglob still walks
             # every entry in node_modules and other large generated trees.

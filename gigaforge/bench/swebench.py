@@ -224,6 +224,45 @@ def _apply(diff: str, cwd: Path) -> tuple[bool, str]:
     return False, (proc.stderr or proc.stdout or "diff did not apply")[-300:]
 
 
+def _worktree_diff(cwd: Path) -> str:
+    """The change that is actually on disk, as a patch.
+
+    SWE-bench grades a *repository*, not a model's claim about one.  Reading
+    ``run.final_diff`` graded the claim: measured live on
+    ``astropy__astropy-12907`` the run reported a 1 851-char diff whose hunks
+    could not anchor (the model had guessed line numbers), while the worktree
+    held a different, valid 2-line edit the episode's ``write_file`` had made.
+    The bench then said "corrupt patch" about a patch nobody had applied.
+
+    ``git diff`` plus the untracked files is the only description of the tree
+    that cannot disagree with it.
+    """
+    parts: list[str] = []
+    code, out = _run(["git", "diff", "--no-color", "--binary"], cwd=cwd, timeout=120)
+    if code == 0 and out.strip():
+        parts.append(out)
+    code, out = _run(["git", "ls-files", "--others", "--exclude-standard"], cwd=cwd, timeout=60)
+    if code == 0:
+        for rel in [line.strip() for line in out.splitlines() if line.strip()]:
+            path = cwd / rel
+            if not path.is_file():
+                continue
+            try:
+                body = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            lines = body.splitlines()
+            parts.append(
+                f"diff --git a/{rel} b/{rel}\n"
+                f"new file mode 100644\n"
+                f"--- /dev/null\n"
+                f"+++ b/{rel}\n"
+                f"@@ -0,0 +1,{len(lines)} @@\n"
+                + "".join(f"+{line}\n" for line in lines)
+            )
+    return "".join(parts)
+
+
 def _pytest_node_ids(tests: Iterable[str]) -> list[str]:
     """SWE-bench names tests as ``path::name``; pytest wants the same string."""
     return [t for t in tests if t.strip()]
@@ -235,6 +274,77 @@ def _run_tests(nodes: Sequence[str], cwd: Path, timeout: int = 600) -> tuple[boo
     cmd = [sys.executable, "-m", "pytest", "-q", "--no-header", "-p", "no:cacheprovider", *nodes]
     code, out = _run(cmd, cwd, timeout=timeout)
     return code == 0, out[-1500:]
+
+
+#: A test run that never reached the tests is not a model failure.  Measured on
+#: ``astropy__astropy-12907``: the model's diff was applied, the maintainer's
+#: test patch was applied, and pytest died in ``conftest.py`` on
+#: ``ModuleNotFoundError: No module named 'hypothesis'``.  The bench reported
+#: ``failed`` — a model failure — for a missing dependency, which is exactly the
+#: number SWE-bench's own harness excludes as an environment error.
+_ENV_FAILURE_MARKERS = (
+    "ModuleNotFoundError",
+    "ImportError while loading conftest",
+    "No module named",
+    "error: command 'gcc' failed",
+    "ERROR: file or directory not found",
+    "INTERNALERROR",
+)
+
+
+def _looks_like_environment_failure(output: str) -> bool:
+    """True when pytest never got as far as running the named tests."""
+    text = output or ""
+    if "collected 0 items" in text and "error" in text.lower():
+        return True
+    return any(marker in text for marker in _ENV_FAILURE_MARKERS)
+
+
+def _install_test_requirements(cwd: Path) -> str:
+    """Best-effort install of the repo's own test dependencies.
+
+    SWE-bench's reference harness builds a per-instance Docker image from the
+    repo's spec.  There is no Docker here, so the closest honest equivalent is
+    to install what the repo declares and report what could not be installed —
+    an instance that still cannot import its own conftest is an environment
+    error, not a wrong answer.
+    """
+    notes: list[str] = []
+    for name in ("requirements-dev.txt", "requirements_test.txt", "test-requirements.txt",
+                 "requirements/tests.txt", "dev-requirements.txt"):
+        path = cwd / name
+        if not path.is_file():
+            continue
+        code, out = _run(
+            [sys.executable, "-m", "pip", "install", "--quiet", "--no-input", "-r", str(path)],
+            cwd=cwd,
+            timeout=600,
+        )
+        notes.append(f"{name}: {'ok' if code == 0 else out[-200:]}")
+    # ``hypothesis`` is imported by astropy's conftest and is not in every
+    # requirements file; it is a test-only dependency with no build cost.
+    code, _ = _run([sys.executable, "-c", "import hypothesis"], cwd=cwd, timeout=60)
+    if code != 0:
+        code, out = _run(
+            [sys.executable, "-m", "pip", "install", "--quiet", "--no-input", "hypothesis"],
+            cwd=cwd,
+            timeout=300,
+        )
+        notes.append(f"hypothesis: {'ok' if code == 0 else out[-200:]}")
+
+    # The repo itself has to be importable: astropy's ``conftest.py`` imports
+    # ``astropy.__version__``, which only exists after the package is installed
+    # (setuptools_scm writes ``version.py`` at build time).  Without this the
+    # tests die on "could not determine astropy package version" — an
+    # environment error that reads like a broken model change.
+    code, out = _run(
+        [sys.executable, "-m", "pip", "install", "--quiet", "--no-input",
+         "--no-deps", "--no-build-isolation", "-e", "."],
+        cwd=cwd,
+        timeout=900,
+    )
+    notes.append(f"editable install: {'ok' if code == 0 else out[-200:]}")
+    return "; ".join(notes)
 
 
 def run_instance(
@@ -293,7 +403,7 @@ def run_instance(
             pipeline.close()
             store.close()
 
-        diff = str(getattr(run, "final_diff", "") or "")
+        diff = _worktree_diff(dest)
         result.diff_chars = len(diff)
         result.tokens_in = int(getattr(client, "usage_in", 0) or 0)
         result.tokens_out = int(getattr(client, "usage_out", 0) or 0)
@@ -302,11 +412,10 @@ def run_instance(
             result.detail = str(getattr(run, "error", "") or "the run produced no diff")[:300]
             return result
 
-        applied, apply_note = _apply(diff, dest)
-        if not applied:
-            result.status = "failed"
-            result.detail = f"model diff did not apply: {apply_note}"
-            return result
+        # The tree already holds the change, so there is nothing to apply: the
+        # diff above is a *description* of it, kept for the report.  Applying it
+        # would be a second edit of an already-edited file.
+        applied, apply_note = True, "graded from the worktree"
 
         # The test patch is the maintainer's own test: it is what makes the
         # grade real, and it is applied *after* the model's change.
@@ -317,6 +426,17 @@ def run_instance(
             return result
 
         f2p_ok, f2p_out = _run_tests(_pytest_node_ids(instance.fail_to_pass), dest)
+        if not f2p_ok and _looks_like_environment_failure(f2p_out):
+            # The tests never ran: install what the repo declares and retry once.
+            install_note = _install_test_requirements(dest)
+            f2p_ok, f2p_out = _run_tests(_pytest_node_ids(instance.fail_to_pass), dest)
+            if not f2p_ok and _looks_like_environment_failure(f2p_out):
+                result.status = "environment_error"
+                result.detail = (
+                    f"tests could not run ({install_note or 'no requirements file'}): "
+                    f"{f2p_out[-300:]}"
+                )
+                return result
         result.fail_to_pass_total = len(instance.fail_to_pass)
         result.fail_to_pass_passed = len(instance.fail_to_pass) if f2p_ok else 0
         if not f2p_ok:
