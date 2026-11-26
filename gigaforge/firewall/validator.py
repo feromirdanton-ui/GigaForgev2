@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import builtins
 import logging
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -56,6 +57,16 @@ RetryFn = Callable[[int, "RepairRequest", str], Optional[str]]
 #: Language builtins are never "missing symbols": ``ValueError("x")`` is a call
 #: the symbol index can never resolve, and reporting it would be pure noise.
 _BUILTINS = frozenset(dir(builtins))
+
+#: Identifiers a repository defines or imports.  Used by
+#: :meth:`DiffValidator._name_appears_in_repo` as the last word on whether a
+#: called name is really undefined: the symbol index is a snapshot and can be
+#: partial for an old checkout, while the files are the truth.
+_DEF_RE = re.compile(r"^\s*(?:async\s+)?(?:def|class)\s+([A-Za-z_]\w*)", re.MULTILINE)
+_IMPORT_RE = re.compile(
+    r"^\s*(?:from\s+[\w.]+\s+import\s+(?:\(\s*)?|import\s+)([A-Za-z_]\w*)",
+    re.MULTILINE,
+)
 log = logging.getLogger(__name__)
 
 
@@ -683,10 +694,51 @@ class DiffValidator:
                 continue
             if self.store.find_symbol(name, exact=True):
                 continue
+            # The index is a snapshot, and for an old repository it is often
+            # partial: measured on ``psf__requests-1142``, two names that exist
+            # in the checkout were reported as undefined because the index had
+            # never seen them.  A name that appears in the repository's own
+            # source is not undefined, whatever the index says — so the last
+            # word goes to the files, not to the snapshot.
+            if self._name_appears_in_repo(name):
+                continue
             out.append(name)
             if len(out) >= limit:
                 break
         return out
+
+    def _name_appears_in_repo(self, name: str) -> bool:
+        """Whether ``name`` is defined or imported anywhere in the checkout.
+
+        A bounded, cached scan: the first call builds a set of every identifier
+        that appears after ``def``/``class``/``import`` in the repo's Python
+        files, and later calls are a set lookup.  Bounded by file count and size
+        so a huge repository cannot turn a verification into a full crawl.
+        """
+        cache = getattr(self, "_repo_names", None)
+        if cache is None:
+            cache = set()
+            root = self.root
+            scanned = 0
+            for path in root.rglob("*.py"):
+                if scanned >= 4000:
+                    break
+                if any(part in {".git", "node_modules", ".venv", "venv", "build", "dist"}
+                       for part in path.parts):
+                    continue
+                try:
+                    if path.stat().st_size > 400_000:
+                        continue
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                scanned += 1
+                for match in _DEF_RE.finditer(text):
+                    cache.add(match.group(1))
+                for match in _IMPORT_RE.finditer(text):
+                    cache.add(match.group(1))
+            self._repo_names = cache
+        return name in cache
 
     # ── rollback / reindex ───────────────────────────────────────────────
     def _auto_fix(self, paths: Sequence[str]) -> list[str]:
