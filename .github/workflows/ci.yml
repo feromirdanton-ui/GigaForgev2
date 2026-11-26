@@ -1,15 +1,15 @@
-name: CI
+name: ci
+
+# The bench was not wired to CI and contained no HTML task, so a regression that
+# broke page generation outright would have left every check green.  This
+# workflow runs the unit suite AND the bench, and the bench now includes a page
+# fixture -- the artifact path is measured, not assumed.
 
 on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
   workflow_dispatch:
-
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   test:
@@ -39,6 +39,11 @@ jobs:
         run: python -m playwright install --with-deps chromium
       - name: Unit tests
         run: python -m pytest -q
+      - name: Bench (deterministic, no API calls)
+        # The bench is the product's own measurement: five fixtures, one of them
+        # a page.  It must pass on every push, not only when someone remembers
+        # to run it.
+        run: python -m gigaforge.cli bench --out bench.json
       - name: Bench must be all-green
         run: |
           python - <<'PY'
@@ -71,4 +76,11 @@ jobs:
           path: |
             ui-audit.json
             /tmp/panel-ci.html
+          if-no-files-found: ignore
+      - name: Upload bench report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.python-version }}
+          path: bench.json
           if-no-files-found: ignore
