@@ -406,7 +406,7 @@ class SegmentedControl(tk.Canvas):
             circle_fill = mix(self.palette.surface, tone, 0.14 if is_selected else 0.08)
             self.create_oval(circle_x - 9, circle_y - 9, circle_x + 9, circle_y + 9,
                              fill=circle_fill, outline="")
-            self.create_text(circle_x, circle_y, text=glyph, fill=tone,
+            self.create_text(circle_x, circle_y, text=glyph, fill=self.palette.ink_for(tone),
                              font=(self.fonts.ui, 10, "bold"))
             foreground = self.palette.text if is_selected else self.palette.text_muted
             self.create_text(offset + 34, circle_y, text=label, anchor="w",
@@ -447,7 +447,7 @@ class SmartIcon(tk.Canvas):
         self.create_oval(inset, inset, size - inset, size - inset,
                          fill=self.fill, outline=mix(self.fill, self.tone, 0.22), width=1)
         self.create_text(size / 2, size / 2, text=self.glyph,
-                         fill=self.tone, font=self.glyph_font)
+                         fill=self.palette.ink_for(self.tone), font=self.glyph_font)
 
 
 class Badge(tk.Canvas):

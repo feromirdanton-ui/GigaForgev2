@@ -78,6 +78,32 @@ class Palette:
     blue = "#48b7c7"
     blue_ink = "#17737f"
 
+    # ``tone_ink`` maps a FILL tone to the value that may be used as text.
+    #
+    # ``SegmentedControl`` and ``IconBadge`` paint a glyph with the tone
+    # (``widgets.py:409`` and ``:450``), and a glyph is text -- it is read, not
+    # just seen.  Measured on the surface they sit on, the fills were 2.78
+    # (accent), 3.48 (violet) and 2.33 (blue); on their own soft badge fill,
+    # 2.49 / 3.13 / 2.09.  ``ok`` and ``info`` were already readable, so they
+    # map to themselves -- the point is that the mapping is explicit, not that
+    # every tone changes.
+    tone_ink = {
+        "#4b9fea": "#1766c2",   # accent     2.78 -> 5.57 on surface
+        "#817ce6": "#6d28d9",   # violet     3.48 -> 7.01
+        "#48b7c7": "#17737f",   # blue       2.33 -> 5.46
+        "#147a4c": "#147a4c",   # ok         5.29, already readable
+        "#1f6bb8": "#1f6bb8",   # info       5.37, already readable
+    }
+
+    @classmethod
+    def ink_for(cls, tone: str) -> str:
+        """The readable value for a fill *tone* used as text.
+
+        Unknown tones are returned unchanged: a caller passing a colour that is
+        already an ink value (or a one-off) must not be silently rewritten.
+        """
+        return cls.tone_ink.get(tone.lower(), tone)
+
     # status
     # These are drawn as text badges (``Palette.status``), so the foreground is
     # the readable value: measured before, ``ok`` on ``ok_soft`` was 2.73 and
