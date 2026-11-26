@@ -71,7 +71,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-__all__ = ["TaskKind", "classify_task", "is_artifact_goal", "PAGE_PHRASES"]
+__all__ = ["TaskKind", "classify_task", "is_artifact_goal", "PAGE_PHRASES", "DOCUMENT_PHRASES"]
 
 #: Suffixes that mean "this is a rendered artifact, not source code".
 _ARTIFACT_SUFFIXES = frozenset({".html", ".htm", ".css"})
@@ -136,6 +136,25 @@ _NO_CHANGE_PHRASES: tuple[str, ...] = (
     "не меняй", "не изменяй", "не трогай", "без изменений", "только ответь",
 )
 
+#: Phrases that mean "the deliverable is a written document" when the goal
+#: names no path.  Checked **before** the mutating-verb scan, because "write" is
+#: a mutating verb and "write a short document explaining X" names no file — so
+#: it used to classify as ``code``, the planner demanded an executable step with
+#: a target file, and the run produced a diff instead of prose.  Measured on the
+#: bench fixture ``document-how-it-works``: ``kind=code``, no text produced.
+#:
+#: The phrases are deliberately narrow.  "Write a function" is code; "write a
+#: document" is prose.  Only the noun decides, and only these nouns.
+DOCUMENT_PHRASES: tuple[str, ...] = (
+    "write a document", "write a short document", "write a doc",
+    "write documentation", "write a report", "write a guide",
+    "write an article", "write a readme", "write a design document",
+    "draft a document", "draft a report", "draft a guide",
+    "create a document", "create a report", "produce a document",
+    "напиши документ", "напиши отчёт", "напиши отчет", "напиши статью",
+    "напиши руководство", "составь документ", "составь отчёт", "составь отчет",
+)
+
 #: Phrases that mean "produce a page" when the goal names no path at all.
 #: Bare ``site`` and bare ``html`` are excluded on purpose — see the module
 #: docstring; they are the substrings that mis-routed "composite" and
@@ -194,6 +213,11 @@ class TaskKind:
     edit_paths: tuple[str, ...] = ()
     #: Paths the goal names that **exist** in the repository and are code.
     code_paths: tuple[str, ...] = ()
+    #: Document paths the goal names.  Empty for a document goal that names no
+    #: file — and that difference decides the product: a named path means the
+    #: run writes prose *into that file* (a diff), while no path means the prose
+    #: itself is the deliverable (a text product).
+    document_paths: tuple[str, ...] = ()
     #: Why this verdict — written to the ledger, shown in the report.
     evidence: str = ""
     #: Paths named in the goal that could not be resolved either way.
@@ -255,13 +279,21 @@ class TaskKind:
     def is_text_product(self) -> bool:
         """True when the deliverable is prose, not a diff.
 
-        Both a chat reply and a code diagnosis end in text.  They share the
-        executor (an episode with repository tools and ``web_search``), the
-        validator (a non-empty reply, citations when it searched) and the
-        settlement (no changed files required).  They differ only in the plan
-        sentence, which is why this is one property and not two branches in
-        four places.
+        A chat reply, a code diagnosis and a document that names no file all end
+        in text.  They share the executor (an episode with repository tools and
+        ``web_search``), the validator (a non-empty reply, citations when it
+        searched) and the settlement (no changed files required).
+
+        **A document with a named path is not a text product.**  "Write a design
+        document in docs/design.md" asks for a file, and the file is the
+        deliverable — the run writes it and the placeholder check grades its
+        text.  "Write a short document explaining X" names no file, so the prose
+        is the product and there is nothing to write it into.  Measured: the
+        second form classified as ``code`` and produced a diff where prose was
+        asked for.
         """
+        if self.kind == "document":
+            return not self.document_paths
         return self.kind in ("answer", "analysis")
 
     def to_dict(self) -> dict[str, object]:
@@ -517,8 +549,19 @@ def classify_task(goal: str, repo_root: Path | str | None = None) -> TaskKind:
             evidence = "goal names path(s) that exist in the repo: " + ", ".join(code_paths)
     else:
         low = (goal or "").lower()
+        # A document phrase wins over the mutating-verb scan.  "Write a short
+        # document explaining X" contains "write" and names no file, so the verb
+        # scan sent it to the coder and the run produced a diff where prose was
+        # asked for.  The noun is the signal, not the verb.
+        doc_phrase = next((p for p in DOCUMENT_PHRASES if p in low), "")
         phrase = next((p for p in PAGE_PHRASES if p in low), "")
-        if phrase:
+        if doc_phrase:
+            kind = "document"
+            evidence = (
+                f"goal names no path but says {doc_phrase!r}: the deliverable is "
+                "a document's text, not a diff"
+            )
+        elif phrase:
             kind = "artifact"
             evidence = f"goal names no path but says {phrase!r}"
         else:
@@ -578,6 +621,7 @@ def classify_task(goal: str, repo_root: Path | str | None = None) -> TaskKind:
         artifact_paths=tuple(artifact_paths),
         edit_paths=tuple(edit_paths),
         code_paths=tuple(code_paths),
+        document_paths=tuple(document_paths),
         evidence=evidence,
         unresolved=tuple(unresolved),
     )

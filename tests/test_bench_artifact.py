@@ -47,9 +47,18 @@ class TestTheTaskSetCoversArtifacts:
         assert page.test_command == []
 
     def test_every_code_task_still_has_a_test_command(self) -> None:
+        """A patch task is verified by running the suite; a text task is not.
+
+        The original form asserted this for every fixture that was not a page,
+        which quietly assumed every fixture is a patch.  The analysis and
+        document fixtures are text products: their acceptance is a set of facts
+        about the prose, and demanding a ``test_command`` of them would have
+        forced a fake one.
+        """
         for task in TASKS:
-            if not task.section_responses:
-                assert task.test_command, f"{task.name} has no way to be verified"
+            if task.section_responses or task.text_responses:
+                continue
+            assert task.test_command, f"{task.name} has no way to be verified"
 
 
 class TestSectionAwareFakeProvider:

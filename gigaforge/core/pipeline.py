@@ -3060,27 +3060,27 @@ class TaskPipeline:
             )
         citations = list(ctx.extras.get("answer_citations") or [])
         searched = bool(ctx.extras.get("answer_searched"))
-        cited_in_reply = [
-            m.group(0).rstrip(".,;:")
-            for m in re.finditer(r"https?://[^\s<>\"')\]]+", text)
-        ]
         if searched and not citations:
             return ValidateResult(
                 accepted=False, applied=False,
                 reason="the episode searched the web but no result URL was observed",
             )
-        invented = [u for u in cited_in_reply if u not in citations]
-        if invented:
-            return ValidateResult(
-                accepted=False, applied=False,
-                reason="the answer cites URL(s) no observation returned: "
-                       + ", ".join(invented[:3]),
+        # The citation gate lives in ``harness/citations.py`` so the rule is one
+        # function, not a regex repeated at each call site.  The inline version
+        # this replaces compared raw strings, so a correct citation written as
+        # ``https://Example.com/a/`` against an observation of
+        # ``https://example.com/a`` was reported as invented — a false rejection
+        # of a right answer, which is the worst kind of gate.
+        try:
+            from gigaforge.harness.citations import citation_issue
+
+            issue = citation_issue(
+                text, citations, require_citation=searched
             )
-        if searched and not cited_in_reply:
-            return ValidateResult(
-                accepted=False, applied=False,
-                reason="the answer used web results but cites none of them",
-            )
+        except Exception:  # noqa: BLE001 - a metric must not fail a run
+            issue = ""
+        if issue:
+            return ValidateResult(accepted=False, applied=False, reason=issue)
         return ValidateResult(
             accepted=True, applied=False, changed_files=[],
             reason=f"answer accepted ({len(text)} chars, {len(citations)} citation(s))",

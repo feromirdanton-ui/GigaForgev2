@@ -14,12 +14,20 @@ needed.
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+import math
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Sequence
 
 if TYPE_CHECKING:  # avoid circular import at runtime
     from gigaforge.bench.harness import BenchResult
 
-__all__ = ["bench_report"]
+__all__ = [
+    "bench_report",
+    "bench_report_json",
+    "DeltaVerdict",
+    "noise_floor",
+    "delta_report",
+]
 
 
 def _ok(b: bool) -> str:
@@ -113,3 +121,122 @@ def bench_report(results: list[BenchResult]) -> str:
 def bench_report_json(results: list[BenchResult]) -> list[dict[str, Any]]:
     """Machine-readable JSON rows (one per task) for downstream tooling."""
     return [r.to_row() for r in results]
+
+
+# ── noise-adjusted floor ─────────────────────────────────────────────────────
+@dataclass
+class DeltaVerdict:
+    """Whether a change in pass rate is bigger than the noise that produced it.
+
+    **The defect this answers.**  The bench reported "5/5" and "6/6" as if they
+    were different facts.  They are not: with a stochastic pipeline, a task that
+    passes 4 times in 5 and a task that passes 5 times in 5 are the same task
+    observed twice.  A harness that "improved" from 4/5 to 5/5 has learned
+    nothing, and a harness that "regressed" from 5/5 to 4/5 has broken nothing.
+    Without a floor, every run is a reason to celebrate or panic, and both are
+    wrong.
+
+    **The floor.**  The standard error of a pass rate over ``k`` attempts is
+    ``sqrt(p(1-p)/k)``.  Two runs differ by more than noise when the gap exceeds
+    ``z * sqrt(se_before^2 + se_after^2)``.
+
+    ``z = 1.96`` (95%) is the default, and the choice is measured rather than
+    conventional.  At ``z = 1.0`` the exact case this module exists for — 4/5
+    becoming 5/5 — computes a delta of 0.20 against a floor of 0.179 and is
+    called a real change.  That is the false positive the floor is supposed to
+    prevent, so one sigma is too loose.  At 95% the same comparison has a floor
+    of 0.35 and is correctly reported as noise, while a genuine collapse
+    (5/5 → 0/5) still clears it with room to spare.
+    """
+
+    task: str
+    before: float
+    after: float
+    delta: float
+    floor: float
+    significant: bool
+    attempts_before: int
+    attempts_after: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "task": self.task,
+            "before": round(self.before, 4),
+            "after": round(self.after, 4),
+            "delta": round(self.delta, 4),
+            "floor": round(self.floor, 4),
+            "significant": self.significant,
+            "attempts_before": self.attempts_before,
+            "attempts_after": self.attempts_after,
+        }
+
+
+def _standard_error(rate: float, attempts: int) -> float:
+    if attempts <= 0:
+        return 0.0
+    return math.sqrt(max(0.0, rate * (1.0 - rate)) / attempts)
+
+
+def noise_floor(
+    before: Sequence[BenchResult],
+    after: Sequence[BenchResult],
+    *,
+    z: float = 1.96,
+) -> list[DeltaVerdict]:
+    """Compare two bench runs task by task, and say what actually changed.
+
+    A task present in only one run is reported with the other side at 0 and
+    ``significant=True`` only when the gap clears the floor — a task that was
+    added is a real change, but a task that was *renamed* is not, and the caller
+    sees both as "present in one run" and can judge.
+    """
+    by_before = {r.name: r for r in before}
+    by_after = {r.name: r for r in after}
+    verdicts: list[DeltaVerdict] = []
+    for name in sorted(set(by_before) | set(by_after)):
+        b = by_before.get(name)
+        a = by_after.get(name)
+        rate_b = b.pass_at_k if b is not None else 0.0
+        rate_a = a.pass_at_k if a is not None else 0.0
+        k_b = max(1, b.attempts) if b is not None else 1
+        k_a = max(1, a.attempts) if a is not None else 1
+        se = math.sqrt(_standard_error(rate_b, k_b) ** 2
+                       + _standard_error(rate_a, k_a) ** 2)
+        floor = z * se
+        delta = rate_a - rate_b
+        verdicts.append(DeltaVerdict(
+            task=name,
+            before=rate_b,
+            after=rate_a,
+            delta=delta,
+            floor=floor,
+            significant=abs(delta) > floor,
+            attempts_before=k_b,
+            attempts_after=k_a,
+        ))
+    return verdicts
+
+
+def delta_report(verdicts: Sequence[DeltaVerdict]) -> str:
+    """Render the comparison, separating real changes from noise."""
+    if not verdicts:
+        return "(no tasks to compare)"
+    lines = [
+        f"{'task':<28} {'before':>8} {'after':>8} {'delta':>8} {'floor':>8}  verdict",
+        "-" * 78,
+    ]
+    real = 0
+    for v in verdicts:
+        verdict = "CHANGED" if v.significant else "within noise"
+        if v.significant:
+            real += 1
+        lines.append(
+            f"{v.task:<28} {v.before:>8.2f} {v.after:>8.2f} "
+            f"{v.delta:>+8.2f} {v.floor:>8.2f}  {verdict}"
+        )
+    lines.append("-" * 78)
+    lines.append(
+        f"{real} of {len(verdicts)} task(s) changed by more than the noise floor; "
+        f"the rest are the same result observed twice"
+    )
+    return "\n".join(lines)

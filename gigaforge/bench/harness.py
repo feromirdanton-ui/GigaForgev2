@@ -91,6 +91,22 @@ class TaskFixture:
     artifact_must_contain: tuple[str, ...] = ()
     #: Minimum size of the written artifact, in bytes.
     artifact_min_bytes: int = 0
+    #: Canned prose answers, keyed by phase, for the text-product classes
+    #: (``answer``, ``analysis``, ``document``).
+    #:
+    #: **Why a separate field.**  A text product has no diff, so
+    #: ``code_responses`` cannot express it: the pipeline asks the episode to
+    #: gather and then one clean call to write.  Without this the bench had five
+    #: fixtures and every one of them was a patch or a page — the two classes the
+    #: review named as "held up by crutches around the patch" were the two the
+    #: bench could not measure at all.
+    text_responses: dict[str, str] = field(default_factory=dict)
+    #: What the finished text must contain.  The text analogue of
+    #: ``artifact_must_contain``: a document has no tests, so its acceptance is a
+    #: set of facts about the prose.
+    text_must_contain: tuple[str, ...] = ()
+    #: Minimum length of the produced text, in characters.
+    text_min_chars: int = 0
 
 
 # --- Task #1: classic validate_email fix (mirrors the toy repo) ------------
@@ -445,8 +461,92 @@ TASK5 = TaskFixture(
 )
 
 
+# --- Task #6: analysis — a diagnosis, not a patch --------------------------
+#
+# The review's finding: three of the four everyday task classes were held up by
+# crutches around the patch, and the bench could not measure any of them.  This
+# fixture is the analysis class: the correct output is a *diagnosis*, and the
+# file must be left alone.  A harness that "fixes" it has failed the task.
+_TASK6_SOURCE = (
+    "def mul(a, b):\n"
+    "    \"\"\"Multiply two numbers.\"\"\"\n"
+    "    return a + b\n"
+)
+
+TASK6 = TaskFixture(
+    name="analysis-bug-diagnosis",
+    repo_files={"calc.py": _TASK6_SOURCE, "README.md": "# calc\n"},
+    task=(
+        "Analyse calc.py and explain what is wrong with mul. Do not change any "
+        "file; the answer is the diagnosis."
+    ),
+    target_function="mul",
+    target_file="calc.py",
+    plan_response=_json.dumps({"steps": []}),
+    code_responses=[],
+    review_responses=[_TASK1_REVIEW_OK],
+    test_command=[],
+    expected_diff_substring="",
+    text_responses={
+        "summarize": (
+            "`mul(a, b)` returns `a + b`, so it adds instead of multiplying. "
+            "Every caller that expects a product gets a sum: `mul(3, 4)` returns "
+            "7 rather than 12. The fix is to return `a * b`."
+        ),
+    },
+    text_must_contain=("a + b", "a * b"),
+    text_min_chars=80,
+)
+
+
+# --- Task #7: document — prose is the product ------------------------------
+#
+# The document class: the deliverable is a written document, not a diff.  The
+# fixture checks the prose has the sections the goal asked for and does not
+# describe itself ("this section provides an overview of..."), which is the
+# template failure the live runs caught.
+_TASK7_DOC = """# GigaForge: how a run works
+
+## Intake
+The goal is classified before any model is called. A page goal, a patch goal, a
+question and a document take different paths, and the classifier decides which
+one from the goal text alone.
+
+## Plan
+The planner produces steps. A step that names a tool the harness does not have
+is dropped, and a plan with no executable step is legal for a read-only task.
+
+## Act
+The executor writes a diff, a page section, or a reply. The shape is chosen by
+the task class, not by the model.
+
+## Verify
+The artifact is checked against the goal: structure for a page, tests for a
+patch, citations for an answer. A run that cannot prove its work has failed.
+"""
+
+TASK7 = TaskFixture(
+    name="document-how-it-works",
+    repo_files={"README.md": "# demo repo\n"},
+    task=(
+        "Write a short document explaining how a GigaForge run works, with "
+        "sections for intake, plan, act and verify."
+    ),
+    target_function="",
+    target_file="",
+    plan_response=_json.dumps({"steps": []}),
+    code_responses=[],
+    review_responses=[_TASK1_REVIEW_OK],
+    test_command=[],
+    expected_diff_substring="",
+    text_responses={"summarize": _TASK7_DOC},
+    text_must_contain=("## Intake", "## Plan", "## Act", "## Verify"),
+    text_min_chars=400,
+)
+
+
 # The default task set — the bench runner uses this if no explicit list is passed.
-TASKS: list[TaskFixture] = [TASK1, TASK2, TASK3, TASK4, TASK5]
+TASKS: list[TaskFixture] = [TASK1, TASK2, TASK3, TASK4, TASK5, TASK6, TASK7]
 
 
 def _section_kind_from_prompt(prompt: str) -> str:
@@ -573,6 +673,9 @@ class BenchFakeGigaClient:
                 else (self._fixture.review_responses[0] if self._fixture.review_responses
                       else _TASK1_REVIEW_OK)
             )
+        elif phase in self._fixture.text_responses:
+            # A text product: the fixture answers the writing phase directly.
+            content = self._fixture.text_responses[phase]
         else:
             content = ""
         tokens_out = max(1, len(content) // 4)
@@ -1007,10 +1110,33 @@ class BenchRunner:
                         f"expected at least {fixture.artifact_min_bytes}"
                     )
 
+        # A text product has no diff and no artifact: its acceptance is a set of
+        # facts about the prose the run produced.  Without this the analysis and
+        # document fixtures would report success on ``result.accepted`` alone,
+        # which is the claim the bench exists to check independently.
+        text_ok = True
+        if fixture.text_must_contain or fixture.text_min_chars:
+            produced = str(getattr(result, "answer", "") or "")
+            if not produced:
+                text_ok = False
+                verify_error = "the run produced no text"
+            else:
+                missing = [needle for needle in fixture.text_must_contain
+                           if needle not in produced]
+                if missing:
+                    text_ok = False
+                    verify_error = f"text missing: {', '.join(missing)}"
+                elif len(produced) < fixture.text_min_chars:
+                    text_ok = False
+                    verify_error = (
+                        f"text is {len(produced)} chars, expected at least "
+                        f"{fixture.text_min_chars}"
+                    )
+
         return BenchResult(
             name=fixture.name,
             task=fixture.task,
-            success=bool(result.accepted) and artifact_ok,
+            success=bool(result.accepted) and artifact_ok and text_ok,
             cache_hit=bool(result.cache_hit),
             llm_calls=llm_calls,
             tokens_in=_bench_tokens(provider, "usage_in"),

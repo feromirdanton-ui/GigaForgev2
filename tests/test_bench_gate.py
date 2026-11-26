@@ -63,22 +63,40 @@ def test_every_diff_passes_the_repository_tests(results):
 
     This is the assertion that separates "the pipeline produced something" from
     "the pipeline fixed the bug".  It is the bench's whole reason to exist.
+
+    A text product has no diff to apply, so it is excluded — and its own
+    acceptance is checked instead (``text_must_contain`` / ``text_min_chars``),
+    which is the same question asked of the right artifact.
     """
-    failed = [(r.name, r.error) for r in results if not r.tests_passed_after_apply]
+    text_tasks = {t.name for t in TASKS if t.text_responses}
+    failed = [
+        (r.name, r.error) for r in results
+        if not r.tests_passed_after_apply and r.name not in text_tasks
+    ]
     assert not failed, f"diffs did not pass the repo tests: {failed}"
 
 
+def test_every_text_task_produced_its_text(results):
+    """A text product is verified by its prose, not by a diff."""
+    text_tasks = {t.name for t in TASKS if t.text_responses}
+    assert text_tasks, "the bench has no text-product fixture"
+    failed = [(r.name, r.error) for r in results
+              if r.name in text_tasks and not r.success]
+    assert not failed, f"text tasks failed: {failed}"
+
+
 def test_expected_diff_substring_is_present(results):
-    """Each fixture's canned answer still matches the task it solves."""
+    """Each patch fixture's canned answer still matches the task it solves."""
     by_name = {t.name: t for t in TASKS}
+    patch_tasks = {t.name for t in TASKS if not t.text_responses}
     missing = [
         r.name
         for r in results
-        if not r.diff_substring_found
+        if r.name in patch_tasks and not r.diff_substring_found
     ]
     assert not missing, f"expected diff substring missing for: {missing}"
     # And the substring is a real one, not an empty string that trivially matches.
-    for name in by_name:
+    for name in patch_tasks:
         assert by_name[name].expected_diff_substring.strip()
 
 
