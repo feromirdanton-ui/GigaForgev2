@@ -104,9 +104,43 @@ class DocumentPlan:
 
 
 #: Section titles the goal may name explicitly, in the order a document reads.
+#:
+#: The separator is required.  Without it the pattern matched the bare word
+#: "sections" and captured whatever followed -- so "with four sections" produced
+#: a single section titled "S" (the first letter of "sections"), and the whole
+#: document was written to a one-section shape the user never asked for.  A
+#: named list is always introduced by "for", ":" or a dash; a count is not a
+#: list, and a count is what "with four sections" is.
 _NAMED_SECTION_RE = re.compile(
-    r"(?:sections?|разделы?|главы?)\s*(?:for|:)?\s*([^.]+)", re.IGNORECASE
+    r"(?:sections?|разделы?|главы?)\s*(?:for|:|\u2014|-)\s*([^.]+)", re.IGNORECASE
 )
+
+#: "with four sections", "in 3 chapters" -- a count, not a list of titles.
+_SECTION_COUNT_RE = re.compile(
+    r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
+    r"(?:sections?|chapters?|parts?|раздел\w*|глав\w*)",
+    re.IGNORECASE,
+)
+_COUNT_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+}
+
+
+def _section_count(goal: str) -> int:
+    """How many sections the goal asks for, or 0 when it does not say.
+
+    A count is a shape instruction and the harness owns the shape, so it is
+    read here rather than left to the model.  "with four sections" used to be
+    parsed as a *list* whose only entry was "S".
+    """
+    match = _SECTION_COUNT_RE.search(goal or "")
+    if not match:
+        return 0
+    raw = match.group(1).lower()
+    if raw.isdigit():
+        return max(0, min(12, int(raw)))
+    return _COUNT_WORDS.get(raw, 0)
 
 
 def _named_sections(goal: str) -> list[str]:
@@ -156,12 +190,26 @@ def plan_document(goal: str, *, default_sections: int = 4) -> DocumentPlan:
     if named:
         sections = [Section(title=t, purpose=f"Cover {t.lower()}.") for t in named]
     else:
-        sections = [
+        # A stated count is honoured; otherwise the default shape.  The count
+        # used to be ignored entirely, and "with four sections" was read as a
+        # one-item list named "S".
+        wanted = _section_count(goal) or default_sections
+        base = [
             Section(title="Overview", purpose="What this document is about."),
             Section(title="Details", purpose="The substance."),
             Section(title="Considerations", purpose="Trade-offs and limits."),
             Section(title="Conclusion", purpose="What to take away."),
-        ][:max(1, default_sections)]
+        ]
+        if wanted <= len(base):
+            sections = base[:max(1, wanted)]
+        else:
+            # Beyond the four canonical parts, add numbered parts rather than
+            # repeating a title: two sections with the same title make the
+            # refinement check unable to say which one failed.
+            sections = list(base) + [
+                Section(title=f"Part {i}", purpose="Further detail.")
+                for i in range(len(base) + 1, wanted + 1)
+            ]
     title = _document_title(goal)
     return DocumentPlan(
         outline=Outline(title=title, sections=sections),
@@ -182,6 +230,72 @@ def _document_title(goal: str) -> str:
     if not text:
         return "Document"
     return text[:1].upper() + text[1:]
+
+
+_FENCE_RE = re.compile(r"^\s*```[a-zA-Z]*\s*$")
+_HUNK_RE = re.compile(r"^\s*@@[^@]*@@\s*$")
+
+
+def clean_section_body(text: str, *, title: str = "") -> str:
+    """Strip the diff envelope a model sometimes wraps a section in.
+
+    **Measured live.**  Asked for prose, the model answered with a fenced
+    ``diff`` block containing a ``@@ -0,0 +1,8 @@`` header and ``+``-prefixed
+    lines -- the channel it had been using for the rest of the run.  The text
+    was correct and the file was unreadable: every section arrived as a patch
+    inside a code fence, and the document was 5 439 characters of diff syntax
+    around 2 000 characters of prose.
+
+    This is a channel problem, not a content problem, so it is fixed by
+    computation: drop the fence, drop the hunk header, drop the leading ``+``
+    of a diff line, and drop a repeated section title.  Nothing is rewritten --
+    a line that is not diff syntax is left exactly as written.
+    """
+    lines = (text or "").splitlines()
+    out: list[str] = []
+    saw_diff = False
+    for line in lines:
+        if _FENCE_RE.match(line):
+            saw_diff = True
+            continue
+        if _HUNK_RE.match(line):
+            saw_diff = True
+            continue
+        if saw_diff and line.startswith("+"):
+            stripped = line[1:]
+            # The closing fence often arrives as ``+``` `` -- a diff line whose
+            # content is the fence.  Stripping the ``+`` would leave a stray
+            # fence in the prose, so it is dropped here too.
+            if _FENCE_RE.match(stripped):
+                continue
+            out.append(stripped)
+            continue
+        out.append(line)
+    body = "\n".join(out).strip()
+    # A section that repeats its own heading is a heading, not prose.
+    if title:
+        heading = re.compile(rf"^#{{1,6}}\s*{re.escape(title)}\s*$", re.IGNORECASE)
+        body = "\n".join(
+            line for line in body.splitlines() if not heading.match(line.strip())
+        ).strip()
+
+    # **A section body may not open with a heading.**  Measured live: section one
+    # came back starting with ``# Design Document About Caching Strategies`` --
+    # the document's own H1, re-emitted inside the section.  ``assemble`` writes
+    # the section heading itself, so the body began with a heading, the section
+    # measured as *empty* (its content sat after a heading that terminated it),
+    # and the run was correctly rejected with "section 'Overview' has 0 chars of
+    # content".  The gate was right; the body was wrong.
+    #
+    # Dropping leading headings loses nothing: the section's own heading is
+    # supplied by ``assemble``, and a subheading cannot be the first thing a
+    # section says.
+    lines = body.splitlines()
+    while lines and re.match(r"^\s*#{1,6}\s+\S", lines[0]):
+        lines.pop(0)
+        while lines and not lines[0].strip():
+            lines.pop(0)
+    return "\n".join(lines).strip()
 
 
 def section_prompt(section: Section, *, document_title: str = "") -> str:

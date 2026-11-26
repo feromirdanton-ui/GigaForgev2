@@ -2562,6 +2562,7 @@ class TaskPipeline:
         """
         from gigaforge.harness.document_pipeline import (
             assemble,
+            clean_section_body,
             plan_document,
             refinement_issues,
             section_prompt,
@@ -2623,7 +2624,13 @@ class TaskPipeline:
             except Exception as exc:  # noqa: BLE001 - one section must not kill the doc
                 self._degraded("document", exc, "document")
                 body = ""
-            section.body = str(body or "").strip()
+            # The model sometimes answers in the diff channel it used for the
+            # rest of the run: a fenced ``diff`` block with a ``@@`` header and
+            # ``+``-prefixed lines.  Measured live -- the prose was right and
+            # the file was 5 439 characters of diff syntax around it.  This is
+            # a channel problem, so it is fixed by computation, not by asking
+            # the model again.
+            section.body = clean_section_body(str(body or ""), title=section.title)
             bodies[section.title] = section.body
 
         document = assemble(plan, bodies)
@@ -2650,7 +2657,7 @@ class TaskPipeline:
                 except Exception as exc:  # noqa: BLE001
                     self._degraded("document", exc, "document")
                     continue
-                section.body = str(body or "").strip()
+                section.body = clean_section_body(str(body or ""), title=section.title)
                 bodies[section.title] = section.body
             document = assemble(plan, bodies)
             issues = refinement_issues(document, plan)
@@ -2663,9 +2670,26 @@ class TaskPipeline:
             chars=len(document), sections=len(plan.outline.sections),
             remaining_issues=len(issues),
         )
+
+        # **A document that names a file must be written to that file.**  The
+        # pipeline returned ``text`` with an empty ``diff``, and the route to it
+        # was ``is_text_product`` -- which is False for a document with a path.
+        # So "write a design document in docs/caching.md" never reached this
+        # code at all: it went to the coder, which produced a one-line file of
+        # headings, and the run was accepted.  Measured live: a four-section
+        # request produced ``# Caching Strategies\n## Section 1: Introduction…``
+        # and nothing else.
+        #
+        # The diff is built here, from text the harness already has, so the
+        # normal apply/validate path grades it like any other change.
+        diff = ""
+        kind_obj = _task_kind_for(self, ctx)
+        targets = list(getattr(kind_obj, "document_paths", ()) or ())
+        if targets:
+            diff = _document_creation_diff(targets[0], document)
         return {
             "proposal": ProposeResult(
-                text=document, diff="", phase="document",
+                text=document, diff=diff, phase="document",
                 model=str(getattr(self.router, "last_model", "") or ""),
             ),
             "proposal_source": "document-pipeline",
@@ -2741,10 +2765,14 @@ class TaskPipeline:
         # for "diff could not be parsed".  The episode is the right executor: it
         # has the repository tools AND ``web_search``, and its ``finish`` prose
         # is the deliverable.
-        if _task_kind_for(self, ctx).is_text_product:
-            kind_obj = _task_kind_for(self, ctx)
-            if getattr(kind_obj, "is_document", False):
-                return self._document_proposal(ctx)
+        # A document is a document whether or not it names a file.  The route
+        # used to be ``is_text_product``, which is False for a document with a
+        # path -- so the pipeline was reachable only for the form that has no
+        # file to write, and the form that has one went to the coder.
+        kind_obj = _task_kind_for(self, ctx)
+        if getattr(kind_obj, "is_document", False):
+            return self._document_proposal(ctx)
+        if kind_obj.is_text_product:
             return self._answer_proposal(ctx)
 
         slice_obj = inputs.get("slice")
@@ -5299,6 +5327,25 @@ def _parse_plan(text: str) -> list[str]:
         if stripped:
             steps.append(stripped)
     return steps[:24]
+
+
+def _document_creation_diff(path: str, text: str) -> str:
+    """A ``git``-style creation diff for a document the harness wrote.
+
+    The body is emitted line by line rather than as one escaped line: a single
+    ``+`` line containing literal ``\\n`` is what the coder produced, and it
+    wrote a file whose entire content was one line of backslash-n.
+    """
+    lines = (text or "").rstrip("\n").split("\n")
+    body = "".join(f"+{line}\n" for line in lines)
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        f"+++ b/{path}\n"
+        f"@@ -0,0 +1,{len(lines)} @@\n"
+        f"{body}"
+    )
 
 
 def _task_kind_for(owner: Any, ctx: RunContext) -> Any:

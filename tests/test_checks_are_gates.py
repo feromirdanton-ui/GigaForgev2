@@ -318,3 +318,87 @@ def test_a_sane_ladder_threshold_is_accepted():
 
     proposal = propose(SurfaceSpec(), {"ladder_thresholds": {"attempts_before_escalation": 3}})
     assert proposal.changes["ladder_thresholds"]["attempts_before_escalation"] == 3
+
+
+# ── a section is prose, not a patch ─────────────────────────────────────────
+
+def test_a_section_wrapped_in_a_diff_fence_is_unwrapped():
+    """Measured live: the model answered prose in the diff channel.
+
+    Every section arrived as a fenced ``diff`` block with a ``@@`` header and
+    ``+``-prefixed lines.  The text was correct and the file was unreadable --
+    5 439 characters of diff syntax around 2 000 of prose.  A channel problem
+    is fixed by computation, not by paying for another call.
+    """
+    from gigaforge.harness.document_pipeline import clean_section_body
+
+    raw = (
+        "```diff\n"
+        "@@ -0,0 +1,4 @@\n"
+        "+## Details\n"
+        "+\n"
+        "+Caching stores data temporarily.\n"
+        "+```\n"
+    )
+    assert clean_section_body(raw, title="Details") == "Caching stores data temporarily."
+
+
+def test_plain_prose_is_left_alone():
+    """The control: a section that is already prose must not be rewritten."""
+    from gigaforge.harness.document_pipeline import clean_section_body
+
+    prose = "Caching stores data temporarily.\n\n- Memory cache\n- Disk cache"
+    assert clean_section_body(prose, title="Details") == prose
+
+
+def test_a_stated_section_count_is_honoured():
+    """"with four sections" was parsed as a one-item list named "S".
+
+    The pattern matched the bare word "sections" and captured what followed, so
+    the first letter of "sections" became the only section title and the whole
+    document was written to a shape the user never asked for.
+    """
+    from gigaforge.harness.document_pipeline import plan_document
+
+    plan = plan_document("Write a design document about caching in docs/c.md with four sections")
+    assert len(plan.outline.sections) == 4
+    assert all(len(s.title) > 1 for s in plan.outline.sections)
+
+
+def test_a_named_section_list_still_wins():
+    """The control: an explicit list of titles is not a count."""
+    from gigaforge.harness.document_pipeline import plan_document
+
+    plan = plan_document("Write a document with sections for intake, plan, act")
+    assert [s.title for s in plan.outline.sections] == ["Intake", "Plan", "Act"]
+
+
+def test_a_document_with_a_path_reaches_the_pipeline():
+    """The route was ``is_text_product``, which is False for a document with a
+    path -- so the form that has a file to write never reached the pipeline and
+    went to the coder instead."""
+    from gigaforge.harness.task_kind import classify_task
+
+    kind = classify_task("Write a design document in docs/caching.md", None)
+    assert kind.is_document is True
+    assert kind.document_paths == ("docs/caching.md",)
+
+
+def test_a_section_may_not_open_with_the_document_heading():
+    """Measured live: the run was rejected with "section 'Overview' has 0 chars".
+
+    The model re-emitted the document's own H1 inside section one.  ``assemble``
+    writes the section heading, so the body began with a heading, the section
+    measured as empty, and the gate -- correctly -- failed the document.  The
+    gate was right and the body was wrong, so the body is what gets fixed.
+    """
+    from gigaforge.harness.document_pipeline import clean_section_body
+
+    raw = (
+        "# Design Document About Caching Strategies\n\n"
+        "Caching is a fundamental technique.\n\n"
+        "### Purpose\nIt serves as a reference."
+    )
+    cleaned = clean_section_body(raw, title="Overview")
+    assert cleaned.startswith("Caching is a fundamental technique.")
+    assert not cleaned.startswith("#")
