@@ -280,6 +280,67 @@ def _goal_of(ctx: Any) -> str:
     return str(getattr(ctx, "task", "") or "")
 
 
+def _document_placeholder_issue(diff: str, goal: str) -> str:
+    """A reason the document is a template rather than writing, or ``""``.
+
+    **The defect this catches.**  Live, a goal asking for a design document with
+    three sections produced::
+
+        ## Section 1: Introduction
+        This section provides an overview of the plugin architecture and its benefits.
+
+        ## Section 2: Design Details
+        This section delves into the specifics of how plugins will be integrated...
+
+        ## Section 3: Implementation Plan
+        This section outlines the steps needed to implement...
+
+    Every section announces what it will cover and then covers nothing.  The file
+    is valid Markdown, has the right number of sections and the right headings,
+    so every existing check passed and the run was reported successful.
+
+    The test is deliberately narrow.  It does not judge whether the writing is
+    *good* — that needs a model and a different question.  It refuses the
+    specific shape of prose that describes itself:
+
+    * a sentence beginning "This section ..." / "This chapter ..." — the document
+      talking about its own structure instead of the subject;
+    * "provides an overview of" / "outlines the steps" with no content after it.
+
+    A document whose *only* content is such sentences has no content.  One such
+    sentence among real paragraphs is normal writing and passes.
+    """
+    added = [
+        line[1:].strip()
+        for line in (diff or "").splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    ]
+    prose = [
+        line for line in added
+        if line
+        and not line.startswith(("#", "```", "---", "*", "-", "|", ">", "!"))
+    ]
+    if not prose:
+        return ""
+    self_describing = re.compile(
+        r"^(this|the following)\s+(section|chapter|part|document|paragraph)\b"
+        r"|\b(provides?|gives?|offers?)\s+an?\s+(overview|introduction|summary)\s+of\b"
+        r"|\b(outlines?|describes?)\s+the\s+(steps|details|specifics|process)\b",
+        re.I,
+    )
+    template = [line for line in prose if self_describing.search(line)]
+    # Half is the threshold, not "any": a real document may open one section with
+    # "This section covers the loader"; a template is *made* of such sentences.
+    if len(template) * 2 >= len(prose):
+        return (
+            "the document describes its own sections instead of its subject: "
+            f"{len(template)} of {len(prose)} prose lines are self-describing "
+            f"(e.g. {template[0][:100]!r}). Write the actual content of each "
+            "section — what the architecture is, not what the section will say."
+        )
+    return ""
+
+
 class TaskPipeline:
     """Builds and runs the task DAG over the client / L0 / firewall layers."""
 
@@ -2940,6 +3001,28 @@ class TaskPipeline:
         # observation.  Demanding a diff here is what made every reply fail.
         if _task_kind_for(self, ctx).is_text_product:
             return {"validation": self._validate_answer(ctx, proposal)}
+        # A document's product is its prose, and the diff is only how it gets
+        # written.  Measured live: "Write a design document in docs/design.md
+        # describing a plugin architecture ... with three sections" produced a
+        # file whose every section was "This section provides an overview of X.
+        # It covers Y and Z." -- structurally perfect, empty of content, and
+        # accepted, because nothing looked at the text.
+        #
+        # The check is deterministic (no model call) and states only what a
+        # placeholder looks like: a sentence that describes its own section
+        # instead of saying anything about the subject.  It does not judge
+        # quality -- that needs a model and is a separate question -- it refuses
+        # the specific failure that shipped.
+        if _task_kind_for(self, ctx).is_document:
+            document_issue = _document_placeholder_issue(diff, ctx.state.goal)
+            if document_issue:
+                return {"validation": ValidateResult(
+                    accepted=False,
+                    applied=False,
+                    changed_files=list(getattr(proposal, "changed_files", []) or []),
+                    reason=document_issue,
+                )}
+
         if not diff:
             return {"validation": ValidateResult(accepted=False, reason="no diff to validate")}
 
