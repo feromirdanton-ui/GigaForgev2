@@ -297,6 +297,7 @@ def goal(
     use_subagents: Annotated[bool, typer.Option("--subagents/--no-subagents", help="Delegate implementation into isolated sub-agent worktrees.")] = False,
     static_only: Annotated[bool, typer.Option("--static-only", help="Allow HTML goals to complete without a browser runtime.")] = False,
     as_json: Annotated[bool, typer.Option("--json", help="Emit the durable goal report as JSON.")] = False,
+    report_out: Annotated[Optional[str], typer.Option("--report-out", help="Write the goal report as JSON to this path.")] = None,
 ) -> None:
     """Pursue a goal through repeated implementation, execution and repair cycles."""
     if resume and goal_id:
@@ -327,8 +328,18 @@ def goal(
         if callable(closer):
             closer()
 
+    payload = result.to_dict()
+    if report_out:
+        # ``run`` has had --report-out since the beginning and ``goal`` did not,
+        # so the mode that actually produces artifacts was the one you could not
+        # capture.  Measured live: a goal run had to be scraped from stdout.
+        target = Path(report_out)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
     if as_json:
-        _emit(json.dumps(result.to_dict(), indent=2, ensure_ascii=False), machine=True)
+        _emit(json.dumps(payload, indent=2, ensure_ascii=False), machine=True)
     else:
         _emit(
             f"goal {result.goal_id}: status={result.status} accepted={result.accepted} "
