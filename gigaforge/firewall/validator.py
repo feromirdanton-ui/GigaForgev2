@@ -693,13 +693,29 @@ class DiffValidator:
             if imp.module:
                 known.add(imp.module.split(".")[0])
 
+        # **Python has an exact answer; do not ask tree-sitter for an estimate.**
+        # ``parsed_now.calls`` comes from a tree-sitter walk, and measured on
+        # ``psf__requests-1142`` it returned ``E501``, ``E713`` and ``F632`` --
+        # ruff *codes*, because the tokens it salvaged from a file that does not
+        # parse look like calls to its recovery pass.  The result was a rejection
+        # message reading "2 undefined symbol(s): E501: Line too long (108 > 100);
+        # F632: Use `==` to compare constant literals", which sends the repair
+        # loop after function names that are lint diagnostics.
+        #
+        # ``ast`` cannot make that mistake: it either parses or it does not, and
+        # an unbound name in a parsed function body is a fact about the code.
+        python_calls = self._python_free_calls(text)
+        calls = (
+            python_calls if python_calls is not None
+            else [(c.callee, bool(c.is_method or c.receiver)) for c in parsed_now.calls]
+        )
+
         out: list[str] = []
         limit = self.config.missing_symbol_limit
-        for call in parsed_now.calls:
-            name = call.callee
+        for name, is_method in calls:
             if not name or name in known:
                 continue
-            if call.is_method or call.receiver:
+            if is_method:
                 continue
             if name.startswith("_"):
                 continue
@@ -717,6 +733,39 @@ class DiffValidator:
             out.append(name)
             if len(out) >= limit:
                 break
+        return out
+
+    @staticmethod
+    def _python_free_calls(text: str) -> list[tuple[str, bool]] | None:
+        """Every call in a Python file, with whether it has a receiver.
+
+        Returns ``None`` for a non-Python file or one that does not parse, so the
+        caller falls back to the tree-sitter walk rather than losing the check.
+
+        A free call is ``name(...)`` where ``name`` is a bare Name: that is the
+        only shape the missing-symbol check is entitled to judge.  ``obj.run()``
+        is a method call whose receiver's type is unknowable from an index.
+        """
+        import ast as _ast
+
+        if not str(getattr(text, "strip", lambda: "")()):
+            return None
+        try:
+            tree = _ast.parse(text)
+        except SyntaxError:
+            return None
+        except (ValueError, TypeError):
+            return None
+        out: list[tuple[str, bool]] = []
+        for node in _ast.walk(tree):
+            if not isinstance(node, _ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, _ast.Name):
+                out.append((func.id, False))
+            elif isinstance(func, _ast.Attribute):
+                # ``obj.run()`` -- a method, which this check never judges.
+                out.append((func.attr, True))
         return out
 
     def _name_is_reachable(self, name: str, path: str, parsed: Any) -> bool:
