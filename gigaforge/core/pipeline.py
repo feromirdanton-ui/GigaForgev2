@@ -151,6 +151,14 @@ class PipelineResult:
     cache_hit_rate: float = 0.0
     cache_hits: int = 0
     cache_lookups: int = 0
+    #: What one task cost, in micro-USD, and how many tasks the run completed.
+    #: ``cost_micros`` answers "what did this run cost"; the question an operator
+    #: actually asks is "what does a task cost", and the two differ as soon as a
+    #: run does more than one thing.  Measured live: a goal run cost 14 722
+    #: micro-USD over 5 model calls, and nothing in the report said whether that
+    #: was one task or five.
+    tasks_completed: int = 0
+    cost_per_task_micros: int = 0
     #: The reply, when the goal asked for one.  Empty for a diff-producing run.
     #: This is the field the harness did not have: every run had to end in a
     #: unified diff, so a goal whose correct output is a sentence was rejected
@@ -248,6 +256,9 @@ class PipelineResult:
             "cache_hit_rate": round(self.cache_hit_rate, 4),
             "cache_hits": self.cache_hits,
             "cache_lookups": self.cache_lookups,
+            "tasks_completed": self.tasks_completed,
+            "cost_per_task_micros": self.cost_per_task_micros,
+            "cost_per_task_usd": round(self.cost_per_task_micros / 1_000_000, 6),
             "routing": list(self.routing),
             "degraded": list(self.degraded),
         }
@@ -339,6 +350,37 @@ def _document_placeholder_issue(diff: str, goal: str) -> str:
             "section — what the architecture is, not what the section will say."
         )
     return ""
+
+
+def _tasks_completed(pipeline: Any, ctx: RunContext) -> int:
+    """How many discrete tasks this run finished, at least 1.
+
+    "Cost per task" needs a task count, and the harness never had one: a run is
+    a run.  The count is the plan's executed steps when there was a plan, and 1
+    otherwise — a single-goal run that did one thing is one task, not zero, and
+    dividing by zero is how a metric becomes a crash.
+
+    A text-product run (an answer, a diagnosis) is one task by definition: its
+    product is a single reply, however many phases produced it.
+    """
+    try:
+        kind = _task_kind_for(pipeline, ctx)
+        if kind.is_text_product:
+            return 1
+    except Exception:  # noqa: BLE001 - a metric must not fail a report
+        pass
+    steps = int(ctx.extras.get("plan_steps_executed") or 0)
+    if steps > 0:
+        return steps
+    changed = len(ctx.extras.get("changed_files") or ())
+    return changed if changed > 1 else 1
+
+
+def _cost_per_task(pipeline: Any, ctx: RunContext) -> int:
+    """Run cost divided by the task count, in micro-USD, floored."""
+    cost = int(getattr(ctx.state, "cost_micros", 0) or 0)
+    count = max(1, _tasks_completed(pipeline, ctx))
+    return cost // count
 
 
 class TaskPipeline:
@@ -4387,6 +4429,8 @@ class TaskPipeline:
             cache_hit_rate=float(getattr(state, "cache_hit_rate", 0.0) or 0.0),
             cache_hits=int(getattr(state, "cache_hits", 0) or 0),
             cache_lookups=int(getattr(state, "cache_lookups", 0) or 0),
+            tasks_completed=_tasks_completed(self, ctx),
+            cost_per_task_micros=_cost_per_task(self, ctx),
             routing=list(getattr(state, "routing", []) or []),
             degraded=list(getattr(state, "degraded", []) or []),
             contract_unmet=list(ctx.extras.get("contract_unmet") or []),
