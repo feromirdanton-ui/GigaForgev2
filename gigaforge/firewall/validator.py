@@ -36,6 +36,7 @@ import logging
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
@@ -697,48 +698,110 @@ class DiffValidator:
             # The index is a snapshot, and for an old repository it is often
             # partial: measured on ``psf__requests-1142``, two names that exist
             # in the checkout were reported as undefined because the index had
-            # never seen them.  A name that appears in the repository's own
-            # source is not undefined, whatever the index says — so the last
-            # word goes to the files, not to the snapshot.
-            if self._name_appears_in_repo(name):
+            # never seen them.  The files are the truth -- but only the files
+            # this one can actually see.  See :meth:`_name_is_reachable`.
+            if self._name_is_reachable(name, path, parsed_now):
                 continue
             out.append(name)
             if len(out) >= limit:
                 break
         return out
 
-    def _name_appears_in_repo(self, name: str) -> bool:
-        """Whether ``name`` is defined or imported anywhere in the checkout.
+    def _name_is_reachable(self, name: str, path: str, parsed: Any) -> bool:
+        """Whether ``name`` is visible *from this file*, not merely present.
 
-        A bounded, cached scan: the first call builds a set of every identifier
-        that appears after ``def``/``class``/``import`` in the repo's Python
-        files, and later calls are a set lookup.  Bounded by file count and size
-        so a huge repository cannot turn a verification into a full crawl.
+        **What the previous version got wrong.**  It built one set of every
+        identifier defined or imported anywhere in the checkout and answered
+        "defined" if the name was in it.  That is a tautology for the case the
+        check exists for: its own docstring says it catches "a free function
+        the agent called but forgot to define or import", and after the fix any
+        name defined in *any other module* -- ``run``, ``main``, ``get``,
+        ``parse``, ``load`` -- counted as defined.  The check stopped catching
+        the thing it was written for and let a broken diff through to the
+        tests, where it fails more expensively.
+
+        Trading a false positive for a false negative is the wrong trade here:
+        a spurious "undefined" costs one repair cycle, a spurious "all defined"
+        costs the whole instance.
+
+        **The scope is the import graph.**  A name is reachable when it is
+        defined in this file, imported by it, or exported by a module this file
+        imports.  That is exactly Python's own rule for a free name, and it is
+        still "the checkout is the truth" -- just with a scope instead of a
+        global set.
+
+        Bounded by time, not by a file counter: the old ``scanned >= 4000``
+        check ran *before* the increment, and the increment only happened after
+        a successful read, so a repository of 50 000 unreadable files scanned
+        all 50 000 paths.
         """
-        cache = getattr(self, "_repo_names", None)
-        if cache is None:
-            cache = set()
-            root = self.root
-            scanned = 0
-            for path in root.rglob("*.py"):
-                if scanned >= 4000:
-                    break
-                if any(part in {".git", "node_modules", ".venv", "venv", "build", "dist"}
-                       for part in path.parts):
+        modules = self._imported_modules(parsed)
+        if not modules:
+            return False
+        deadline = time.monotonic() + 2.0
+        for module in modules:
+            if time.monotonic() > deadline:
+                # Out of time: answer "not reachable" rather than "reachable".
+                # The cost of being wrong is one repair cycle, and a check that
+                # silently says yes is the defect this method replaced.
+                return False
+            target = self._module_file(module, path)
+            if target is None:
+                continue
+            try:
+                if target.stat().st_size > 400_000:
                     continue
-                try:
-                    if path.stat().st_size > 400_000:
-                        continue
-                    text = path.read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    continue
-                scanned += 1
-                for match in _DEF_RE.finditer(text):
-                    cache.add(match.group(1))
-                for match in _IMPORT_RE.finditer(text):
-                    cache.add(match.group(1))
-            self._repo_names = cache
-        return name in cache
+                text = target.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for match in _DEF_RE.finditer(text):
+                if match.group(1) == name:
+                    return True
+            # A re-export (``from .x import y`` in a package ``__init__``) is
+            # how a name becomes visible through a module that does not define
+            # it.  One hop is enough: deeper chains are rare and the cost of
+            # missing one is a repair cycle, not a wrong verdict.
+            for match in _IMPORT_RE.finditer(text):
+                if match.group(1) == name:
+                    return True
+        return False
+
+    @staticmethod
+    def _imported_modules(parsed: Any) -> list[str]:
+        """The dotted module paths this file imports, in order."""
+        out: list[str] = []
+        for imp in getattr(parsed, "imports", ()) or ():
+            module = str(getattr(imp, "module", "") or "").strip()
+            if not module:
+                continue
+            if module not in out:
+                out.append(module)
+        return out
+
+    def _module_file(self, module: str, from_path: str) -> Optional[Path]:
+        """Resolve a dotted module to a file in the checkout, or ``None``.
+
+        Relative imports are resolved against the importing file's package;
+        absolute ones against the repository root.  A module that cannot be
+        resolved is not an error -- it is a third-party import, and a name from
+        it is not this repository's to define.
+        """
+        root = Path(self.root)
+        parts = [p for p in module.split(".") if p]
+        if not parts:
+            return None
+        if module.startswith("."):
+            depth = len(module) - len(module.lstrip("."))
+            base = (root / from_path).parent
+            for _ in range(max(0, depth - 1)):
+                base = base.parent
+            candidate = base / Path(*parts)
+        else:
+            candidate = root / Path(*parts)
+        for path in (Path(str(candidate) + ".py"), candidate / "__init__.py"):
+            if path.is_file():
+                return path
+        return None
 
     # ── rollback / reindex ───────────────────────────────────────────────
     def _auto_fix(self, paths: Sequence[str]) -> list[str]:
@@ -829,7 +892,17 @@ class DiffValidator:
         return ok
 
     def _reindex(self, paths: Sequence[str]) -> None:
-        """Bring the L0 index back in line with the working tree."""
+        """Bring the L0 index back in line with the working tree.
+
+        Any cache derived from the tree is dropped here.  ``_repo_names`` used
+        to be built once per validator and never invalidated, so a name deleted
+        by a diff stayed "defined" for the rest of the run -- the cache and
+        ``_reindex`` described the same tree and disagreed about it.  The
+        reachability check reads the files directly, so there is no set to
+        stale; the attribute is cleared anyway so a stale one from an older
+        code path cannot be read.
+        """
+        self._repo_names = None
         if self.store is None:
             return
         from gigaforge.l0.indexer import Indexer

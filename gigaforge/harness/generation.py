@@ -986,7 +986,14 @@ def _layout_invariants() -> str:
         # is wider than the phone.  The harness owns the layout, so the
         # invariants are stated here rather than hoped for in a child's CSS.
         "@media (max-width: 480px) {\n"
-        "    html, body { max-width: 100%; overflow-x: hidden; }\n"
+        # ``overflow-x: hidden`` used to sit on this line and it was a lie: it
+        # makes ``documentElement.scrollWidth`` equal ``innerWidth``, so the
+        # overflow detector could no longer see the defect it was measuring --
+        # and WCAG 1.4.10 (Reflow) forbids clipping in place of reflowing.  A
+        # phone user lost the right-hand 833px of the page with no way to
+        # scroll to it.  The real fix is the reflow below (one column, capped
+        # widths); clipping is not a fix, it is a cover-up.
+        "    html, body { max-width: 100%; }\n"
         "    .feature-grid, .features-grid, .features:not(section),\n"
         "    .grid, .row {\n"
         "        grid-template-columns: 1fr !important;\n"

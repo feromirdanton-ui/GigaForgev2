@@ -1171,6 +1171,13 @@ def wcag(
         bool,
         typer.Option("--fix", help="Rewrite failing text colours until AA is met, then re-measure."),
     ] = False,
+    in_place: Annotated[
+        bool,
+        typer.Option(
+            "--in-place",
+            help="With --fix, overwrite the input instead of writing <page>.fixed.html.",
+        ),
+    ] = False,
 ) -> None:
     """Measure WCAG 2.1 contrast and 375px overflow on a rendered page.
 
@@ -1188,18 +1195,25 @@ def wcag(
 
     from gigaforge.harness.wcag import measure, repair
 
+    measured = Path(page)
     if fix:
         # Repair first, then measure the repaired file: the number reported is
         # the number a reader would get, not the one before the edit.
-        changed = repair(Path(page))
+        #
+        # The repair writes a NEW file.  It used to overwrite the input with a
+        # re-serialised DOM -- formatting normalised, comments outside the DOM
+        # gone -- which is not "change a colour".  ``--in-place`` asks for that
+        # explicitly; the default leaves the original untouched.
+        changed = repair(Path(page), out=Path(page) if in_place else None)
         if changed.get("error"):
             typer.echo(f"cannot repair: {changed['error']}", err=True)
         else:
-            typer.echo(f"repaired {len(changed['fixed'])} text colour(s)")
+            typer.echo(f"repaired {len(changed['fixed'])} text colour(s) -> {changed['out']}")
             for row in changed["fixed"]:
                 typer.echo(f"  {row['tag']} {row['from']} -> {row['to']} ({row['sample']!r})")
+            measured = Path(changed["out"])
 
-    report = measure(Path(page))
+    report = measure(measured)
     if as_json:
         typer.echo(_json.dumps(report.to_dict(), indent=2))
     else:

@@ -83,8 +83,12 @@ def test_the_first_call_of_a_phase_is_attempt_zero() -> None:
 
     assert (first, repeats_first) == (0, 0)
     assert (second, repeats_second) == (1, 1)
-    # A different prompt is new information, so the streak resets.
-    assert (third, repeats_third) == (2, 0)
+    # A different prompt is a *new question*, not a third attempt at the old
+    # one.  The counter used to be ``attempts[phase] += 1``, which made a
+    # ten-section document escalate every section after the second to the
+    # flagship model although none had failed.  Keying by (phase, prompt) is
+    # what makes "attempt" mean "attempt at this question".
+    assert (third, repeats_third) == (0, 0)
 
 
 def test_two_identical_failures_escalate_to_a_different_model() -> None:

@@ -85,6 +85,11 @@ class SweResult:
     fail_to_pass_passed: int = 0
     fail_to_pass_total: int = 0
     pass_to_pass_regressed: int = 0
+    #: The pytest the tests actually ran under.  "Gradable" is a claim about an
+    #: environment, and without this number it is unprovable: the venv fix was
+    #: reported as done while ``--system-site-packages`` still let a system
+    #: pytest satisfy the repo's declared requirement.
+    pytest_version: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -98,6 +103,7 @@ class SweResult:
             "diff_chars": self.diff_chars,
             "fail_to_pass": f"{self.fail_to_pass_passed}/{self.fail_to_pass_total}",
             "pass_to_pass_regressed": self.pass_to_pass_regressed,
+            "pytest_version": self.pytest_version,
         }
 
 
@@ -162,7 +168,59 @@ def load_instances(
     return out
 
 
-def _run(cmd: Sequence[str], cwd: Path, timeout: int = 300) -> tuple[int, str]:
+class _Deadline:
+    """One wall-clock budget for a whole instance, enforced at every step.
+
+    **Why this exists.**  ``run_instance(timeout_s=900)`` accepted the argument
+    and never read it: the real limits were hard-coded per step (clone 600,
+    venv 300, install 900 -- called twice on the env-error path --, tests
+    600 x 2).  Worst case was ~3900s against a stated budget of 900s, so a run
+    could not "not fit in the budget" -- the budget did not exist.  That is why
+    the symbol-index fix was never re-verified: the run was killed by the
+    caller, not by its own limit, and the report could only say "did not
+    finish".
+
+    A deadline makes the failure a fact the code can name: when the budget is
+    gone, the step returns 124 and the instance is reported as ``timeout`` --
+    a distinct status, because "the environment is broken" and "we ran out of
+    time" are different claims and only one of them is about the model.
+    """
+
+    def __init__(self, budget_s: int) -> None:
+        self.budget_s = int(budget_s)
+        self.started = time.monotonic()
+        self.end = self.started + max(1, int(budget_s))
+
+    def remaining(self) -> float:
+        return max(0.0, self.end - time.monotonic())
+
+    @property
+    def expired(self) -> bool:
+        return self.remaining() <= 0.0
+
+    def timeout(self, default: int) -> int:
+        """``default``, capped by what is left of the budget.
+
+        Never returns 0: a zero timeout would make every subprocess fail
+        instantly and read as a broken command rather than an exhausted budget.
+        """
+        return max(1, int(min(default, self.remaining())))
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self.started
+
+
+def _run(
+    cmd: Sequence[str],
+    cwd: Path,
+    timeout: int = 300,
+    *,
+    deadline: "_Deadline | None" = None,
+) -> tuple[int, str]:
+    if deadline is not None:
+        if deadline.expired:
+            return 124, f"deadline exhausted before: {cmd[0]}"
+        timeout = deadline.timeout(timeout)
     try:
         proc = subprocess.run(
             list(cmd), cwd=cwd, capture_output=True, text=True, timeout=timeout
@@ -174,7 +232,10 @@ def _run(cmd: Sequence[str], cwd: Path, timeout: int = 300) -> tuple[int, str]:
     return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
 
-def _clone(instance: SweInstance, dest: Path, *, depth: int = 1) -> tuple[bool, str]:
+def _clone(
+    instance: SweInstance, dest: Path, *, depth: int = 1,
+    deadline: "_Deadline | None" = None,
+) -> tuple[bool, str]:
     """Clone the repo at ``base_commit``.
 
     A shallow clone of the default branch usually does not contain the commit,
@@ -191,7 +252,10 @@ def _clone(instance: SweInstance, dest: Path, *, depth: int = 1) -> tuple[bool, 
     )
     if code != 0:
         return False, f"clone failed: {out[-300:]}"
-    code, out = _run(["git", "checkout", "--quiet", instance.base_commit], cwd=dest, timeout=300)
+    code, out = _run(
+        ["git", "checkout", "--quiet", instance.base_commit],
+        cwd=dest, timeout=300, deadline=deadline,
+    )
     if code != 0:
         return False, f"checkout {instance.base_commit[:8]} failed: {out[-300:]}"
     return True, ""
@@ -269,7 +333,8 @@ def _pytest_node_ids(tests: Iterable[str]) -> list[str]:
 
 
 def _run_tests(
-    nodes: Sequence[str], cwd: Path, timeout: int = 600, python: str = ""
+    nodes: Sequence[str], cwd: Path, timeout: int = 600, python: str = "",
+    *, deadline: "_Deadline | None" = None,
 ) -> tuple[bool, str]:
     """Run the named tests with the *instance's* interpreter.
 
@@ -289,10 +354,10 @@ def _run_tests(
     runtests = cwd / "tests" / "runtests.py"
     if runtests.is_file() and all("::" not in n for n in nodes):
         cmd = [py, str(runtests), "--verbosity", "1", *nodes]
-        code, out = _run(cmd, cwd=cwd, timeout=timeout)
+        code, out = _run(cmd, cwd=cwd, timeout=timeout, deadline=deadline)
         return code == 0, out[-1500:]
     cmd = [py, "-m", "pytest", "-q", "--no-header", "-p", "no:cacheprovider", *nodes]
-    code, out = _run(cmd, cwd, timeout=timeout)
+    code, out = _run(cmd, cwd, timeout=timeout, deadline=deadline)
     return code == 0, out[-1500:]
 
 
@@ -321,7 +386,22 @@ def _looks_like_environment_failure(output: str) -> bool:
     return any(marker in text for marker in _ENV_FAILURE_MARKERS)
 
 
-def _make_venv(dest: Path) -> tuple[str, str]:
+def _venv_command(venv: Path) -> list[str]:
+    """The command that builds an instance's private interpreter.
+
+    A separate function so the *absence* of ``--system-site-packages`` is a
+    testable fact rather than a claim about a docstring.  The flag was there to
+    keep the sandbox's prebuilt wheels visible, and it quietly undid the
+    isolation: pip treats a system package as satisfying a declared
+    requirement, so a repo asking for ``pytest>=6.0`` against a system
+    ``pytest 8.x`` got "already satisfied" and ran on a version it never
+    declared.  That is the same class of defect as the leak this venv exists to
+    close, only silent -- a wrong environment instead of a crash.
+    """
+    return [sys.executable, "-m", "venv", str(venv)]
+
+
+def _make_venv(dest: Path, *, deadline: "_Deadline | None" = None) -> tuple[str, str]:
     """A private interpreter for one instance, or ``("", reason)``.
 
     **Why this is not optional.**  Measured live: ``_install_test_requirements``
@@ -336,17 +416,26 @@ def _make_venv(dest: Path) -> tuple[str, str]:
 
     SWE-bench's own harness gets this for free: each instance is a container.
     Without containers, a venv per instance is the same isolation at a fraction
-    of the cost.  ``--system-site-packages`` keeps the sandbox's already-built
-    wheels (numpy, pyarrow) visible so the venv is cheap, while anything the
-    repo installs shadows them inside that venv only.
+    of the cost.
+
+    **No ``--system-site-packages``.**  It was there to keep the sandbox's
+    prebuilt wheels visible, and it quietly undid the isolation: pip treats a
+    system package as satisfying a declared requirement, so a repo asking for
+    ``pytest>=6.0`` against a system ``pytest 8.x`` got "already satisfied" and
+    ran on a version it never declared.  That is the same class of defect as
+    the leak this venv exists to close, only silent -- a wrong environment
+    instead of a crash.  The venv is now genuinely private; declared
+    dependencies are installed with ``--ignore-installed`` so the version in
+    ``install_requires`` always wins.
     """
     venv = dest.parent / f"{dest.name}.venv"
     if venv.exists():
         shutil.rmtree(venv, ignore_errors=True)
     code, out = _run(
-        [sys.executable, "-m", "venv", "--system-site-packages", str(venv)],
+        _venv_command(venv),
         cwd=dest.parent,
         timeout=300,
+        deadline=deadline,
     )
     if code != 0:
         return "", f"venv failed: {out[-200:]}"
@@ -356,7 +445,27 @@ def _make_venv(dest: Path) -> tuple[str, str]:
     return python, ""
 
 
-def _install_test_requirements(cwd: Path, python: str = "") -> str:
+def _pytest_version(python: str, cwd: Path, *, deadline: "_Deadline | None" = None) -> str:
+    """The pytest the tests will actually run under, or ``""``.
+
+    Recorded on every result because "gradable" is a claim about an
+    environment.  The venv fix was reported as complete while
+    ``--system-site-packages`` still let a system pytest satisfy the repo's
+    declared requirement -- the run was gradable, but not on the version the
+    repo asked for, and nothing in the result said so.
+    """
+    code, out = _run(
+        [python or sys.executable, "-m", "pytest", "--version"],
+        cwd=cwd, timeout=60, deadline=deadline,
+    )
+    if code != 0 or not (out or "").strip():
+        return ""
+    return out.strip().splitlines()[0][:80]
+
+
+def _install_test_requirements(
+    cwd: Path, python: str = "", *, deadline: "_Deadline | None" = None
+) -> str:
     """Best-effort install of the repo's own test dependencies.
 
     SWE-bench's reference harness builds a per-instance Docker image from the
@@ -380,16 +489,18 @@ def _install_test_requirements(cwd: Path, python: str = "") -> str:
             [py, "-m", "pip", "install", "--quiet", "--no-input", "-r", str(path)],
             cwd=cwd,
             timeout=600,
+            deadline=deadline,
         )
         notes.append(f"{name}: {'ok' if code == 0 else out[-200:]}")
     # ``hypothesis`` is imported by astropy's conftest and is not in every
     # requirements file; it is a test-only dependency with no build cost.
-    code, _ = _run([py, "-c", "import hypothesis"], cwd=cwd, timeout=60)
+    code, _ = _run([py, "-c", "import hypothesis"], cwd=cwd, timeout=60, deadline=deadline)
     if code != 0:
         code, out = _run(
             [py, "-m", "pip", "install", "--quiet", "--no-input", "hypothesis"],
             cwd=cwd,
             timeout=300,
+            deadline=deadline,
         )
         notes.append(f"hypothesis: {'ok' if code == 0 else out[-200:]}")
 
@@ -410,9 +521,10 @@ def _install_test_requirements(cwd: Path, python: str = "") -> str:
     # the fallback for a repo whose build is genuinely broken.
     code, out = _run(
         [py, "-m", "pip", "install", "--quiet", "--no-input",
-         "--no-build-isolation", "-e", "."],
+         "--ignore-installed", "--no-build-isolation", "-e", "."],
         cwd=cwd,
         timeout=900,
+        deadline=deadline,
     )
     notes.append(f"editable install: {'ok' if code == 0 else 'failed'}")
     if code != 0:
@@ -421,6 +533,7 @@ def _install_test_requirements(cwd: Path, python: str = "") -> str:
              "--no-deps", "--no-build-isolation", "-e", "."],
             cwd=cwd,
             timeout=900,
+            deadline=deadline,
         )
         notes.append(f"editable install (no-deps): {'ok' if code == 0 else 'failed'}")
     if code != 0:
@@ -432,6 +545,7 @@ def _install_test_requirements(cwd: Path, python: str = "") -> str:
              "f'version = {v!r}\\n__version__ = {v!r}\\n')"],
             cwd=cwd,
             timeout=120,
+            deadline=deadline,
         )
         notes.append(f"version.py: {'ok' if code == 0 else out[-200:]}")
     return "; ".join(notes)
@@ -455,24 +569,46 @@ def run_instance(
     dest = work_root / instance.instance_id.replace("/", "__")
     result = SweResult(instance_id=instance.instance_id, repo=instance.repo, status="failed")
 
-    ok, err = _clone(instance, dest)
+    # One budget for the whole instance, enforced at every subprocess.  Before
+    # this, ``timeout_s`` was accepted and never read: the real limits were
+    # hard-coded per step and summed to ~3900s against a stated 900s.
+    deadline = _Deadline(timeout_s)
+
+    def _cleanup() -> None:
+        """Remove the checkout and its venv.
+
+        Called from the ``finally`` *and* from every early return.  The early
+        returns used to skip it: a failed clone left a partial checkout, a
+        failed venv left the checkout behind, and on a 4 GB disk a handful of
+        those filled the volume -- which then made later instances fail as
+        environment errors, blaming the model for a full disk.
+        """
+        if keep:
+            return
+        shutil.rmtree(dest, ignore_errors=True)
+        shutil.rmtree(dest.parent / f"{dest.name}.venv", ignore_errors=True)
+
+    ok, err = _clone(instance, dest, deadline=deadline)
     if not ok:
-        result.status = "environment_error"
+        result.status = "timeout" if deadline.expired else "environment_error"
         result.detail = err
         result.latency_s = time.monotonic() - started
+        _cleanup()
         return result
 
     # The instance's own interpreter, built before anything is installed.
     # Without it every ``pip install`` in this function wrote into the sandbox's
     # site-packages and the *next* instance inherited it (measured: pytest
     # 6.0-dev from one checkout broke four unrelated ``psf/requests`` runs).
-    python, venv_err = _make_venv(dest)
+    python, venv_err = _make_venv(dest, deadline=deadline)
     if not python:
-        result.status = "environment_error"
+        result.status = "timeout" if deadline.expired else "environment_error"
         result.detail = venv_err
         result.latency_s = time.monotonic() - started
+        _cleanup()
         return result
-    install_note = _install_test_requirements(dest, python)
+    install_note = _install_test_requirements(dest, python, deadline=deadline)
+    result.pytest_version = _pytest_version(python, dest, deadline=deadline)
 
     try:
         # The harness solves the issue; it never sees the gold patch.
@@ -528,13 +664,15 @@ def run_instance(
             return result
 
         f2p_ok, f2p_out = _run_tests(
-            _pytest_node_ids(instance.fail_to_pass), dest, python=python
+            _pytest_node_ids(instance.fail_to_pass), dest, python=python,
+            deadline=deadline,
         )
         if not f2p_ok and _looks_like_environment_failure(f2p_out):
             # The tests never ran: install what the repo declares and retry once.
-            install_note = _install_test_requirements(dest, python)
+            install_note = _install_test_requirements(dest, python, deadline=deadline)
             f2p_ok, f2p_out = _run_tests(
-                _pytest_node_ids(instance.fail_to_pass), dest, python=python
+                _pytest_node_ids(instance.fail_to_pass), dest, python=python,
+                deadline=deadline,
             )
             if not f2p_ok and _looks_like_environment_failure(f2p_out):
                 result.status = "environment_error"
@@ -546,12 +684,15 @@ def run_instance(
         result.fail_to_pass_total = len(instance.fail_to_pass)
         result.fail_to_pass_passed = len(instance.fail_to_pass) if f2p_ok else 0
         if not f2p_ok:
-            result.status = "failed"
+            # An exhausted budget is not a wrong answer.  Reporting it as
+            # ``failed`` is how "the run did not fit" became "the model failed".
+            result.status = "timeout" if deadline.expired else "failed"
             result.detail = f"FAIL_TO_PASS did not pass: {f2p_out[-400:]}"
             return result
 
         p2p_ok, p2p_out = _run_tests(
-            _pytest_node_ids(instance.pass_to_pass), dest, python=python
+            _pytest_node_ids(instance.pass_to_pass), dest, python=python,
+            deadline=deadline,
         )
         if not p2p_ok:
             result.status = "failed"
@@ -568,11 +709,7 @@ def run_instance(
         return result
     finally:
         result.latency_s = time.monotonic() - started
-        if not keep:
-            shutil.rmtree(dest, ignore_errors=True)
-            # The venv is the instance's, not the sandbox's: leaving it behind
-            # would fill the 4 GB disk after a handful of instances.
-            shutil.rmtree(dest.parent / f"{dest.name}.venv", ignore_errors=True)
+        _cleanup()
 
 
 def run_swebench(

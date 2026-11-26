@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import os
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Optional, Sequence
 
 from gigaforge.client.errors import BudgetExceeded
@@ -229,6 +229,10 @@ class ModelRouter:
         self.exclude_models = tuple(exclude_models)
         self._lock = threading.Lock()
         self._usage: dict[str, PhaseUsage] = {}
+        #: Per-run budget overrides.  A phase whose work is N independent units
+        #: (a document's sections) cannot have a constant call allowance: see
+        #: :meth:`scale_phase_budget`.
+        self._budget_overrides: dict[str, PhaseBudget] = {}
         self._stats = RouterStats()
         self._last_route: Optional[Route] = None
         self._s = settings or get_settings()
@@ -284,7 +288,7 @@ class ModelRouter:
 
     def remaining(self, phase: str) -> dict[str, Optional[int]]:
         """Tokens and calls still available to ``phase`` (``None`` = unlimited)."""
-        budget = self.config.budget_for(phase)
+        budget = self._budget_for(phase)
         with self._lock:
             used = self._usage.get(phase)
             tokens_used = used.total_tokens if used else 0
@@ -517,6 +521,33 @@ class ModelRouter:
         """Return a copy of the routing table (task_type -> model)."""
         return dict(self._s.models)
 
+
+    def _budget_for(self, phase: str) -> PhaseBudget:
+        """The phase's budget, honouring a per-run override."""
+        override = self._budget_overrides.get(phase)
+        return override if override is not None else self.config.budget_for(phase)
+
+    def scale_phase_budget(self, phase: str, *, calls: int) -> None:
+        """Raise ``phase``'s call allowance to at least ``calls``.
+
+        **Why a constant was wrong.**  ``document`` was configured with
+        ``max_calls=16``.  A ten-section document makes ten ``research`` calls,
+        ten ``document`` calls and up to ten refinements -- 30 calls.  The 17th
+        raised ``PhaseBudgetExceeded``, the section loop caught it as a
+        degraded step, and ``assemble`` wrote ``_No content was produced for
+        this section._`` into the document.  The run then reported success: a
+        document assembled out of placeholders, with the budget arithmetic
+        visible in advance.  That is not an unknown limitation, it is a
+        predictable failure.
+
+        The allowance is a function of the work, so the caller that knows the
+        work states it.  Only ever raises: a caller cannot lower a budget it
+        does not own.
+        """
+        current = self._budget_for(phase)
+        if int(current.max_calls or 0) >= int(calls):
+            return
+        self._budget_overrides[phase] = replace(current, max_calls=int(calls))
 
     def _enforce_budget(self, phase: str, budget: PhaseBudget) -> None:
         """Refuse the call when the phase is out of allowance.

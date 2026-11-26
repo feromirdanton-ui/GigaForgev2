@@ -327,6 +327,17 @@ def _named_paths(goal: str) -> list[str]:
     # Strip URLs first: the path regex would otherwise match inside them.
     text = re.sub(r"https?://\S+", " ", text)
     text = re.sub(r"\bwww\.\S+", " ", text)
+    # Then strip bare host-shaped prefixes.  The old check was a blocklist of
+    # TLDs (``.com .org .io .net .dev``) applied to the first segment, and it
+    # was wrong in both directions: ``.ai``, ``.co``, ``.ru``, ``.app``, ``.sh``,
+    # ``.gg``, ``.xyz`` were not covered, so ``docs.example.ai/guide.md`` became
+    # a file to create; and a legitimate directory whose name ends in ``.dev``
+    # (``tools.dev/``) was dropped as a host.  A blocklist of TLDs cannot be
+    # complete, so the rule is structural instead: a host is a dotted token
+    # followed by a path, and it is removed before the path scan rather than
+    # filtered after it.
+    text = re.sub(r"\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)+/\S*", " ", text,
+                  flags=re.IGNORECASE)
     out: list[str] = []
     for match in _PATH_RE.finditer(text):
         raw = match.group(0).replace("\\", "/").strip()
@@ -341,11 +352,19 @@ def _named_paths(goal: str) -> list[str]:
         if not cleaned or cleaned in out:
             continue
         # A domain-shaped first segment means this is a host, not a path.
-        first = cleaned.split("/", 1)[0].lower()
-        if first in {"github.com", "gitlab.com", "bitbucket.org"} or first.endswith(
-            (".com", ".org", ".io", ".net", ".dev")
-        ):
-            continue
+        # Second line of defence for a host that survived the strip above (one
+        # written without a trailing path).  The test is structural -- "the
+        # first segment is dotted" -- not a TLD list, because a TLD list is
+        # always missing the next TLD.  A real repository directory with a dot
+        # in its name is rare enough that one extra repair cycle is the cheaper
+        # error, and the strip above already removed the common case.
+        # Only a *directory* segment can be a host: ``index.html`` is a file
+        # name with a dot, not a domain.  The first version of this check
+        # dropped every bare filename and broke artifact routing outright.
+        if "/" in cleaned:
+            first = cleaned.split("/", 1)[0].lower()
+            if "." in first:
+                continue
         out.append(cleaned)
     return out
 

@@ -72,6 +72,50 @@ _JS = r"""
 """
 
 
+#: Element-wise overflow probe.
+#:
+#: **Why not ``scrollWidth``.**  ``documentElement.scrollWidth > innerWidth``
+#: was the original metric and it is blind to exactly the defect it exists to
+#: find: any ``overflow-x: hidden`` on ``html``/``body`` -- including the one
+#: the harness itself used to inject -- makes ``scrollWidth`` equal
+#: ``innerWidth``, because the content is *clipped*, not scrolled.  Reproduced
+#: in a headless Chromium at 375x812 with a 1200px child: ``scrollWidth 375``,
+#: ``innerWidth 375``, ``overflow_detected False``, while the child's right
+#: edge sat at 1208px -- 833px of the page unreachable on a phone.
+#:
+#: So the measurement is per element: anything whose right edge is past the
+#: viewport is reported, whether or not an ancestor clips it.  Clipping is the
+#: defect (WCAG 1.4.10 Reflow requires reflow, not truncation), so a clipped
+#: element must still count.
+_OVERFLOW_JS = r"""
+() => {
+  const vw = window.innerWidth;
+  const out = [];
+  const all = document.querySelectorAll('body *');
+  for (const el of all) {
+    const cs = getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 && r.height <= 0) continue;
+    // A right edge past the viewport is the defect.  A 1px tolerance absorbs
+    // sub-pixel rounding, which is not a layout bug.
+    if (r.right > vw + 1) {
+      out.push({
+        tag: el.tagName.toLowerCase(),
+        cls: (el.className && String(el.className).slice(0, 60)) || '',
+        right: Math.round(r.right),
+        width: Math.round(r.width),
+        over: Math.round(r.right - vw),
+      });
+    }
+  }
+  // Widest offenders first: the report should name the cause, not a symptom.
+  out.sort((a, b) => b.over - a.over);
+  return {viewport: vw, count: out.length, worst: out.slice(0, 5)};
+}
+"""
+
+
 @dataclass
 class ContrastPair:
     tag: str
@@ -104,6 +148,11 @@ class WcagReport:
     pairs: list[ContrastPair] = field(default_factory=list)
     overflow_375: bool = False
     overflow_1440: bool = False
+    #: The elements that stick out, widest first.  A boolean alone says "there
+    #: is a defect" and leaves the reader to find it; the offenders say which
+    #: element and by how much, which is what a repair needs.
+    overflow_375_offenders: list[dict[str, Any]] = field(default_factory=list)
+    overflow_1440_offenders: list[dict[str, Any]] = field(default_factory=list)
     min_ratio: float = 0.0
     error: str = ""
 
@@ -123,6 +172,8 @@ class WcagReport:
             "min_ratio": round(self.min_ratio, 2),
             "overflow_375": self.overflow_375,
             "overflow_1440": self.overflow_1440,
+            "overflow_375_offenders": list(self.overflow_375_offenders),
+            "overflow_1440_offenders": list(self.overflow_1440_offenders),
             "error": self.error,
         }
 
@@ -173,14 +224,10 @@ def measure(page: Path, *, timeout_ms: int = 30000) -> WcagReport:
                 view = browser.new_page(viewport={"width": 1440, "height": 900})
                 view.goto(Path(page).resolve().as_uri(), timeout=timeout_ms)
                 pairs = view.evaluate(_JS)
-                wide = view.evaluate(
-                    "() => document.documentElement.scrollWidth > window.innerWidth + 1"
-                )
+                wide = view.evaluate(_OVERFLOW_JS) or {}
                 view.set_viewport_size({"width": 375, "height": 812})
                 view.wait_for_timeout(200)
-                narrow = view.evaluate(
-                    "() => document.documentElement.scrollWidth > window.innerWidth + 1"
-                )
+                narrow = view.evaluate(_OVERFLOW_JS) or {}
             finally:
                 browser.close()
     except Exception as exc:  # noqa: BLE001 - a render failure is a report, not a crash
@@ -193,8 +240,10 @@ def measure(page: Path, *, timeout_ms: int = 30000) -> WcagReport:
             tag=row["tag"], sample=row["sample"], fg=row["fg"], bg=row["bg"],
             size=float(row["size"]), large=bool(row["large"]), ratio=ratio,
         ))
-    report.overflow_1440 = bool(wide)
-    report.overflow_375 = bool(narrow)
+    report.overflow_1440 = bool(wide.get("count"))
+    report.overflow_375 = bool(narrow.get("count"))
+    report.overflow_1440_offenders = list(wide.get("worst") or [])
+    report.overflow_375_offenders = list(narrow.get("worst") or [])
     report.min_ratio = min((p.ratio for p in report.pairs), default=0.0)
     return report
 
@@ -282,11 +331,21 @@ def repair(page: Path, *, out: Path | None = None, timeout_ms: int = 30000) -> d
     are the input.  Returns the list of changes so the caller can report them
     instead of silently editing the artifact.
 
-    The page is written back to ``out`` (default: in place).  Only ``color`` is
-    touched — layout, structure and every other declaration are left alone, so
-    a repair cannot introduce the overflow it was not asked to fix.
+    **The output is a new file by default.**  ``repair`` used to write
+    ``view.content()`` back over the input: that is not "change a colour", it is
+    a full re-serialisation of the DOM.  Formatting is normalised, comments
+    outside the DOM are lost, and inline ``!important`` colours start fighting
+    future CSS rules.  Acceptable for a throwaway artifact, wrong for a page
+    someone will edit afterwards.  So the default target is ``<page>.fixed.html``
+    and the caller is told where it went; ``out=page`` still means in place, but
+    now it has to be asked for.
+
+    Only ``color`` is touched — layout, structure and every other declaration
+    are left alone, so a repair cannot introduce the overflow it was not asked
+    to fix.
     """
-    result: dict[str, Any] = {"fixed": [], "error": "", "out": str(out or page)}
+    target = Path(out) if out else Path(page).with_suffix(".fixed.html")
+    result: dict[str, Any] = {"fixed": [], "error": "", "out": str(target)}
     if not Path(page).is_file():
         result["error"] = f"page not found: {page}"
         return result
@@ -310,6 +369,5 @@ def repair(page: Path, *, out: Path | None = None, timeout_ms: int = 30000) -> d
         result["error"] = f"{type(exc).__name__}: {exc}"[:400]
         return result
 
-    target = Path(out) if out else Path(page)
     target.write_text(html, encoding="utf-8")
     return result

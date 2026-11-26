@@ -2575,6 +2575,22 @@ class TaskPipeline:
             min_chars=plan.min_chars,
         )
 
+        # The call allowance is a function of the work, not a constant.  A
+        # ten-section document is 10 research + 10 section + up to 10
+        # refinement calls; the configured 16 was exhausted at the 17th, the
+        # section loop caught the refusal as a degraded step, and ``assemble``
+        # wrote "_No content was produced for this section._" into the
+        # document -- which then reported success.  The arithmetic was visible
+        # in advance, so this is a predictable failure, not an unknown limit.
+        n_sections = max(1, len(plan.outline.sections))
+        scale = getattr(self.router, "scale_phase_budget", None)
+        if callable(scale):
+            try:
+                scale("research", calls=n_sections + 4)
+                scale("document", calls=3 * n_sections + 4)
+            except Exception as exc:  # noqa: BLE001 - a budget hint must not fail a run
+                self._degraded("document", exc, "document")
+
         # ── Literature: what each section may assert ────────────────────────
         for section in plan.outline.sections:
             try:
@@ -2827,7 +2843,9 @@ class TaskPipeline:
                 )
 
         def propose(phase: str, prompt_text: str, iteration: int, hint: str) -> ProposeResult:
-            text = self._ask(phase, prompt_text, ctx)
+            # ``iteration`` is the loop's own count of *failed* attempts, which
+            # is the only honest source for the ladder's ``attempt`` signal.
+            text = self._ask(phase, prompt_text, ctx, attempt=max(0, iteration - 1))
             route = self.router.last_route if self.router else None
             diff = extract_diff(text)
             blocks = self._file_blocks(text)
@@ -3099,7 +3117,7 @@ class TaskPipeline:
                 "these findings against the current files. No prose."
             )
             try:
-                text = self._ask("fix", prompt, ctx)
+                text = self._ask("fix", prompt, ctx, attempt=round_index - 1)
             except Exception as exc:  # noqa: BLE001 - a failed round ends the loop
                 self._event("pipeline.react_error", run_id=ctx.run_id, round=round_index,
                             error=str(exc)[:200])
@@ -3278,6 +3296,23 @@ class TaskPipeline:
         # quality -- that needs a model and is a separate question -- it refuses
         # the specific failure that shipped.
         if _task_kind_for(self, ctx).is_document:
+            # The document pipeline's own refinement verdict is the first word.
+            # It was computed and stored in ``ctx.extras["document_issues"]``
+            # and read by nobody: a document that still had placeholders after
+            # refinement was accepted, so the pipeline was not a gate -- it was
+            # a log line.  A check that cannot fail the run is not a check.
+            pipeline_issues = list(ctx.extras.get("document_issues") or [])
+            if pipeline_issues:
+                return {"validation": ValidateResult(
+                    accepted=False,
+                    applied=False,
+                    changed_files=list(getattr(proposal, "changed_files", []) or []),
+                    reason=(
+                        "the document pipeline reported "
+                        f"{len(pipeline_issues)} unresolved section(s): "
+                        + "; ".join(str(i) for i in pipeline_issues[:3])
+                    )[:400],
+                )}
             document_issue = _document_placeholder_issue(diff, ctx.state.goal)
             if document_issue:
                 return {"validation": ValidateResult(
@@ -4342,37 +4377,49 @@ class TaskPipeline:
 
     # ── helpers ──────────────────────────────────────────────────────────────
     def _note_phase_attempt(
-        self, ctx: RunContext, phase: str, prompt: str
+        self, ctx: RunContext, phase: str, prompt: str, attempt: Optional[int] = None
     ) -> tuple[int, int]:
-        """Record this call against the phase's counters; return ``(attempt, repeats)``.
+        """Return ``(attempt, repeats)`` for this call — the ladder's evidence.
 
-        **Why the counters live here.**  ``_ask`` is the single door every phase
-        call goes through, so a counter written here cannot be forgotten by a
-        new loop.  The previous version read ``phase_attempts``/``phase_repeats``
-        from ``ctx.extras`` and nothing ever wrote them, so the ladder was asked
-        "how many times has this failed?" and always heard "zero" — escalation
-        was physically impossible.
+        **What went wrong before.**  The counter was ``attempts[phase] += 1``:
+        it counted *calls*, not *failures*.  For ``code`` in a fix loop that is
+        roughly right, because every call after the first is a retry.  For
+        ``document`` and ``research`` it is simply false: a ten-section document
+        makes ten independent calls, and from the third one on the ladder read
+        "attempt 2 at this level" and escalated every remaining section to the
+        flagship model — although not one of them had failed.  On an account
+        with ``GIGAFORGE_ALLOW_MAX`` that is a multiple overpayment; without it
+        the escalation is a silent no-op, and then "the ladder works" is untrue.
 
-        ``attempt`` is the number of *prior* calls to this phase, so the first
-        call sees 0 and the ladder's ``attempts_before_escalation`` threshold
-        means what it says.  ``repeats`` counts consecutive calls whose prompt
-        is byte-identical: the same question against the same context produces
-        the same answer, so asking it again at the same level proves nothing.
-        A different prompt resets the streak, because new information is a
-        genuinely new attempt.
+        **The fix is to stop inferring.**  A loop that knows its own iteration
+        passes it in (``attempt=``); a call that is a first attempt for a new
+        unit of work passes nothing and gets 0.  The counter no longer guesses
+        from the number of calls, because the number of calls is not the number
+        of failures.
+
+        ``repeats`` stays measured rather than declared: it counts prior calls
+        with a byte-identical prompt, keyed by ``(phase, prompt-hash)``.  The
+        same question against the same context produces the same answer, so
+        asking it again at the same level proves nothing — and a different
+        prompt is genuinely new information, not a repeat.
         """
-        attempts = ctx.extras.setdefault("phase_attempts", {})
+        import hashlib
+
         repeats = ctx.extras.setdefault("phase_repeats", {})
-        seen = ctx.extras.setdefault("phase_prompts", {})
-        prior = int(attempts.get(phase, 0))
-        previous_prompt = seen.get(phase)
-        if previous_prompt is not None and previous_prompt == prompt:
-            repeats[phase] = int(repeats.get(phase, 0)) + 1
-        else:
-            repeats[phase] = 0
-        seen[phase] = prompt
-        attempts[phase] = prior + 1
-        return prior, int(repeats.get(phase, 0))
+        key = (phase, hashlib.sha1(prompt.encode("utf-8", "replace")).hexdigest()[:16])
+        prior = int(repeats.get(key, 0))
+        repeats[key] = prior + 1
+        # ``attempt`` is the caller's knowledge when the caller has one.  A loop
+        # that knows its own iteration passes it; a direct call falls back to
+        # "how many times has this exact question been asked", which is the
+        # honest reading of a repeat and keeps escalation working for callers
+        # that have no loop to consult.
+        #
+        # The key is the prompt, so a document's ten sections -- ten different
+        # prompts -- are ten first attempts, not one attempt repeated ten times.
+        # That is the whole point: the number of calls is not the number of
+        # failures.
+        return (int(attempt) if attempt is not None else prior), prior
 
     def _with_phase_skills(self, ctx: RunContext, phase: str, prompt: str) -> str:
         """Prepend the skills that apply to *this phase*, once per run.
@@ -4425,7 +4472,8 @@ class TaskPipeline:
             return prompt
 
     def _ask(self, phase: str, prompt: str, ctx: RunContext,
-             *, temperature: Optional[float] = None) -> str:
+             *, temperature: Optional[float] = None,
+             attempt: Optional[int] = None) -> str:
         """Route a phase call through the router and return the answer text.
 
         ``temperature`` is threaded through for the tree search, whose whole
@@ -4435,6 +4483,11 @@ class TaskPipeline:
         """
         if self.router is None:
             raise PipelineError("no model client is wired into the pipeline")
+        # The repeat key is the caller's prompt, not the skills-augmented one:
+        # ``_with_phase_skills`` prepends a block on the first call and not on
+        # the second, so hashing after it made every repeat look like a new
+        # question and the streak could never form.
+        prompt_key = prompt
         prompt = self._with_phase_skills(ctx, phase, prompt)
         messages = ctx.state.messages(extra=[{"role": "user", "content": prompt}])
         max_tokens = None
@@ -4477,7 +4530,7 @@ class TaskPipeline:
         # drive.  A repeat is measured, not guessed: the same phase asked the
         # same question twice is the same prompt against the same context, and
         # repeating it at the same level produces the same answer.
-        attempt, repeats = self._note_phase_attempt(ctx, phase, prompt)
+        attempt, repeats = self._note_phase_attempt(ctx, phase, prompt_key, attempt)
         # Ask the registry whether *this* phase, for *this* prompt, has a
         # deterministic implementation.  A handler that cannot serve the input
         # declines (``can_serve``), so "a handler exists" never becomes "skip the
