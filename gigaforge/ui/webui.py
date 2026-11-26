@@ -53,7 +53,18 @@ _CSS = """
 :root{
   --bg:#f3f8fd; --bg2:#ffffff; --panel:#ffffffd9; --panel-solid:#ffffff;
   --line:#dce9f5; --line2:#bfd7eb; --fg:#183b66; --fg-dim:#55708f;
-  --accent:#328df2; --accent2:#21b6d2; --ok:#1da96a; --warn:#bd7b11; --bad:#d64d63;
+  /* Two accents, and the split is the whole point.  ``--accent`` is a FILL:
+     gradients, bars, the logo, a 2px rule.  ``--accent-ink`` is TEXT, and it
+     is darker because a fill only has to be seen while text has to be read.
+     Measured before this split: ``#328df2`` as text on the diff background
+     ``#f7fbff`` was 3.24 against the 4.5 AA floor -- the hunk header of every
+     diff was the least readable line on the page.  ``#1766c2`` is 5.44 on the
+     same background and 5.23 on the page background, so one token covers
+     every surface the panel paints text on. */
+  --accent:#328df2; --accent-ink:#1766c2; --accent2:#21b6d2;
+  --ok:#1da96a; --ok-ink:#147a4c; --warn:#bd7b11; --warn-ink:#8a5a08;
+  --bad:#d64d63; --bad-ink:#b02a41; --mag-ink:#6d28d9;
+  --focus:#1766c2; --focus-ring:#1766c233;
   --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
   --sans:system-ui,-apple-system,"Segoe UI",Roboto,Inter,Arial,sans-serif;
 }
@@ -67,7 +78,15 @@ body{
   color:var(--fg); font-family:var(--sans); font-size:14px; line-height:1.5;
   min-height:100vh; -webkit-font-smoothing:antialiased;
 }
-a{color:var(--accent)}
+a{color:var(--accent-ink);text-underline-offset:2px}
+a:hover{color:var(--fg)}
+/* One visible focus treatment for every interactive element.  ``:focus-visible``
+   and not ``:focus``: a mouse click on a tab should not leave a ring behind,
+   while a keyboard user must always see where they are. */
+:where(a,button,select,input,[tabindex]):focus-visible{
+  outline:2px solid var(--focus);outline-offset:2px;border-radius:9px;
+  box-shadow:0 0 0 4px var(--focus-ring);
+}
 .wrap{max-width:1360px;margin:0 auto;padding:22px 20px 64px}
 header.top{display:flex;flex-wrap:wrap;gap:14px;align-items:center;justify-content:space-between;margin-bottom:18px}
 .brand{display:flex;align-items:center;gap:12px}
@@ -92,9 +111,29 @@ h1{font-size:19px;margin:0;letter-spacing:.2px}
 button,select,input{
   font-family:var(--mono);font-size:12px;color:var(--fg);background:#ffffff;
   border:1px solid var(--line2);border-radius:9px;padding:7px 11px;cursor:pointer;
+  transition:border-color .15s ease,color .15s ease,background .15s ease;
 }
-button:hover{border-color:var(--accent);color:var(--accent)}
-input{cursor:text;min-width:190px}
+button:hover{border-color:var(--accent-ink);color:var(--accent-ink)}
+button:active{border-color:var(--accent-ink);background:#eaf3fd;color:var(--accent-ink)}
+button:disabled,button[aria-disabled="true"],select:disabled,input:disabled{
+  /* WCAG exempts disabled controls from the contrast minimum, but the gate
+     measures what is painted and a reader still has to read it -- so the
+     muted grey is chosen to pass anyway: #5a6f85 is 4.86 on #f4f8fc, while
+     still sitting far below the 11.3 of live text. */
+  color:#5a6f85;background:#f4f8fc;border-color:var(--line);cursor:not-allowed;
+}
+button:disabled:hover{border-color:var(--line);color:#5a6f85}
+/* A button that is working says so, and stops accepting a second click. */
+button[aria-busy="true"]{cursor:progress;color:var(--fg-dim)}
+button[aria-busy="true"]::after{
+  content:"";display:inline-block;width:9px;height:9px;margin-left:7px;
+  border:2px solid var(--line2);border-top-color:var(--accent-ink);border-radius:50%;
+  vertical-align:-1px;animation:spin .7s linear infinite;
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+input{cursor:text;min-width:190px;max-width:100%}
+input:hover{border-color:var(--line2)}
+input:focus{border-color:var(--accent-ink)}
 .grid{display:grid;gap:14px}
 .kpis{grid-template-columns:repeat(auto-fit,minmax(196px,1fr));margin-bottom:14px}
 .card{
@@ -105,8 +144,12 @@ input{cursor:text;min-width:190px}
 .card .label{color:var(--fg-dim);font-size:11px;text-transform:uppercase;letter-spacing:.7px;font-family:var(--mono)}
 .card .value{font-size:25px;font-weight:700;margin-top:7px;font-variant-numeric:tabular-nums}
 .card .hint{color:var(--fg-dim);font-size:11.5px;margin-top:5px;font-family:var(--mono)}
-.card.ok .value{color:var(--ok)} .card.warn .value{color:var(--warn)} .card.bad .value{color:var(--bad)}
-.card.acc .value{color:var(--accent)} .card.mag .value{color:#c084fc}
+/* KPI values are 25px bold, so they clear the 3.0 large-text floor -- but the
+   hint under them is 11.5px and does not, and a value that only just passes is
+   a value that fails the moment the card is tinted.  The ink tokens are used
+   for both, so the pair is legible at any size. */
+.card.ok .value{color:var(--ok-ink)} .card.warn .value{color:var(--warn-ink)} .card.bad .value{color:var(--bad-ink)}
+.card.acc .value{color:var(--accent-ink)} .card.mag .value{color:var(--mag-ink)}
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:15px;padding:0;overflow:hidden;backdrop-filter:blur(9px)}
 .panel > h2{
   margin:0;padding:13px 16px;font-size:12.5px;letter-spacing:.8px;text-transform:uppercase;
@@ -138,40 +181,78 @@ td.num{text-align:right;font-variant-numeric:tabular-nums;font-family:var(--mono
 .cols > *{min-width:0}
 .scroll{overflow-x:auto}
 .steps{display:flex;flex-direction:column;gap:7px}
-.step{display:grid;grid-template-columns:26px 1fr auto auto;gap:10px;align-items:center;padding:9px 11px;border:1px solid var(--line);border-radius:11px;background:#f9fcff}
-.step .name{font-family:var(--mono);font-weight:600}
-.step .meta{font-family:var(--mono);color:var(--fg-dim);font-size:11.5px}
+.step{
+  display:grid;grid-template-columns:26px minmax(0,1fr) auto auto;gap:10px;align-items:center;
+  padding:9px 11px;border:1px solid var(--line);border-radius:11px;background:#f9fcff;
+  transition:border-color .15s ease,background .15s ease;
+}
+.step:hover{border-color:var(--line2);background:#f4faff}
+.step > *{min-width:0}
+.step .name{font-family:var(--mono);font-weight:600;overflow-wrap:anywhere}
+.step .meta{font-family:var(--mono);color:var(--fg-dim);font-size:11.5px;overflow-wrap:anywhere}
 .badge{font-family:var(--mono);font-size:10.5px;padding:3px 8px;border-radius:999px;border:1px solid var(--line2);text-transform:uppercase;letter-spacing:.4px}
 .badge.succeeded{color:#157b4d;background:#e8f8ef;border-color:#bfead1}
 .badge.failed,.badge.timeout{color:#b83d51;background:#fff0f1;border-color:#ffd9df}
 .badge.running{color:#94620f;background:#fff4df;border-color:#f3dfb8}
 .badge.skipped,.badge.unknown,.badge.pending{color:var(--fg-dim)}
 .glyph{font-size:14px;text-align:center}
-.k-ok{color:var(--ok)} .k-bad{color:var(--bad)} .k-warn{color:var(--warn)} .k-dim{color:var(--fg-dim)}
+.k-ok{color:var(--ok-ink)} .k-bad{color:var(--bad-ink)} .k-warn{color:var(--warn-ink)} .k-dim{color:var(--fg-dim)}
 pre.diff{
   margin:0;padding:13px 15px;max-height:460px;overflow:auto;font-family:var(--mono);
   font-size:12px;line-height:1.5;background:#f7fbff;border-top:1px solid var(--line);
 }
 pre.diff .a{color:#157b4d;background:#e8f8ef}
 pre.diff .d{color:#b83d51;background:#fff0f1}
-pre.diff .h{color:var(--accent)}
+pre.diff .h{color:var(--accent-ink)}
 pre.diff .m{color:#665ce7;font-weight:600}
 pre.diff .c{color:#55708f}
 .trace{font-family:var(--mono);font-size:12px}
 .trace .row{display:grid;grid-template-columns:96px 158px 1fr;gap:10px;padding:6px 4px;border-bottom:1px solid var(--line)}
 .trace .ts{color:var(--fg-dim)}
-.trace .ev{color:var(--accent)}
+.trace .ev{color:var(--accent-ink)}
 .trace .det{color:#4d6b91;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.tabs{display:flex;gap:6px;padding:11px 14px 0}
-.tab{padding:7px 13px;border-radius:9px 9px 0 0;border:1px solid var(--line);border-bottom:none;background:#f3f8fd;font-family:var(--mono);font-size:12px;color:var(--fg-dim);cursor:pointer}
-.tab.active{background:var(--panel-solid);color:var(--fg);border-color:var(--line2)}
+/* ``flex-wrap`` and not a fixed row: four tabs at 12px mono are 322px wide
+   together, which is 2px past a 320px viewport and would be past a 375px one
+   the moment a label grows.  Wrapping reflows them onto a second line instead
+   of pushing the page sideways -- reflow, not clipping (WCAG 1.4.10). */
+.tabs{display:flex;flex-wrap:wrap;gap:6px;padding:11px 14px 0}
+.tab{
+  padding:7px 13px;border-radius:9px 9px 0 0;border:1px solid var(--line);border-bottom:none;
+  background:#f3f8fd;font-family:var(--mono);font-size:12px;color:var(--fg-dim);cursor:pointer;
+  transition:background .15s ease,color .15s ease;
+}
+.tab:hover{background:#e9f2fb;color:var(--fg)}
+.tab:active{background:#dcebf9}
+.tab.active{background:var(--panel-solid);color:var(--fg);border-color:var(--line2);font-weight:600}
+.tab.active:hover{background:var(--panel-solid)}
 .hide{display:none!important}
 .empty{padding:34px 16px;text-align:center;color:var(--fg-dim);font-family:var(--mono);font-size:12.5px}
+/* An empty state and an error state are different messages and must not look
+   the same: "nothing recorded yet" is normal, "the source is missing" is not. */
+.empty.err{color:var(--bad-ink)}
+.empty.err::before{content:"! ";font-weight:700}
 .chips{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px}
 .chip{font-family:var(--mono);font-size:11.5px;padding:4px 9px;border-radius:999px;border:1px solid var(--line2);color:var(--fg-dim)}
 .chip b{color:var(--fg);font-weight:600}
 .spark{width:100%;height:62px;display:block}
 footer{margin-top:20px;color:var(--fg-dim);font-family:var(--mono);font-size:11.5px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+/* Narrow screens: the trace row is a three-column grid sized for a desktop
+   (96px + 158px + the detail).  Below 560px the detail column has nothing left
+   to shrink, so the row stacks instead of overflowing. */
+@media(max-width:560px){
+  .wrap{padding:16px 12px 48px}
+  .trace .row{grid-template-columns:1fr;gap:2px;padding:8px 4px}
+  .trace .det{white-space:normal;overflow-wrap:anywhere}
+  .step{grid-template-columns:22px minmax(0,1fr);row-gap:4px}
+  .step .meta,.step .badge{grid-column:2}
+  .kpis{grid-template-columns:1fr}
+  .card .value{font-size:22px}
+  .controls{width:100%}
+  .controls input{flex:1 1 100%;min-width:0}
+}
+@media(prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important}
+}
 """
 
 _JS = r"""
@@ -291,7 +372,12 @@ _JS = r"""
         Object.keys(idx.languages||{}).map((l) => '<span class="chip">' + esc(l) + " <b>" + fmtInt(idx.languages[l]) + "</b></span>").join("")
       : '<span class="chip">no L0 index database</span>';
     const notes = (data.source && data.source.missing) || [];
-    el("notes").innerHTML = notes.length ? notes.map((n) => "! " + esc(n)).join("<br>") : "data sources ok";
+    // A missing data source is an error state, not an empty state: it gets the
+    // error styling and a sentence that says what to do about it.
+    el("notes").innerHTML = notes.length
+      ? '<span class="empty err" style="display:block;padding:0;text-align:left">' +
+        notes.map((n) => esc(n)).join("<br>") + "</span>"
+      : "data sources ok";
     const totals = data.totals || {};
     el("totals").textContent = fmtInt(totals.runs_recorded) + " runs · " + fmtInt(totals.metrics_points) + " metric points · " + fmtInt(totals.trace_events) + " trace events";
   }
@@ -348,11 +434,22 @@ _JS = r"""
       "</svg>";
   }
 
-  function tab(name){
-    ["overview","steps","trace","diff"].forEach((t) => {
-      el("tab-" + t).className = "tab" + (t === name ? " active" : "");
-      el("view-" + t).className = (t === name ? "" : "hide");
+  const TABS = ["overview","steps","trace","diff"];
+
+  function tab(name, focus){
+    TABS.forEach((t) => {
+      const on = t === name;
+      const btn = el("tab-" + t);
+      btn.className = "tab" + (on ? " active" : "");
+      // ``aria-selected`` is what a screen reader announces; the class is only
+      // what a sighted user sees.  Setting one without the other is how a tab
+      // strip ends up looking right and reading wrong.
+      btn.setAttribute("aria-selected", on ? "true" : "false");
+      // Roving tabindex: Tab enters the strip once, arrows move inside it.
+      btn.tabIndex = on ? 0 : -1;
+      el("view-" + t).className = on ? "" : "hide";
     });
+    if (focus) el("tab-" + name).focus();
   }
 
   function tick(){
@@ -363,18 +460,61 @@ _JS = r"""
     fetch("api/snapshot", {cache:"no-store"}).then((r) => (r.ok ? r.json() : null)).then((d) => { if (d) render(d); }).catch(() => {});
   }
 
+  // A manual refresh is a request the user is waiting on, so it says it is
+  // working and refuses a second click until the answer arrives.
+  function refreshNow(){
+    const btn = el("refresh");
+    if (btn.getAttribute("aria-busy") === "true") return;
+    if (!canPoll){ return; }
+    btn.setAttribute("aria-busy", "true");
+    btn.disabled = true;
+    fetch("api/snapshot", {cache:"no-store"})
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => { if (d) render(d); })
+      .catch(() => {})
+      .then(() => { btn.removeAttribute("aria-busy"); btn.disabled = false; });
+  }
+
   function boot(){
     render(SNAP);
-    el("tab-overview").onclick = () => tab("overview");
-    el("tab-steps").onclick = () => tab("steps");
-    el("tab-trace").onclick = () => tab("trace");
-    el("tab-diff").onclick = () => tab("diff");
+    TABS.forEach((t) => {
+      el("tab-" + t).onclick = () => tab(t);
+    });
+    // Arrow keys / Home / End move between tabs, as the ARIA tabs pattern
+    // requires.  Without this the strip is four buttons that only a mouse can
+    // operate, which is the accessibility defect a role="tablist" promises not
+    // to have.
+    el("tab-overview").parentNode.addEventListener("keydown", (ev) => {
+      const i = TABS.indexOf(document.activeElement && document.activeElement.id.replace("tab-", ""));
+      if (i < 0) return;
+      let next = -1;
+      if (ev.key === "ArrowRight") next = (i + 1) % TABS.length;
+      else if (ev.key === "ArrowLeft") next = (i - 1 + TABS.length) % TABS.length;
+      else if (ev.key === "Home") next = 0;
+      else if (ev.key === "End") next = TABS.length - 1;
+      if (next < 0) return;
+      ev.preventDefault();
+      tab(TABS[next], true);
+    });
     el("traceFilter").oninput = renderTrace;
-    el("refresh").onclick = tick;
+    el("refresh").onclick = refreshNow;
     el("auto").onclick = () => {
       auto = !auto;
       el("auto").textContent = auto ? "auto-refresh: on" : "auto-refresh: off";
+      el("auto").setAttribute("aria-pressed", auto ? "true" : "false");
     };
+    // A file:// page has no ``api/snapshot`` to poll, so both controls would be
+    // buttons that do nothing.  A control that cannot act is disabled and says
+    // why, instead of looking live and silently ignoring the click.
+    if (!canPoll){
+      ["refresh", "auto"].forEach((id) => {
+        const b = el(id);
+        b.disabled = true;
+        b.setAttribute("aria-disabled", "true");
+        b.title = "live refresh needs the served panel (gigaforge web --serve)";
+      });
+      el("auto").textContent = "auto-refresh: n/a";
+    }
     timer = setInterval(tick, 2000);
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
@@ -418,12 +558,12 @@ def render_html(
       </div>
     </div>
     <div class="controls">
-      <span id="status"></span>
+      <span id="status" role="status" aria-live="polite"></span>
       <span class="pill" id="stamp"></span>
       <span class="pill"><span class="dot"></span><span id="srcnote"></span></span>
       <input id="traceFilter" type="search" placeholder="filter trace…" aria-label="filter trace events">
-      <button id="auto" title="toggle polling">auto-refresh: on</button>
-      <button id="refresh" title="refresh now">refresh</button>
+      <button id="auto" type="button" title="toggle polling" aria-pressed="true">auto-refresh: on</button>
+      <button id="refresh" type="button" title="refresh now">refresh</button>
     </div>
   </header>
 
@@ -445,14 +585,14 @@ def render_html(
     </div>
   </div>
 
-  <div class="tabs">
-    <div class="tab active" id="tab-overview">Overview</div>
-    <div class="tab" id="tab-steps">Steps</div>
-    <div class="tab" id="tab-trace">Trace</div>
-    <div class="tab" id="tab-diff">Diff</div>
+  <div class="tabs" role="tablist" aria-label="dashboard views">
+    <button class="tab active" id="tab-overview" type="button" role="tab" aria-selected="true" aria-controls="view-overview" tabindex="0">Overview</button>
+    <button class="tab" id="tab-steps" type="button" role="tab" aria-selected="false" aria-controls="view-steps" tabindex="-1">Steps</button>
+    <button class="tab" id="tab-trace" type="button" role="tab" aria-selected="false" aria-controls="view-trace" tabindex="-1">Trace</button>
+    <button class="tab" id="tab-diff" type="button" role="tab" aria-selected="false" aria-controls="view-diff" tabindex="-1">Diff</button>
   </div>
 
-  <div id="view-overview" class="cols">
+  <div id="view-overview" class="cols" role="tabpanel" aria-labelledby="tab-overview" tabindex="0">
     <div class="panel">
       <h2>cost &amp; usage</h2>
       <div class="body">
@@ -487,11 +627,11 @@ def render_html(
     </div>
   </div>
 
-  <div id="view-steps" class="hide">
+  <div id="view-steps" class="hide" role="tabpanel" aria-labelledby="tab-steps" tabindex="0">
     <div class="panel"><h2>step timeline</h2><div class="body"><div class="steps" id="steps"></div></div></div>
   </div>
 
-  <div id="view-trace" class="hide">
+  <div id="view-trace" class="hide" role="tabpanel" aria-labelledby="tab-trace" tabindex="0">
     <div class="panel">
       <h2>trace viewer<span class="k-dim" id="traceShown" style="font-size:11px"></span></h2>
       <div class="body"><div class="chips" id="traceCounts"></div></div>
@@ -499,7 +639,7 @@ def render_html(
     </div>
   </div>
 
-  <div id="view-diff" class="hide">
+  <div id="view-diff" class="hide" role="tabpanel" aria-labelledby="tab-diff" tabindex="0">
     <div class="panel">
       <h2>diff viewer<span class="k-dim" id="diffMeta" style="font-size:11px"></span></h2>
       <div class="body"><div class="chips" id="diffFiles"></div></div>
@@ -541,7 +681,7 @@ def write_html(
     return path
 
 
-# ── live server ────────────────────────────────────────────────────────────
+# ── live server ──────────────────────────────────────────────────────────────
 def make_handler(
     store: UiStore,
     *,
