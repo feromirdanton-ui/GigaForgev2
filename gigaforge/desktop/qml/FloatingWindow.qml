@@ -8,7 +8,10 @@ Rectangle {
     property string title: ""
     property string iconText: "◈"
     property string iconFont: themeTokens.text
-    property color accent: themeTokens.primary
+    // The window icon is a glyph, so it is text: the fill token would be 4.07
+    // on the field.  ``accent`` stays the name the callers set; it now carries
+    // the readable value.
+    property color accent: themeTokens.primaryInk
     property string closeLabel: "Закрыть"
     property string minimizeLabel: "Свернуть"
     property string maximizeLabel: "Развернуть"
@@ -161,7 +164,7 @@ Rectangle {
                     contentItem: Text {
                         text: modelData.text
                         color: modelData.action === "close" && parent.hovered
-                            ? themeTokens.red : themeTokens.ink3
+                            ? themeTokens.redInk : themeTokens.ink3
                         font.pixelSize: modelData.action === "maximize" ? 11 : 16
                         horizontalAlignment: Text.AlignHCenter
                         verticalAlignment: Text.AlignVCenter

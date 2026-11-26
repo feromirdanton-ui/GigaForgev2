@@ -1160,7 +1160,8 @@ ApplicationWindow {
                     }
                     contentItem: Text {
                         text: parent.text
-                        color: themeTokens.aqua
+                        // A glyph is text: it is read, so it takes the ink token.
+                        color: themeTokens.aquaInk
                         font.family: "Segoe MDL2 Assets"
                         font.pixelSize: Math.round(13 * window.textScale)
                         horizontalAlignment: Text.AlignHCenter
@@ -4161,7 +4162,7 @@ ApplicationWindow {
                                                 Layout.fillWidth: true
                                                 Rectangle { width: 7; height: 7; radius: 4; color: bridge.openPath ? mint : themeTokens.ember }
                                                 Text { text: bridge.openPath || window.tr("Выберите файл проекта", "Select a project file"); color: themeTokens.consoleInk; font.pixelSize: Math.round(11 * window.textScale); font.bold: true; elide: Text.ElideMiddle; Layout.fillWidth: true }
-                                                Text { text: editor.text !== bridge.savedEditorContents ? window.tr("● изменён", "● modified") : ""; color: themeTokens.amber; font.pixelSize: Math.round(9.5 * window.textScale) }
+                                                Text { text: editor.text !== bridge.savedEditorContents ? window.tr("● изменён", "● modified") : ""; color: themeTokens.amberInk; font.pixelSize: Math.round(9.5 * window.textScale) }
                                                 Button {
                                                     objectName: "fileDiffButton"
                                                     text: "Diff"
@@ -4271,7 +4272,7 @@ ApplicationWindow {
                                                     : window.tr("Переместить консоль вправо", "Move terminal beside editor")
                                                     onClicked: bridge.setTerminalSideBySide(!bridge.terminalSideBySide)
                                                     background: Rectangle { radius: themeTokens.radiusControl; color: themeTokens.console3; border.color: themeTokens.line }
-                                                    contentItem: Text { text: parent.text; color: themeTokens.aqua; font.pixelSize: Math.round(10.5 * window.textScale); horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter; leftPadding: 8; rightPadding: 8 }
+                                                    contentItem: Text { text: parent.text; color: themeTokens.aquaInk; font.pixelSize: Math.round(10.5 * window.textScale); horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter; leftPadding: 8; rightPadding: 8 }
                                                 }
                                                 Button {
                                                     visible: bridge.terminalRunning

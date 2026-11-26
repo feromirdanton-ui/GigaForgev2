@@ -106,7 +106,7 @@ Item {
                         Layout.preferredHeight: 34
                         radius: 17
                         color: themeTokens.primaryTint
-                        Text { anchors.centerIn: parent; text: "⌕"; color: themeTokens.primary; font.pixelSize: 24 }
+                        Text { anchors.centerIn: parent; text: "⌕"; color: themeTokens.primaryInk; font.pixelSize: 24 }
                     }
                     TextField {
                         id: projectSearch

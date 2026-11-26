@@ -23,10 +23,21 @@ QtObject {
     readonly property color lineStrong: light ? "#FFAAC1C9" : graphiteTheme ? "#609CBBD1" : "#5D89D4BD"
     readonly property color controlLine: light ? "#FF9EB8C1" : graphiteTheme ? "#718EB0C4" : "#6386EFC3"
 
+    // The ink ladder is TEXT, all of it, and it is ordered by brightness:
+    // ink (body) > ink2 > ink3 > ink4 (the quietest rung).  Every rung clears
+    // the 4.5 AA floor on every surface it is painted on -- measured, not
+    // assumed, by gigaforge/desktop/qml_tokens.py and tests/test_qml_tokens.py.
+    //
+    // ink4 used to be #8498A0 in pearl: 2.58 on the field, and it is the colour
+    // of 28 labels set at 7.5-9px.  It is now #5A6E75 (4.60 on the field, 5.28
+    // on the lightest surface) and still reads quieter than ink3 (#4E6973,
+    // 5.02).  The dark themes had the same defect in the other direction:
+    // #65727D was 3.01 on graphite's surface3 and #648B79 was 3.66 on
+    // verdant's, so both were lifted until the quietest rung still clears AA.
     readonly property color ink: light ? "#0B1B24" : graphiteTheme ? "#E7ECEF" : "#E3F5EC"
     readonly property color ink2: light ? "#3C5563" : graphiteTheme ? "#DFE5E9" : "#D7EFE3"
-    readonly property color ink3: light ? "#536E78" : graphiteTheme ? "#8D98A3" : "#83B3A0"
-    readonly property color ink4: light ? "#8498A0" : graphiteTheme ? "#65727D" : "#648B79"
+    readonly property color ink3: light ? "#4E6973" : graphiteTheme ? "#8D98A3" : "#83B3A0"
+    readonly property color ink4: light ? "#5A6E75" : graphiteTheme ? "#8996A1" : "#789F8D"
     readonly property color graphite: light ? "#435C67" : graphiteTheme ? "#C7D2D9" : "#C7E4D6"
     readonly property color mist: light ? "#596F77" : graphiteTheme ? "#91A0AA" : "#91B5A2"
 
@@ -41,19 +52,38 @@ QtObject {
     readonly property color navGlow: light ? "#60E0BE" : graphiteTheme ? "#2DD4BF" : "#6EE7B7"
     readonly property color navRule: railLine
 
+    // ── accents: fill vs text ────────────────────────────────────────────────
+    // The same split the web panel and the Tk palette carry, because the defect
+    // is the same one: a colour chosen to be *seen* (a bar, a dot, a border, a
+    // gradient stop) was also used to *read* (a label, a chip, a link).  A fill
+    // only has to be visible; text has to clear 4.5.
+    //
+    // ``primary``/``aqua``/``cobalt``/``lilac`` stay the fills.  Every place the
+    // colour becomes text uses the matching ``*Ink`` token, which is the darker
+    // value in the light theme and the lighter one in the dark themes.
+    //
+    // Measured before the split, in pearl: primary #177F88 was 4.07 on the
+    // field, aqua #368F9C 3.24, cobalt #5577C7 3.72, lilac #9A87DD 2.62 -- and
+    // aqua is the colour of the terminal and chat button glyphs.
     readonly property color primary: light ? "#177F88" : graphiteTheme ? "#46CFC8" : "#44C6A0"
-    readonly property color primaryDeep: light ? "#105F69" : graphiteTheme ? "#28B8B4" : "#1F9C7F"
+    readonly property color primaryInk: light ? "#146E76" : graphiteTheme ? "#46CFC8" : "#44C6A0"
+    readonly property color primaryDeep: light ? "#105F69" : graphiteTheme ? "#28B8B4" : "#23A879"
     readonly property color primaryTint: light ? "#DDEEF0" : graphiteTheme ? "#302DD4BF" : "#2934D399"
     readonly property color aqua: light ? "#368F9C" : graphiteTheme ? "#3FC7C0" : "#54C8B2"
     readonly property color aquaInk: light ? "#256F7B" : graphiteTheme ? "#91F2E6" : "#A1EBDD"
     readonly property color cobalt: light ? "#5577C7" : graphiteTheme ? "#78A1FF" : "#9ABAF5"
+    readonly property color cobaltInk: light ? "#3F5DA8" : graphiteTheme ? "#78A1FF" : "#9ABAF5"
     readonly property color lilac: light ? "#9A87DD" : graphiteTheme ? "#B7A6FF" : "#C3B4FF"
+    readonly property color lilacInk: light ? "#6D5AB4" : graphiteTheme ? "#B7A6FF" : "#C3B4FF"
     readonly property color aquaTint: light ? "#DDECF3" : graphiteTheme ? "#336D8DFF" : "#315F9ED4"
     readonly property color mint: light ? "#238F76" : graphiteTheme ? "#48D4A0" : "#6ED5AD"
     readonly property color mintDeep: light ? "#0F6E5B" : graphiteTheme ? "#28BD83" : "#23A879"
     readonly property color mintGlow: light ? "#4ABF9C" : graphiteTheme ? "#63D9AE" : "#64D5A8"
     readonly property color mintGlass: light ? "#6699E5D2" : graphiteTheme ? "#3D2DD4BF" : "#6034D399"
-    readonly property color mintInk: light ? "#0B7F62" : graphiteTheme ? "#A7F3D0" : "#A7F3D0"
+    // mintInk is a badge foreground, so it is measured against mintTint, not
+    // against the field: #0B7F62 was 4.27 on the field and 4.39 on its own
+    // tint.  #096B52 is 5.57 / 5.73.
+    readonly property color mintInk: light ? "#096B52" : graphiteTheme ? "#A7F3D0" : "#A7F3D0"
     readonly property color mintTint: light ? "#FFE2F5EF" : graphiteTheme ? "#224ADE80" : "#2634D399"
     readonly property color amber: light ? "#D69318" : graphiteTheme ? "#FBBF24" : "#E8C268"
     readonly property color amberInk: light ? "#8A5A05" : graphiteTheme ? "#FCD77A" : "#F3D58B"
@@ -61,8 +91,11 @@ QtObject {
     readonly property color red: light ? "#C8443F" : graphiteTheme ? "#FB7185" : "#F38FB1"
     readonly property color redInk: light ? "#A5322D" : graphiteTheme ? "#FDA4AF" : "#FDA4AF"
     readonly property color redTint: light ? "#FFFBE9E8" : graphiteTheme ? "#22FB7185" : "#22F38FB1"
-    readonly property color lime: light ? "#91B84C" : graphiteTheme ? "#B7D76A" : "#B2D875"
-    readonly property color limeTint: light ? "#1A86B83E" : graphiteTheme ? "#22A3E635" : "#22A7E163"
+    // lime is a badge foreground too.  #91B84C on its own tint was 1.84 -- the
+    // worst pair in the file -- because the tint was a 10% wash of the same hue.
+    // The tint is now a real pale lime and the foreground is the readable value.
+    readonly property color lime: light ? "#4A6218" : graphiteTheme ? "#B7D76A" : "#B2D875"
+    readonly property color limeTint: light ? "#FFE8F2D8" : graphiteTheme ? "#22A3E635" : "#22A7E163"
     readonly property color fail: red
     readonly property color failTint: redTint
     readonly property color warn: amberInk
