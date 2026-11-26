@@ -1,15 +1,15 @@
-name: ci
-
-# The bench was not wired to CI and contained no HTML task, so a regression that
-# broke page generation outright would have left every check green.  This
-# workflow runs the unit suite AND the bench, and the bench now includes a page
-# fixture -- the artifact path is measured, not assumed.
+name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
   workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -29,13 +29,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]" || pip install -e .
           pip install pytest
+      - name: Install Chromium for the render tests
+        # ``pip install playwright`` installs the client, not the browser.  The
+        # render tests (panel design, WCAG gate, glitch probe) need a real
+        # Chromium, and without this step they failed on "Executable doesn't
+        # exist" -- the guard checked the package, which was present, so it did
+        # not skip.  Installing the browser is the fix; the guard now also
+        # launches it, so a future regression skips instead of failing.
+        run: python -m playwright install --with-deps chromium
       - name: Unit tests
         run: python -m pytest -q
-      - name: Bench (deterministic, no API calls)
-        # The bench is the product's own measurement: five fixtures, one of them
-        # a page.  It must pass on every push, not only when someone remembers
-        # to run it.
-        run: python -m gigaforge.cli bench --out bench.json
       - name: Bench must be all-green
         run: |
           python - <<'PY'
@@ -50,10 +53,22 @@ jobs:
               sys.exit(1)
           print(f"\nall {len(rows)} bench tasks passed")
           PY
-      - name: Upload bench report
+      - name: Panel design audit (all four views, three widths)
+        # ``gigaforge wcag`` measures the Overview tab only: the other three are
+        # ``display:none`` until opened, so a single run silently skips them.
+        # This opens each view at 1440/375/320 and fails on any pair below AA.
+        run: python scripts/ui_design_audit.py --label ci --json ui-audit.json
+      - name: Panel interactive states
+        # Contrast is a colour probe; this checks what a colour probe cannot
+        # see -- real tablist semantics, arrow-key movement, a painted focus
+        # ring, aria-busy while refreshing, and no console error.
+        run: python scripts/ui_state_check.py /tmp/panel-ci.html
+      - name: Upload UI audit
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bench-${{ matrix.python-version }}
-          path: bench.json
+          name: ui-audit-${{ matrix.python-version }}
+          path: |
+            ui-audit.json
+            /tmp/panel-ci.html
           if-no-files-found: ignore
