@@ -221,6 +221,11 @@ class TaskState:
     cache_lookups: int = 0
     #: Things the run could not do and did not fail on (see ``note_degraded``).
     degraded: list[dict[str, Any]] = field(default_factory=list)
+    #: One row per model call: phase, decided level, attempt, repeat, the model
+    #: that actually answered, tokens and latency.  The route table is a policy;
+    #: this is what the run experienced.  A policy never compared against its own
+    #: outcomes cannot be improved, only argued about.
+    routing: list[dict[str, Any]] = field(default_factory=list)
     artifacts: dict[str, Any] = field(default_factory=dict)
     completed_nodes: list[str] = field(default_factory=list)
     history: list[dict[str, str]] = field(default_factory=list)

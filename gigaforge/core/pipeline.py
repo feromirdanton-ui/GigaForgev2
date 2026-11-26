@@ -178,6 +178,10 @@ class PipelineResult:
     #: a number that cannot be recomputed is not a metric.  ``None`` when no
     #: contract ran (a code goal with no contract, a run that produced nothing).
     completeness: float | None = None
+    #: One row per model call: phase, decided level, attempt, repeat, the model
+    #: that answered, tokens and latency.  This is the measured routing table —
+    #: the policy compared against its own outcomes.
+    routing: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.success and not self.accepted:
@@ -244,6 +248,7 @@ class PipelineResult:
             "cache_hit_rate": round(self.cache_hit_rate, 4),
             "cache_hits": self.cache_hits,
             "cache_lookups": self.cache_lookups,
+            "routing": list(self.routing),
             "degraded": list(self.degraded),
         }
 
@@ -4102,11 +4107,60 @@ class TaskPipeline:
             max_tokens=max_tokens,
             level=level,
         )
+        self._note_route(ctx, phase, level, attempt, repeats, result)
         for attr in ("content", "text"):
             value = getattr(result, attr, None)
             if isinstance(value, str):
                 return value
         return str(result)
+
+    def _note_route(
+        self,
+        ctx: RunContext,
+        phase: str,
+        level: Any,
+        attempt: int,
+        repeats: int,
+        result: Any,
+    ) -> None:
+        """Record what actually served this step, not what the table predicted.
+
+        **Why measurement and not a static table.**  The router's route table is
+        a *policy*: it says which model a phase should get at which level.  What
+        the run experiences is the composition of that table, the account's
+        allow-list, the ladder's escalation and any fallback — and a policy that
+        is never compared against its own outcomes cannot be improved, only
+        argued about.  This records one row per call: phase, decided level,
+        attempt, whether the prompt repeated, the model that answered, tokens and
+        latency.
+
+        The rows are the input to a measured routing table: a phase that
+        repeatedly escalates on cheap-then-strong has its base level wrong, and
+        that is visible here as data rather than as an opinion.
+        """
+        try:
+            usage = getattr(result, "usage", None)
+            row = {
+                "phase": phase,
+                "level": int(level) if level is not None else None,
+                "attempt": int(attempt),
+                "repeat": int(repeats),
+                "model": str(getattr(result, "model", "") or ""),
+                "tokens_in": int(getattr(usage, "prompt_tokens", 0) or 0),
+                "tokens_out": int(getattr(usage, "completion_tokens", 0) or 0),
+                "latency_ms": int(getattr(result, "latency_ms", 0) or 0),
+            }
+            ctx.state.routing.append(row)
+            self._event(
+                "pipeline.route",
+                run_id=ctx.run_id,
+                phase=phase,
+                level=row["level"],
+                model=row["model"],
+                repeat=row["repeat"],
+            )
+        except Exception as exc:  # noqa: BLE001 - measurement must not fail a run
+            self._degraded("routing", exc, "ask")
 
     def _collect(
         self, run_id: str, goal: str, dag: DagResult, ctx: RunContext, *, started_ms: float
@@ -4213,6 +4267,7 @@ class TaskPipeline:
             cache_hit_rate=float(getattr(state, "cache_hit_rate", 0.0) or 0.0),
             cache_hits=int(getattr(state, "cache_hits", 0) or 0),
             cache_lookups=int(getattr(state, "cache_lookups", 0) or 0),
+            routing=list(getattr(state, "routing", []) or []),
             degraded=list(getattr(state, "degraded", []) or []),
             contract_unmet=list(ctx.extras.get("contract_unmet") or []),
             completeness=ctx.extras.get("completeness"),
