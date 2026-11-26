@@ -288,6 +288,31 @@ The QML surface has its own gate, because it is the primary one:
 python -m pytest tests/test_qml_tokens.py    # every token, all three themes
 ```
 
+### Scripts
+
+Every script in `scripts/` is either wired to CI or documented here. Three that
+were neither have been removed: `build_proto.py` (its input directory `原型/`
+does not exist in the repository), `render_check.py` (a stale copy of
+`gigaforge/harness/render_check.py`, which the pipeline imports) and
+`probe_summary.py` (an 11-line reader for a report nothing writes).
+
+| Script | What it does | Wired to |
+|---|---|---|
+| `_render_panel.py` | writes the control-room panel to a file from a populated snapshot | CI (via the two audits) |
+| `ui_design_audit.py` | all four panel views at 1440/375/320, fails on any pair below AA | CI |
+| `ui_state_check.py` | tablist semantics, arrow keys, focus ring, aria-busy, console errors | CI |
+| `contrast_table.py` | prints the contrast table for all three surfaces; `--markdown` feeds `qa/REPORT.md` | `tests/test_report_numbers.py` |
+| `qml_render_audit.py` | renders Main.qml offscreen and reports the field colour actually painted | manual (needs PySide6) |
+| `probe_p0.py` | executable probes for the P0 findings, driving the real pipeline | manual |
+| `probe_gradability.py` | whether a SWE-bench instance can be graded in this sandbox | manual |
+| `dump_swe_diff.py` | runs one SWE-bench instance and dumps the model's diff verbatim | manual |
+| `make_icon.py` | regenerates `assets/gigaforge.ico` from the palette | manual |
+| `generate_watercolor_wash.py` | regenerates the QML watercolor texture | manual |
+
+The manual ones are diagnostics: they need a model credential, a clone, or Qt,
+so they cannot run in CI. They are listed here so they are findable rather than
+being 466 lines nobody knows about.
+
 ## Docs
 
 - [`docs/DESKTOP.md`](docs/DESKTOP.md) — the window: structure, threading, theming
