@@ -2508,7 +2508,7 @@ class TaskPipeline:
         if searched and citations and not re.search(r"https?://", text):
             listed = "\n".join(f"- {url}" for url in citations[:8])
             text = f"{text}\n\nSources:\n{listed}" if text else f"Sources:\n{listed}"
-        ctx.extras["answer_text"] = text
+        ctx.extras["answer_text"] = _unwrap_text_envelope(text)
         ctx.extras["answer_citations"] = citations
         ctx.extras["answer_searched"] = searched
         self._event(
@@ -3059,6 +3059,11 @@ class TaskPipeline:
                 accepted=False, applied=False,
                 reason="the run produced no answer text",
             )
+        # A diff envelope around prose is a computation, not a failure: the
+        # model wrote the document and wrapped it in a patch because every other
+        # phase speaks diff.  Unwrap it rather than paying for a second call to
+        # get the same text without the wrapper.
+        text = _unwrap_text_envelope(text)
         # A reply that is a tool call is not a reply.  Measured live: the
         # document goal returned
         #
@@ -5292,6 +5297,100 @@ def _merge_focused_creation(
     result.reason = validation.reason or "focused creation was rejected"
     missing = sorted(requested.difference(all_files)) or ["focused file creation was rejected"]
     return {"accepted": False, "files": created_files, "missing": missing}
+
+
+def _unwrap_text_envelope(text: str) -> str:
+    """The prose inside a diff envelope, or ``text`` unchanged.
+
+    **The failure.**  Measured live on the document goal: the reply was
+
+        ```diff
+        diff --git a/gigaforge_run_explanation.md b/...
+        new file mode 100644
+        --- /dev/null
+        +++ b/gigaforge_run_explanation.md
+        @@ -0,0 +1,1023 @@
+        +## GigaForge Run Explanation
+        ...
+        ```
+
+    The model wrote the document correctly and then wrapped it in a patch,
+    because every other phase of this harness speaks diff.  Rejecting that would
+    throw away a correct document and pay for a second call to get the same
+    text without the wrapper.
+
+    **The rule.**  A fenced ``diff`` block that is most of the reply is an
+    envelope, and the added lines are the product.  Unwrapping is a computation
+    — the harness can do it exactly — so it does, instead of asking the model to
+    try again.  A reply that is not a diff envelope is returned unchanged.
+    """
+    import re as _re
+
+    stripped = text.strip()
+    fence = _re.match(r"^```(?:diff|patch)\s*\n(.*?)\n```\s*$", stripped, _re.DOTALL)
+    if not fence:
+        return text
+    body = fence.group(1)
+    if len(body) < 0.6 * len(stripped):
+        return text
+    if not _re.search(r"^(diff --git|--- |\+\+\+ |@@ )", body, _re.MULTILINE):
+        # A fenced block that is not a patch may still be a call envelope:
+        # measured live, the document goal answered with
+        # ```diff\nwrite_file("x.md", """# Doc...""")\n``` — the fence says diff,
+        # the body is a call.  The content is in there and extraction is exact.
+        return _unwrap_call_envelope(body) or text
+    added: list[str] = []
+    for line in body.splitlines():
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("+"):
+            added.append(line[1:])
+        elif line.startswith("@@"):
+            added.append("")
+    prose = "\n".join(added).strip()
+    if prose:
+        return prose
+    return _unwrap_call_envelope(body) or text
+
+
+def _unwrap_call_envelope(body: str) -> str:
+    """The content argument of a ``write_file(...)``-shaped call, or ``""``.
+
+    **The failure.**  Measured live, twice in a row: the document goal answered
+    with
+
+        write_file(
+          "gigaforge_run_explanation.md",
+          \"\"\"# GigaForge Run Explanation
+
+        ## Intake
+        ...
+        \"\"\"
+        )
+
+    The document is *in there*, complete and correct.  Rejecting it costs a
+    second call and gets the same text with a different wrapper — the model is
+    not confused about the content, it is confused about the channel, because
+    every other phase of this harness speaks tool calls.
+
+    **The rule.**  If the body is a call whose last argument is a triple-quoted
+    string, that string is the product.  Extraction is exact, so the harness
+    does it.  A body that is not that shape returns ``""`` and the caller keeps
+    its rejection.
+    """
+    import re as _re
+
+    match = _re.search(
+        r'"""(.+?)"""|\'\'\'(.+?)\'\'\'', body, _re.DOTALL
+    )
+    if not match:
+        return ""
+    content = match.group(1) if match.group(1) is not None else match.group(2)
+    content = (content or "").strip()
+    # A one-line string is a path, not a document.
+    if len(content) < 80:
+        return ""
+    return content
 
 
 def _tool_envelope_issue(text: str) -> str:
