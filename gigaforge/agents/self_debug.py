@@ -178,9 +178,8 @@ class SelfDebugger:
                 raise
             latency_ms = int((time.monotonic() - started) * 1000)
             text = chat_result.content or ""
-            usage = chat_result.usage or {}
-            tokens_in = int(usage.get("prompt_tokens", 0) or 0)
-            tokens_out = int(usage.get("completion_tokens", 0) or 0)
+            from gigaforge.client.types import usage_tokens
+            tokens_in, tokens_out = usage_tokens(chat_result.usage)
 
             try:
                 claim.settle(tokens_in, tokens_out)

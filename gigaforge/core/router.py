@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional, Sequence
 
 from gigaforge.client.errors import BudgetExceeded
+from gigaforge.client.types import usage_tokens
 from gigaforge.config import Settings, get_settings
 from gigaforge.core.budgets import PHASE_CAP_ATTRS, BudgetTracker
 
@@ -103,13 +104,30 @@ class PhaseUsage:
     fallback_used: int = 0
     cache_hits: int = 0
 
-    def add(self, usage: Mapping[str, Any], *, latency_ms: float = 0.0) -> None:
+    def add(self, usage: Any, *, latency_ms: float = 0.0) -> None:
+        """Accumulate one call's usage.
+
+        ``usage`` is a :class:`~gigaforge.client.types.Usage` dataclass on the
+        real client and a plain dict on the fake.  This method used ``.get()``
+        unconditionally, so on the real client it raised ``AttributeError`` —
+        and the caller swallowed it, which is why every live run reported zero
+        tokens and the per-phase table was empty.
+        """
         self.calls += 1
-        self.prompt_tokens += int(usage.get("prompt_tokens", 0) or 0)
-        self.completion_tokens += int(usage.get("completion_tokens", 0) or 0)
-        self.total_tokens += int(usage.get("total_tokens", 0) or 0)
-        if usage.get("source") == "estimate" or usage.get("estimated"):
-            self.estimated_tokens += int(usage.get("total_tokens", 0) or 0)
+        prompt, completion = usage_tokens(usage)
+        self.prompt_tokens += prompt
+        self.completion_tokens += completion
+        total = getattr(usage, "total_tokens", None)
+        if total is None and isinstance(usage, Mapping):
+            total = usage.get("total_tokens")
+        self.total_tokens += int(total or (prompt + completion))
+        source = getattr(usage, "source", None)
+        estimated = getattr(usage, "estimated", None)
+        if source is None and isinstance(usage, Mapping):
+            source = usage.get("source")
+            estimated = usage.get("estimated")
+        if source == "estimate" or estimated:
+            self.estimated_tokens += int(total or (prompt + completion))
         self.latency_ms += float(latency_ms or 0.0)
 
     def to_dict(self) -> dict[str, Any]:

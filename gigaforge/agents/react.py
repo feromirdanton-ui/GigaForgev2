@@ -294,6 +294,61 @@ def _clean_pattern(raw: str) -> str:
     return text
 
 
+#: ``<pattern> in <path>`` / ``<pattern> --path <path>`` / ``<pattern> <path>``.
+#: The tool contract tells the model to "always pass ``path`` to scope the
+#: search", but the tool took a single string and had no path argument at all.
+#: Measured on SWE-bench: the model asked for
+#: ``def separability_matrix( in astropy/modeling/separable.py``, the whole
+#: string became the pattern, nothing matched a function that is on line 66 of
+#: that file, and the episode burned its budget retrying.  A contract that
+#: promises an argument the tool does not accept is a harness defect, not a
+#: model mistake.
+_SCOPED_GREP = re.compile(
+    r"^(?P<pattern>.+?)\s+(?:in|--path|-p|path=)\s+(?P<path>[^\s]+)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _python_literal(raw: str) -> dict[str, Any] | None:
+    """Parse a Python dict literal a model wrote instead of JSON.
+
+    ``ast.literal_eval`` accepts single quotes, ``True``/``None`` and trailing
+    commas — all of which a model writes naturally and none of which JSON
+    accepts.  Returns ``None`` when the text is not a dict literal, so the
+    caller can still report a real format error.
+    """
+    import ast
+
+    text = (raw or "").strip()
+    if not text.startswith("{"):
+        return None
+    try:
+        value = ast.literal_eval(text)
+    except (ValueError, SyntaxError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _split_grep_input(raw: str) -> tuple[str, str]:
+    """``(pattern, path)`` from the several shapes a model writes.
+
+    ``path`` is ``""`` when the input names none, which means "the whole
+    worktree" — the previous behaviour.
+    """
+    text = _clean_pattern(raw)
+    if not text:
+        return "", ""
+    match = _SCOPED_GREP.match(text)
+    if match:
+        pattern = match.group("pattern").strip().strip("\"'`")
+        path = match.group("path").strip().strip("\"'`")
+        # A trailing token that is not a path (no separator, no dot) is part of
+        # the pattern: ``def foo in bar`` is a phrase, not a scope.
+        if "/" in path or "." in path:
+            return pattern, path
+    return text, ""
+
+
 def _remember_file_read(
     ctx: ReActContext,
     path: str,
@@ -356,9 +411,22 @@ class GrepTool:
 
         if not action_input or not action_input.strip():
             return "ERROR: grep needs a pattern"
-        pattern = _clean_pattern(action_input)
+        pattern, scope = _split_grep_input(action_input)
         if not pattern:
             return "ERROR: grep needs a pattern"
+        # A scoped search is what the tool contract promises; an unscoped one
+        # walks the whole worktree, which is the previous behaviour.
+        root = ctx.worktree
+        if scope:
+            candidate = (ctx.worktree / scope).resolve()
+            try:
+                candidate.relative_to(ctx.worktree.resolve())
+            except ValueError:
+                return f"ERROR: path escapes the worktree: {scope}"
+            if candidate.exists():
+                root = candidate
+            else:
+                return f"ERROR: path not found: {scope}"
 
         if shutil.which("rg"):
             try:
@@ -369,7 +437,7 @@ class GrepTool:
                 # Keep ripgrep traversal aligned with the Python fallback.
                 for directory in sorted(self._SKIP_DIRS):
                     args.extend(("--glob", f"!**/{directory}/**"))
-                args.extend((pattern, str(ctx.worktree)))
+                args.extend((pattern, str(root)))
                 proc = await asyncio.create_subprocess_exec(
                     *args,
                     stdout=asyncio.subprocess.PIPE,
@@ -379,11 +447,11 @@ class GrepTool:
                 out = (stdout_b or b"").decode("utf-8", errors="replace")
                 if out.strip():
                     return out
-                return f"(no matches for {pattern!r} under {ctx.worktree})"
+                return f"(no matches for {pattern!r} under {root})"
             except Exception:  # noqa: BLE001 - fall through to the pure-Python path
                 pass
 
-        return await asyncio.to_thread(self._py_grep, pattern, ctx.worktree, re)
+        return await asyncio.to_thread(self._py_grep, pattern, root, re)
 
     def _py_grep(self, pattern: str, root: Path, re_module: Any) -> str:
         """Pure-Python grep. Case-insensitive, honouring the skip list."""
@@ -430,22 +498,68 @@ class ReadStructureTool:
     async def run(self, action_input: str, *, ctx: ReActContext) -> str:
         if not action_input or not action_input.strip():
             return "ERROR: read_structure needs a file path"
-        rel = action_input.strip()
+        rel = action_input.strip().strip("\"'`")
         path = ctx.worktree / rel
         if not path.exists():
             return f"ERROR: file not found: {rel}"
-        # Re-index the file to ensure the L0 knows about it.
+        # Re-index the file so the L0 knows about it.
         try:
             ctx.index.index_file(path)
         except Exception:  # noqa: BLE001 — best-effort
             pass
-        skel = ctx.index.read_structure(str(path))
-        if not skel:
-            return f"(empty file: {rel})"
+        # ``Indexer.read_structure`` never existed: the tool called a method
+        # that is not on the object, the handler turned the AttributeError into
+        # "ERROR: tool 'read_structure' raised: 'Indexer' object has no
+        # attribute 'read_structure'", and the model — correctly — concluded
+        # the tool was unavailable and stopped using it.  Measured on
+        # SWE-bench: the episode then read a 900-line file three times, was
+        # truncated each time, and never found the function on line 66.
+        #
+        # The skeleton is a query, not a new index: the store already holds
+        # every symbol with its line, kind, qualified name and signature.
+        rows = []
+        try:
+            rows = ctx.index.store.symbols_in_file(rel)
+        except Exception:  # noqa: BLE001 — fall back to a source scan
+            rows = []
+        if not rows:
+            return self._scan_skeleton(path, rel)
         lines = []
-        for s in skel:
-            lines.append(f"{s.start_line:4d} {s.kind:8s} {s.qname}  ::  {s.signature}")
+        for row in rows:
+            start = int(row["start_line"] or 0)
+            kind = str(row["kind"] or "")
+            qname = str(row["qname"] or row["name"] or "")
+            signature = str(row["signature"] or "")
+            lines.append(f"{start:4d} {kind:8s} {qname}  ::  {signature}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _scan_skeleton(path: Path, rel: str) -> str:
+        """A Python skeleton from the source, when the index has no rows.
+
+        Deterministic and model-free: ``ast`` gives the same answer the index
+        would, and a file the indexer skipped (a non-Python file, a fresh
+        clone) still gets a usable outline instead of an error.
+        """
+        import ast
+
+        try:
+            source = path.read_text(encoding="utf-8", errors="replace")
+            tree = ast.parse(source)
+        except (OSError, SyntaxError):
+            return f"(no structure available for {rel})"
+        lines: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                kind = "class" if isinstance(node, ast.ClassDef) else "function"
+                args = ""
+                if not isinstance(node, ast.ClassDef):
+                    args = ", ".join(a.arg for a in node.args.args)
+                lines.append(
+                    f"{node.lineno:4d} {kind:8s} {node.name}  ::  {node.name}({args})"
+                )
+        lines.sort(key=lambda line: int(line.split()[0]))
+        return "\n".join(lines) if lines else f"(no symbols in {rel})"
 
 
 class ReadFileTool:
@@ -572,10 +686,19 @@ class EditFileTool:
             try:
                 data = json.loads(json_repair(action_input))
             except json.JSONDecodeError:
-                return (
-                    "ERROR: edit_file needs JSON with 'path', 'old_string', "
-                    "and 'new_string'"
-                )
+                # A model that writes a Python dict literal — single quotes,
+                # ``True``/``None`` — is not making a mistake the harness should
+                # punish: the payload is unambiguous, only the quoting differs.
+                # Measured on SWE-bench: three consecutive ``edit_file`` calls
+                # were rejected with "needs JSON with 'path', 'old_string'…"
+                # while the model had supplied exactly those three keys, and the
+                # episode burned its budget re-sending the same edit.
+                data = _python_literal(action_input)
+                if data is None:
+                    return (
+                        "ERROR: edit_file needs JSON with 'path', 'old_string', "
+                        "and 'new_string'"
+                    )
         if not isinstance(data, dict):
             return "ERROR: edit_file needs a JSON object"
         rel = str(data.get("path") or data.get("file") or data.get("location") or "").strip()
@@ -1056,9 +1179,8 @@ class ReActRunner:
                 raise
             latency_ms = int((time.monotonic() - started) * 1000)
             text = chat_result.content or ""
-            usage = chat_result.usage or {}
-            tokens_in = int(usage.get("prompt_tokens", 0) or 0)
-            tokens_out = int(usage.get("completion_tokens", 0) or 0)
+            from gigaforge.client.types import usage_tokens
+            tokens_in, tokens_out = usage_tokens(chat_result.usage)
 
             try:
                 claim.settle(tokens_in, tokens_out)
@@ -2202,11 +2324,21 @@ def _kind_for_tool(action: str) -> str:
         return "pytest"
     if action == "grep":
         return "grep"
+    if action in {"read_file", "read_structure"}:
+        # A file's contents are not a compiler diagnostic.  ``read_file`` fell
+        # through to ``builderr``, which parses its input as compiler output and
+        # — finding no diagnostic — returned
+        # ``{"error": "no parseable compiler diagnostic found", "raw_truncated": ...}``.
+        # Measured on SWE-bench: the model asked to read a 900-line file, got
+        # that envelope, concluded the tool was broken, and never saw the
+        # function it needed.  ``text`` is the honest bound: keep the head and
+        # the tail, say how much was dropped.
+        return "text"
     if action == "web_search":
         # A results page is prose with URLs; the builderr compressor is the
         # general text bound and keeps the titles and links intact.
         return "builderr"
-    # read_structure + repl + finish + unknown → builderr (general fallback).
+    # repl + finish + unknown → builderr (general fallback).
     # A REPL step's output is a traceback or a print, which is exactly what the
     # builderr compressor is built to bound.
     return "builderr"

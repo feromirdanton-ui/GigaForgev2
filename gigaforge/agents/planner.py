@@ -252,9 +252,8 @@ class PlannerAgent:
             latency_ms = int((time.monotonic() - started) * 1000)
 
             text = result.content or ""
-            usage = result.usage or {}
-            tokens_in = int(usage.get("prompt_tokens", 0) or 0)
-            tokens_out = int(usage.get("completion_tokens", 0) or 0)
+            from gigaforge.client.types import usage_tokens
+            tokens_in, tokens_out = usage_tokens(result.usage)
 
             # Per-task accounting (best-effort; budgets.check already committed
             # to the global "" bucket per the BudgetTracker design).

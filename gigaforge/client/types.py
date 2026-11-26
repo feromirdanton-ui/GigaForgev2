@@ -309,6 +309,25 @@ class ModelInfo:
         return {"id": self.id, "created": self.created, "owned_by": self.owned_by}
 
 
+def usage_tokens(usage: Any) -> tuple[int, int]:
+    """``(prompt_tokens, completion_tokens)`` from either usage shape.
+
+    ``ChatResult.usage`` is a :class:`Usage` dataclass on the real client and a
+    plain dict on the fake.  Eight call sites did ``usage.get("prompt_tokens")``,
+    which raises ``AttributeError`` on the real client — and the exception was
+    swallowed by a best-effort ``except``, so every live run recorded zero
+    tokens and the budget never saw the spend.  One helper, one shape.
+    """
+    if usage is None:
+        return 0, 0
+    prompt = getattr(usage, "prompt_tokens", None)
+    completion = getattr(usage, "completion_tokens", None)
+    if prompt is None and isinstance(usage, Mapping):
+        prompt = usage.get("prompt_tokens")
+        completion = usage.get("completion_tokens")
+    return int(prompt or 0), int(completion or 0)
+
+
 __all__ = [
     "ChatMessage",
     "ChatResult",
@@ -320,4 +339,5 @@ __all__ = [
     "coerce_messages",
     "estimate_token_count",
     "join_message_text",
+    "usage_tokens",
 ]

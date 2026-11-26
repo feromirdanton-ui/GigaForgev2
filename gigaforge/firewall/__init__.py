@@ -40,6 +40,7 @@ from gigaforge.firewall.compressors import (
 from gigaforge.firewall.compressors import (
     PytestCompressor as PytestCompressorOld,
 )
+from gigaforge.firewall.compress.text_out import TextCompressor
 from gigaforge.l0.store import L0Store
 
 from .compress import (
@@ -62,6 +63,10 @@ COMPRESSORS: dict[str, Any] = {
     "grep": GrepCompressorOld(),
     "gitdiff": GitDiffCompressorOld(),
     "builderr": BuildErrCompressor(),
+    # File contents are not a diagnostic: ``read_file`` used to fall through to
+    # ``builderr`` and receive "no parseable compiler diagnostic found" instead
+    # of the file.  ``text`` keeps the head and the tail and says what it cut.
+    "text": TextCompressor(),
 }
 
 

@@ -153,6 +153,15 @@ class ReActState(TypedDict, total=False):
     #: the model had answered correctly.  Measured on both text fixtures: the
     #: fake returned the document as ``finish`` prose and the result was empty.
     final_text: str
+    #: Why the episode stopped, when it stopped for a reason other than the
+    #: model's own ``finish``.  ``_to_result`` has always read this key, but the
+    #: state never declared it — so the provider-error branch returned
+    #: ``{"error": ...}``, LangGraph rejected the update as an unknown channel,
+    #: and the real cause (a 429, a 404 model, a timeout) was replaced by
+    #: "did not produce an executable plan".  Measured on SWE-bench: every
+    #: instance reported a planning defect while the provider had never been
+    #: reached.
+    error: str
 
 
 def _writer() -> Callable[[dict[str, Any]], None]:
@@ -390,9 +399,8 @@ def build_react_graph(
             }
         latency_ms = int((time.monotonic() - started) * 1000)
         text = chat_result.content or ""
-        usage = chat_result.usage or {}
-        tokens_in = int(usage.get("prompt_tokens", 0) or 0)
-        tokens_out = int(usage.get("completion_tokens", 0) or 0)
+        from gigaforge.client.types import usage_tokens
+        tokens_in, tokens_out = usage_tokens(chat_result.usage)
         try:
             claim.settle(tokens_in, tokens_out)
             runner.budgets.check_overshoot(_REACT_PHASE, task_id=task_state.task_id)

@@ -1046,6 +1046,206 @@ def bench(
         typer.echo(bench_report(results))
 
 
+@app.command()
+def swebench(
+    limit: Annotated[
+        int, typer.Option("--limit", "-n", help="How many instances to run.")
+    ] = 3,
+    repo: Annotated[
+        str, typer.Option("--repo", help="Only instances from this repo (owner/name).")
+    ] = "",
+    instance: Annotated[
+        str, typer.Option("--instance", help="Only this instance id.")
+    ] = "",
+    dataset: Annotated[
+        str, typer.Option("--dataset", help="Path to the Verified parquet copy.")
+    ] = "/tmp/swe.parquet",
+    out: Annotated[
+        str, typer.Option("--out", help="Write the JSON report to this path.")
+    ] = "",
+    keep: Annotated[
+        bool, typer.Option("--keep", help="Keep the cloned repo for inspection.")
+    ] = False,
+) -> None:
+    """Run SWE-bench Verified instances against the real model.
+
+    The internal bench is seven fixtures written by the harness's own author, so
+    it measures the harness against its author's imagination.  SWE-bench
+    Verified is 500 real issues with maintainer-written tests: an instance
+    passes only if FAIL_TO_PASS goes green and PASS_TO_PASS stays green.
+
+    No Docker: the repo is cloned at ``base_commit``, the model's diff is
+    applied, the maintainer's test patch is applied, and the named tests run
+    with the repo's own pytest.  An instance whose 2022 dependencies cannot be
+    installed here is reported as ``environment_error`` and excluded from the
+    pass rate rather than scored as a model failure.
+    """
+    import json as _json
+    from pathlib import Path
+
+    from gigaforge.bench.swebench import load_instances, run_swebench, summarise
+
+    instances = load_instances(
+        dataset,
+        limit=limit,
+        repos=[repo] if repo else None,
+        instance_ids=[instance] if instance else None,
+    )
+    if not instances:
+        typer.echo("no instances matched the filter", err=True)
+        raise typer.Exit(code=2)
+
+    def _progress(line: str) -> None:
+        typer.echo(line, err=True)
+
+    results = run_swebench(instances, keep=keep, progress=_progress)
+    summary = summarise(results)
+    payload = {"summary": summary, "results": [r.to_dict() for r in results]}
+    if out:
+        Path(out).write_text(_json.dumps(payload, indent=2), encoding="utf-8")
+
+    typer.echo("")
+    typer.echo(f"{'instance':<44} {'status':<18} {'f2p':>7} {'tok':>8}")
+    typer.echo("-" * 82)
+    for r in results:
+        typer.echo(
+            f"{r.instance_id:<44} {r.status:<18} "
+            f"{r.fail_to_pass_passed}/{r.fail_to_pass_total:<5} "
+            f"{r.tokens_in + r.tokens_out:>8}"
+        )
+    typer.echo("-" * 82)
+    typer.echo(
+        f"{summary['passed']}/{summary['gradable']} gradable instances passed "
+        f"({summary['pass_rate']:.0%}); "
+        f"{summary['environment_errors']} environment error(s) excluded"
+    )
+    if summary["environment_errors"]:
+        typer.echo(
+            "  environment errors are NOT model failures: the 2022 dependency "
+            "set could not be built in this sandbox"
+        )
+
+
+@app.command()
+def outline(
+    goal: Annotated[str, typer.Argument(help="What the document is about.")],
+    sections: Annotated[
+        int, typer.Option("--sections", help="Default section count when the goal names none.")
+    ] = 4,
+    as_json: Annotated[bool, typer.Option("--json", help="Emit JSON.")] = False,
+) -> None:
+    """Show the document shape the harness derives from a goal.
+
+    The shape is a computation, not a model call: a goal that names its sections
+    gets exactly those, and a goal that does not gets a small default.  Asking a
+    model for structure produces a different answer each time, which makes the
+    document unmeasurable — and the live runs shipped documents whose every
+    section said "this section provides an overview of…".
+    """
+    import json as _json
+
+    from gigaforge.harness.document_pipeline import plan_document
+
+    plan = plan_document(goal, default_sections=sections)
+    if as_json:
+        typer.echo(
+            _json.dumps(
+                {
+                    "title": plan.outline.title,
+                    "min_chars": plan.min_chars,
+                    "sections": [
+                        {"title": s.title, "purpose": s.purpose}
+                        for s in plan.outline.sections
+                    ],
+                },
+                indent=2,
+            )
+        )
+        return
+    typer.echo(f"# {plan.outline.title}")
+    for i, section in enumerate(plan.outline.sections, 1):
+        typer.echo(f"  {i}. {section.title} — {section.purpose}")
+    typer.echo(f"  (minimum {plan.min_chars} chars)")
+
+
+@app.command()
+def prune(
+    observation: Annotated[
+        str, typer.Argument(help="Path to a JSON observation, or '-' for stdin.")
+    ] = "-",
+) -> None:
+    """Check a candidate observation against the prune set.
+
+    A candidate that trips a rule is rejected *before* it is scored: scoring
+    first teaches the search to leak, because a leaked answer scores well.
+    """
+    import json as _json
+    import sys as _sys
+    from pathlib import Path
+
+    from gigaforge.harness.prune import PRUNE_SET, check_prune
+
+    raw = _sys.stdin.read() if observation == "-" else Path(observation).read_text(encoding="utf-8")
+    try:
+        payload = _json.loads(raw)
+    except _json.JSONDecodeError as exc:
+        typer.echo(f"not JSON: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    if not isinstance(payload, dict):
+        typer.echo("the observation must be a JSON object", err=True)
+        raise typer.Exit(code=2)
+
+    verdict = check_prune(payload)
+    typer.echo(f"rules: {len(PRUNE_SET)}")
+    if verdict.pruned:
+        typer.echo("PRUNED")
+        for detail in verdict.details:
+            typer.echo(f"  - {detail}")
+        raise typer.Exit(code=1)
+    typer.echo("clean")
+
+
+@app.command()
+def evolve(
+    changes: Annotated[
+        str, typer.Argument(help="Path to a JSON proposal, or '-' for stdin.")
+    ] = "-",
+    rationale: Annotated[str, typer.Option("--rationale", help="Why this change.")] = "",
+) -> None:
+    """Validate a harness-surface proposal against the editable components.
+
+    Eight components are editable and everything else is frozen.  A surface that
+    can edit anything is not a surface, it is a rewrite — and a rewrite cannot be
+    attributed to a component, so it cannot be measured.
+    """
+    import json as _json
+    import sys as _sys
+    from pathlib import Path
+
+    from gigaforge.harness.evolve import EDITABLE_COMPONENTS, SurfaceSpec, propose
+
+    raw = _sys.stdin.read() if changes == "-" else Path(changes).read_text(encoding="utf-8")
+    try:
+        payload = _json.loads(raw)
+    except _json.JSONDecodeError as exc:
+        typer.echo(f"not JSON: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    if not isinstance(payload, dict):
+        typer.echo("the proposal must be a JSON object of component -> value", err=True)
+        raise typer.Exit(code=2)
+
+    incumbent = SurfaceSpec()
+    try:
+        proposal = propose(incumbent, payload, rationale=rationale)
+    except Exception as exc:  # noqa: BLE001 - a rejected proposal is the answer
+        typer.echo(f"REJECTED: {exc}", err=True)
+        typer.echo("editable components: " + ", ".join(EDITABLE_COMPONENTS), err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"accepted: {', '.join(sorted(proposal.changes))}")
+    if proposal.rationale:
+        typer.echo(f"rationale: {proposal.rationale}")
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # desktop application
 # ══════════════════════════════════════════════════════════════════════════

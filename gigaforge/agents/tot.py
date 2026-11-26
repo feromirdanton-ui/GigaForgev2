@@ -458,9 +458,8 @@ class ToTPlanner:
         latency_ms = int((time.monotonic() - started) * 1000)
 
         text = result.content or ""
-        usage = result.usage or {}
-        tokens_in = int(usage.get("prompt_tokens", 0) or 0)
-        tokens_out = int(usage.get("completion_tokens", 0) or 0)
+        from gigaforge.client.types import usage_tokens
+        tokens_in, tokens_out = usage_tokens(result.usage)
 
         try:
             claim.settle(tokens_in, tokens_out)
@@ -566,9 +565,8 @@ class ToTPlanner:
             raise
         latency_ms = int((time.monotonic() - started) * 1000)
         text = result.content or ""
-        usage = result.usage or {}
-        tokens_in = int(usage.get("prompt_tokens", 0) or 0)
-        tokens_out = int(usage.get("completion_tokens", 0) or 0)
+        from gigaforge.client.types import usage_tokens
+        tokens_in, tokens_out = usage_tokens(result.usage)
         try:
             claim.settle(tokens_in, tokens_out)
             self._budgets.check_overshoot("plan", task_id=task_id)

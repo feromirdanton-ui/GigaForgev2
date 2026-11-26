@@ -110,11 +110,29 @@ _NAMED_SECTION_RE = re.compile(
 
 
 def _named_sections(goal: str) -> list[str]:
-    """Section names the goal states, e.g. "with sections for intake, plan, act"."""
+    """Section names the goal states, e.g. "with sections for intake, plan, act".
+
+    Two shapes are natural and both are read: the explicit ``sections for a, b``
+    and a trailing colon list — ``… how the harness works: Intake, Plan, Act``.
+    The colon form was missed, so a goal that named its four sections got the
+    default Overview/Details/Considerations/Conclusion instead, and the document
+    was written to a shape the user had not asked for.
+    """
     match = _NAMED_SECTION_RE.search(goal or "")
-    if not match:
+    raw = match.group(1) if match else ""
+    if not raw:
+        # A trailing colon list: everything after the last colon, when it reads
+        # as a list of short titles rather than a sentence.
+        tail = (goal or "").rsplit(":", 1)
+        if len(tail) == 2:
+            candidate = tail[1].strip().rstrip(".")
+            parts = re.split(r",|\band\b|\bи\b|;", candidate)
+            if 2 <= len(parts) <= 8 and all(
+                0 < len(p.strip(" .;:")) <= 40 for p in parts
+            ):
+                raw = candidate
+    if not raw:
         return []
-    raw = match.group(1)
     parts = re.split(r",|\band\b|\bи\b|;", raw)
     titles: list[str] = []
     for part in parts:

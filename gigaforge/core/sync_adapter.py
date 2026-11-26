@@ -416,6 +416,16 @@ class _SyncProviderShim:
         self._client = client
 
     async def chat(self, messages: Any, **kwargs: Any) -> Any:
+        # ``task_id`` and ``phase`` are the adapter's own bookkeeping — the
+        # router uses them to attribute spend — and ``GigaClient.complete``
+        # does not accept them.  Forwarding them raised
+        # ``TypeError: GigaClient.complete() got an unexpected keyword argument
+        # 'task_id'`` on the very first model call of every run, and the
+        # exception was swallowed into "the model produced no plan".  Measured
+        # on SWE-bench: every instance reported a planning defect while the
+        # provider had never been reached.
+        kwargs.pop("task_id", None)
+        kwargs.pop("phase", None)
         return self._client.complete(messages, **kwargs)
 
     def capabilities(self) -> Any:
