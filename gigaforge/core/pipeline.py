@@ -370,6 +370,24 @@ def _document_placeholder_issue(diff: str, goal: str) -> str:
     return ""
 
 
+def _normalise_dag_error(value: Any) -> str:
+    """The DAG's error string, with a success word treated as no error.
+
+    ``"ok"`` is not an error, but it is a truthy string, so every branch in
+    ``_collect`` that asks ``if not error`` was skipped and a rejected run
+    reported ``error: "ok"``.  Measured live: a document refused by the contract
+    came back as ``status=rejected, accepted=False, error="ok"`` — the caller was
+    told nothing was wrong with a run that was refused.
+
+    The comparison is on the whole word: a reason that merely contains "ok" is a
+    reason.
+    """
+    text = str(value or "").strip()
+    if text.lower() in ("ok", "none", "success", "succeeded"):
+        return ""
+    return text
+
+
 def _tasks_completed(pipeline: Any, ctx: RunContext) -> int:
     """How many discrete tasks this run finished, at least 1.
 
@@ -4352,7 +4370,7 @@ class TaskPipeline:
         nodes = [r.to_dict() for r in dag.records]
         if loop_result is not None:
             nodes.append({"node": "fixloop", **loop_result.to_dict()})
-        error = str(dag.error or "")
+        error = _normalise_dag_error(dag.error)
         # The contract's verdict is the reason the run was refused, and it was
         # being dropped: ``settle`` recorded ``contract_unmet`` and moved on, so
         # ``_collect`` fell through to the fix-loop branch and reported
