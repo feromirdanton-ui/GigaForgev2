@@ -637,6 +637,26 @@ LooserBudgetTracker = None
 # --- BenchResult + Runner --------------------------------------------------
 
 
+def _bench_tokens(provider: Any, name: str) -> int:
+    """A token counter from whichever provider the runner was given.
+
+    The fake keeps ``usage_in``/``usage_out`` on itself; the real client accounts
+    per call and exposes nothing by those names.  Measured live, reading them
+    directly failed all five tasks with "AttributeError: 'GigaClient' object has
+    no attribute 'usage_in'" — after the work was done, so a live bench could
+    never report a number.
+
+    A missing counter reports 0 rather than raising: a missing *measurement* must
+    not turn a successful task into a failed one, and a zero is visibly absent.
+    """
+    value = getattr(provider, name, None)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, (float,)):
+        return int(value)
+    return 0
+
+
 @dataclass
 class BenchResult:
     """One task's bench outcome."""
@@ -949,7 +969,17 @@ class BenchRunner:
                     verify_error = f"{type(exc).__name__}: {exc}"
                     tests_passed = False
 
-        llm_calls = len(provider.chat_calls)
+        # The call count comes from the adapter whenever there is one, because
+        # only the fake records ``chat_calls``: measured live, every task failed
+        # with "AttributeError: 'GigaClient' object has no attribute
+        # 'chat_calls'" *after* doing its work, so a live bench could never
+        # report a result.  The adapter counts what it actually sent, so the
+        # number is comparable between the fake and the real provider.
+        adapter = getattr(client, "calls", None)
+        if isinstance(adapter, int):
+            llm_calls = adapter
+        else:
+            llm_calls = len(getattr(provider, "chat_calls", []) or [])
         pipeline.close()
         l0_store.close()
 
@@ -983,8 +1013,8 @@ class BenchRunner:
             success=bool(result.accepted) and artifact_ok,
             cache_hit=bool(result.cache_hit),
             llm_calls=llm_calls,
-            tokens_in=provider.usage_in,
-            tokens_out=provider.usage_out,
+            tokens_in=_bench_tokens(provider, "usage_in"),
+            tokens_out=_bench_tokens(provider, "usage_out"),
             latency_s=latency,
             applied_files=list(result.changed_files),
             diff_substring_found=diff_substring_found,
