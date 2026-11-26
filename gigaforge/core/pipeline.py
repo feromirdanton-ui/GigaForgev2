@@ -4209,6 +4209,27 @@ class TaskPipeline:
             self._event("pipeline.wcag_unavailable", run_id=ctx.run_id,
                         reason=str(report.error)[:200])
             return []
+        # **Repair before rejecting.**  A failing contrast is a colour, and a
+        # colour is computable: ``repair`` walks the luminance axis until AA is
+        # met.  Rejecting without trying the deterministic fix spends a whole
+        # model round on something arithmetic can do -- measured live, the
+        # cyberpunk page failed at 3.14 and 2.50 and the run was rejected with
+        # the repair available and unused.
+        if report.failures:
+            try:
+                from gigaforge.harness.wcag import repair
+
+                fixed = repair(page, out=page)
+                if fixed.get("fixed"):
+                    self._event(
+                        "pipeline.wcag_repaired", run_id=ctx.run_id,
+                        changes=len(fixed["fixed"]),
+                        detail=[str(c)[:80] for c in fixed["fixed"][:4]],
+                    )
+                    report = measure(page)
+                    ctx.extras["wcag"] = report.to_dict()
+            except Exception as exc:  # noqa: BLE001 - repair is best-effort
+                self._degraded("wcag_repair", exc, "settle")
         self._event(
             "pipeline.wcag", run_id=ctx.run_id,
             min_ratio=report.min_ratio, failures=len(report.failures),

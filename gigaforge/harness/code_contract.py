@@ -33,7 +33,77 @@ __all__ = [
     "CodeVerdict",
     "public_symbols",
     "check_code_contract",
+    "repair_indentation",
 ]
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def repair_indentation(source: str) -> tuple[str, str]:
+    """Fix a block indented deeper than its parent allows, or return it unchanged.
+
+    **The case the diff repair cannot see.**  ``normalize_hunk_indentation``
+    fixes a hunk whose *context* disagrees with the file.  Measured live on
+    ``toy-validate-email``: the model wrote a body four spaces too deep inside a
+    function whose context matched perfectly, so every delta was zero and the
+    hunk passed through untouched.  The file then failed with
+    ``math_utils.py:15: unexpected indent`` and the run was rejected with the
+    repair available and unused.
+
+    The repair is arithmetic, not judgement: Python's rule says a line after one
+    ending in ``:`` sits one level deeper, and any other line sits at the level
+    of the enclosing block.  When the offending line is deeper than that, the
+    excess is removed from it and from every following line of its block.
+
+    Accepted only if the result parses.  A repair that does not make the file
+    valid is not a repair, and the original is returned with an empty reason.
+    """
+    try:
+        ast.parse(source)
+        return source, ""
+    except SyntaxError as exc:
+        if "indent" not in (exc.msg or "").lower():
+            return source, ""
+        lineno = exc.lineno or 0
+
+    lines = source.splitlines()
+    if not (1 <= lineno <= len(lines)):
+        return source, ""
+
+    # The enclosing line: the nearest non-blank line above the offender.
+    prev = lineno - 2
+    while prev >= 0 and not lines[prev].strip():
+        prev -= 1
+    if prev < 0:
+        return source, ""
+    expected = _indent(lines[prev]) + (4 if lines[prev].rstrip().endswith(":") else 0)
+    actual = _indent(lines[lineno - 1])
+    if actual <= expected:
+        # Not the "too deep" case; a different defect, and guessing at it would
+        # be a repair that changes code it does not understand.
+        return source, ""
+
+    delta = actual - expected
+    repaired = list(lines)
+    # The offender and every following line at least as deep as it: the block
+    # that was written one level too far in.  A line that dedents below the
+    # offender belongs to an enclosing block and is left alone.
+    for index in range(lineno - 1, len(lines)):
+        line = lines[index]
+        if not line.strip():
+            continue
+        if _indent(line) < actual:
+            break
+        repaired[index] = line[delta:] if _indent(line) >= delta else line.lstrip()
+
+    candidate = "\n".join(repaired) + ("\n" if source.endswith("\n") else "")
+    try:
+        ast.parse(candidate)
+    except SyntaxError:
+        return source, ""
+    return candidate, f"dedented {delta} space(s) from line {lineno} and its block"
 
 
 def public_symbols(source: str) -> set[str]:
@@ -85,6 +155,8 @@ class CodeVerdict:
     not_checked: list[str] = field(default_factory=list)
     #: Human-readable reasons the verdict is not ok.
     unmet: list[str] = field(default_factory=list)
+    #: Defects the contract repaired itself, before judging.
+    repairs: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -96,6 +168,7 @@ class CodeVerdict:
             "tests_passed": self.tests_passed,
             "not_checked": list(self.not_checked),
             "unmet": list(self.unmet),
+            "repairs": list(self.repairs),
         }
 
 
@@ -182,8 +255,26 @@ def check_code_contract(
         try:
             ast.parse(after)
         except SyntaxError as exc:
-            verdict.syntax_errors.append(f"{path}:{exc.lineno}: {exc.msg}")
-            continue
+            # **Repair before rejecting.**  An indentation error is arithmetic:
+            # the block sits deeper than its parent allows, and the excess is
+            # computable.  Rejecting without trying the deterministic repair
+            # spends a whole model round on something a shift can do -- measured
+            # live on ``toy-validate-email``: 2 of 3 attempts failed at
+            # ``math_utils.py:15: unexpected indent`` with the repair available
+            # and unused.
+            repaired, why = repair_indentation(after)
+            if why:
+                try:
+                    target.write_text(repaired, encoding="utf-8")
+                    verdict.repairs.append(f"{path}:{exc.lineno}: {why}")
+                    after = repaired
+                except OSError:
+                    # A read-only tree is not a reason to accept a broken file.
+                    verdict.syntax_errors.append(f"{path}:{exc.lineno}: {exc.msg}")
+                    continue
+            else:
+                verdict.syntax_errors.append(f"{path}:{exc.lineno}: {exc.msg}")
+                continue
         if before and path in before:
             was = public_symbols(before[path])
             now = public_symbols(after)

@@ -75,15 +75,36 @@ class _Stub(TaskPipeline):
 
 
 @PLAYWRIGHT
-def test_white_on_white_is_rejected_with_the_ratio_and_the_text(tmp_path: Path) -> None:
-    """The defect the live run shipped: unreadable, and accepted."""
-    (tmp_path / "index.html").write_text(WHITE_ON_WHITE, encoding="utf-8")
+def test_white_on_white_is_never_accepted_unreadable(tmp_path: Path) -> None:
+    """The defect the live run shipped: unreadable, and accepted.
+
+    **The invariant is not "rejected" -- it is "not accepted unreadable".**  A
+    failing contrast is a colour, and a colour is computable, so the gate now
+    repairs before it judges.  Either outcome is correct: the page is repaired
+    until it passes, or it is rejected with the ratio.  What must never happen
+    is the third outcome -- the run is accepted and the page is still
+    unreadable.
+    """
+    page = tmp_path / "index.html"
+    page.write_text(WHITE_ON_WHITE, encoding="utf-8")
     pipeline = _Stub(tmp_path)
     unmet = pipeline._check_wcag(_Ctx(), ["index.html"])
-    assert unmet, "white text on a white card must be rejected"
-    assert "1.10" in unmet[0] or "< 3.0" in unmet[0] or "< 4.5" in unmet[0]
-    # The message names the text so the repair loop knows what to change.
-    assert "Comfortable cat play areas" in unmet[0] or "cat" in unmet[0].lower()
+
+    if unmet:
+        # Rejected: the message must carry the number and name the text, so the
+        # repair loop knows what to change.
+        assert "1.10" in unmet[0] or "< 3.0" in unmet[0] or "< 4.5" in unmet[0]
+        assert "Comfortable cat play areas" in unmet[0] or "cat" in unmet[0].lower()
+    else:
+        # Repaired: the file on disk must now actually pass.
+        from gigaforge.harness.wcag import measure
+
+        after = measure(page)
+        assert not after.failures, (
+            "the gate accepted the page without rejecting it and without "
+            f"repairing it: min ratio {after.min_ratio}"
+        )
+        assert after.min_ratio >= 3.0
 
 
 @PLAYWRIGHT
