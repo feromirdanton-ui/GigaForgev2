@@ -169,20 +169,75 @@ def _reindent_hunk(
                 break
         new_body.append(marker + _shift(content, delta))
 
-    if new_body == body:
-        return header, body, False
+    def _parses(lines: list[str]) -> bool:
+        new_side = [line[1:] for line in lines if line[:1] in (" ", "+")]
+        candidate = (
+            file_lines[:best_pos] + new_side + file_lines[best_pos + len(old_text):]
+        )
+        try:
+            ast.parse("\n".join(candidate) + "\n")
+        except SyntaxError:
+            return False
+        return True
 
-    # Accept only a repair that makes the file parse.  Simulate the apply against
-    # the matched window, then hand the result to the same gate the product uses.
-    new_side = [line[1:] for line in new_body if line[:1] in (" ", "+")]
-    candidate = (
-        file_lines[:best_pos] + new_side + file_lines[best_pos + len(old_text):]
-    )
-    try:
-        ast.parse("\n".join(candidate) + "\n")
-    except SyntaxError:
-        return header, body, False
-    return header, new_body, True
+    # If the hunk already produces a file that parses, it is not broken and
+    # must be left byte-for-byte alone.  The first version of the shift search
+    # below ran unconditionally and "repaired" a correct hunk into an invalid
+    # one -- a repair pass that can damage a working diff is worse than none.
+    if _parses(new_body):
+        return header, new_body, new_body != body
+
+    # **The case the delta cannot see.**  When the hunk's *context* lines match
+    # the file exactly, every delta is 0 and the added lines are left as the
+    # model wrote them -- so a body indented four spaces too deep survives the
+    # repair untouched.  Measured on the live bench: ``toy-validate-email``
+    # failed 1 of 3 repeats with ``math_utils.py:21: unexpected indent`` while
+    # the context matched perfectly, which is why the earlier fix (correct for
+    # the mismatched-context case) did not cover it.
+    #
+    # The added block's own indentation is the unknown, so try the plausible
+    # shifts and keep the first that parses.  Deterministic, bounded, and gated
+    # by the same parser the product uses: a shift that does not make the file
+    # valid is not a repair.
+    added_idx = [k for k, line in enumerate(new_body) if line[:1] == "+"]
+    if added_idx:
+        # A uniform shift is not enough when the block is internally
+        # inconsistent -- ``if`` at 8 with its body at 4 is not fixed by moving
+        # every line the same amount.  Re-derive the block's indentation from
+        # Python's own rule instead: a line after one ending in ``:`` is one
+        # level deeper, a line that dedents returns to an enclosing level.
+        # Then anchor the block at the indentation its context implies.
+        anchor = 0
+        for back in range(added_idx[0] - 1, -1, -1):
+            if new_body[back][:1] in (" ", "-"):
+                anchor = _indent_of(new_body[back][1:])
+                if new_body[back][1:].rstrip().endswith(":"):
+                    anchor += 4
+                break
+        trial = list(new_body)
+        levels = [anchor]
+        prev_indent = anchor
+        prev_opens = False
+        for k in added_idx:
+            content = trial[k][1:]
+            if not content.strip():
+                trial[k] = "+"
+                continue
+            if prev_opens:
+                indent = prev_indent + 4
+                levels.append(indent)
+            else:
+                current = _indent_of(content)
+                while len(levels) > 1 and levels[-1] > current:
+                    levels.pop()
+                indent = levels[-1]
+            trial[k] = "+" + " " * indent + content.lstrip()
+            prev_indent = indent
+            prev_opens = content.rstrip().endswith(":")
+        if trial != new_body and _parses(trial):
+            return header, trial, True
+
+    return header, body, False
 
 
 def normalize_hunk_indentation(diff: str, root: Path) -> tuple[str, RepairReport]:

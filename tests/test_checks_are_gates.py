@@ -241,3 +241,80 @@ def test_a_host_is_not_a_path(goal, expected):
     from gigaforge.harness.task_kind import _named_paths
 
     assert _named_paths(goal) == expected
+
+
+# ── the indent repair must cover the case the delta cannot see ──────────────
+
+def test_over_indented_added_lines_are_repaired_when_context_matches(tmp_path):
+    """The live bench's ``toy-validate-email`` failure, 1 of 3 repeats.
+
+    The repair shifted lines by the *context* delta.  When the context matches
+    the file exactly every delta is 0, so a body indented four spaces too deep
+    survived untouched and the file failed to parse with ``unexpected indent``.
+    The earlier fix was correct for mismatched context and blind to this case.
+    """
+    from gigaforge.harness.diff_repair import normalize_hunk_indentation
+
+    (tmp_path / "math_utils.py").write_text(
+        "def add(a, b):\n    return a + b\n\n\n"
+        "def validate_email(value):\n    return '@' in value\n",
+        encoding="utf-8",
+    )
+    # The added block is internally inconsistent: the ``if`` sits at 8 spaces
+    # and its body at 4, so the file does not parse.  (A uniformly over-indented
+    # block *is* valid Python -- the first version of this test used one and
+    # asserted a repair that no parser would ask for.)
+    diff = (
+        "--- a/math_utils.py\n+++ b/math_utils.py\n@@ -5,2 +5,4 @@\n"
+        " def validate_email(value):\n"
+        "-    return '@' in value\n"
+        "+        if not value:\n"
+        "+    return False\n"
+        "+        return '@' in value\n"
+    )
+    out, report = normalize_hunk_indentation(diff, tmp_path)
+    assert report.changed is True
+    assert "+    if not value:" in out
+    assert "+        return False" in out
+
+
+def test_a_repair_that_does_not_parse_is_refused(tmp_path):
+    """The control: a shift that leaves the file invalid is not a repair."""
+    from gigaforge.harness.diff_repair import normalize_hunk_indentation
+
+    (tmp_path / "m.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    diff = (
+        "--- a/m.py\n+++ b/m.py\n@@ -1,2 +1,3 @@\n"
+        " def f():\n"
+        "-    return 1\n"
+        "+    return 1\n"
+        "+def broken(:\n"
+    )
+    out, report = normalize_hunk_indentation(diff, tmp_path)
+    assert report.changed is False
+    assert out == diff
+
+
+# ── evolve validates values, not only names ─────────────────────────────────
+
+def test_a_negative_ladder_threshold_is_rejected():
+    """``attempts_before_escalation: -1`` was accepted by the CLI.
+
+    The ladder compares ``attempt >= threshold``, so a negative threshold
+    escalates every call and the cheap model is never used -- a proposal that
+    "improves" the bench by spending the flagship on everything.  The value
+    check lived only in ``compose_surface``; ``propose`` is the CLI's entry
+    point, so the command that exists to reject it reported "accepted".
+    """
+    from gigaforge.harness.evolve import SurfaceSpec, propose
+
+    with pytest.raises(ValueError, match="must be >= 0"):
+        propose(SurfaceSpec(), {"ladder_thresholds": {"attempts_before_escalation": -1}})
+
+
+def test_a_sane_ladder_threshold_is_accepted():
+    """The control: a real tuning change must still pass."""
+    from gigaforge.harness.evolve import SurfaceSpec, propose
+
+    proposal = propose(SurfaceSpec(), {"ladder_thresholds": {"attempts_before_escalation": 3}})
+    assert proposal.changes["ladder_thresholds"]["attempts_before_escalation"] == 3

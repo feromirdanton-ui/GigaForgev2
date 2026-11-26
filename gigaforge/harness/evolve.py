@@ -203,6 +203,13 @@ def propose(
             "a proposal may only touch the declared surface; unknown "
             f"component(s): {', '.join(sorted(unknown))}"
         )
+    # Validate the *value*, not only the name.  The check lived in
+    # ``compose_surface`` alone, and ``propose`` is the entry point the CLI
+    # uses -- so ``{"ladder_thresholds": {"attempts_before_escalation": -1}}``
+    # was reported "accepted" by the command that exists to reject it.  A
+    # validation that only one of two entry points performs is not a contract.
+    for key, value in changes.items():
+        _check_component_value(key, value)
     current = incumbent.to_dict()
     effective = {k: v for k, v in changes.items() if current.get(k) != v}
     if not effective:
@@ -221,8 +228,48 @@ def compose_surface(incumbent: SurfaceSpec, proposal: Proposal) -> SurfaceSpec:
     for key, value in proposal.changes.items():
         if key not in EDITABLE_COMPONENTS:
             raise ValueError(f"unknown component {key!r}")
+        _check_component_value(key, value)
         merged[key] = copy.deepcopy(value)
     return SurfaceSpec.from_dict(merged)
+
+
+def _check_component_value(key: str, value: Any) -> None:
+    """Reject a value the harness cannot act on.
+
+    **Why the surface check was not enough.**  ``compose_surface`` verified the
+    *name* of every component and nothing about its value, so
+    ``{"ladder_thresholds": {"attempts_before_escalation": -1}}`` was accepted
+    as a valid proposal.  A negative threshold is not a tuning choice: the
+    ladder compares ``attempt >= threshold``, so every call would escalate
+    immediately and the cheap model would never be used -- a proposal that
+    "improves" the bench by spending the flagship on everything.  The surface
+    is a contract about shape; a contract that accepts any value is a name
+    check wearing a contract's clothes.
+    """
+    if key == "ladder_thresholds":
+        if not isinstance(value, Mapping):
+            raise ValueError("ladder_thresholds must be an object")
+        for name, threshold in value.items():
+            if not isinstance(threshold, (int, float)) or isinstance(threshold, bool):
+                raise ValueError(f"ladder_thresholds[{name!r}] must be a number")
+            if threshold < 0:
+                raise ValueError(
+                    f"ladder_thresholds[{name!r}] must be >= 0, got {threshold}"
+                )
+    elif key == "context_budget":
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError("context_budget must be a non-negative integer")
+    elif key in {"skills", "tool_set"}:
+        if not isinstance(value, (list, tuple)) or not all(
+            isinstance(item, str) for item in value
+        ):
+            raise ValueError(f"{key} must be a list of strings")
+    elif key in {"phase_prompts", "contracts", "retry_policy"}:
+        if not isinstance(value, Mapping):
+            raise ValueError(f"{key} must be an object")
+    elif key == "system_prompt":
+        if not isinstance(value, str):
+            raise ValueError("system_prompt must be a string")
 
 
 def compose(
