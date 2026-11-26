@@ -143,6 +143,16 @@ class ReActState(TypedDict, total=False):
     #: How many times the contract has sent the episode back to fix the file.
     contract_retries: int
     contract_unmet: list[str]
+    #: The episode's own prose when the deliverable is text, not a diff.
+    #:
+    #: **Why this field had to exist.**  ``ReActResult.final_text`` is what the
+    #: answer path reads, and the classic loop set it (``react.py:1245``).  The
+    #: LangGraph engine — the product path — never did, because ``_to_result``
+    #: had no field to read it from.  So every text product produced an empty
+    #: answer and the run was rejected with "the run produced no text", while
+    #: the model had answered correctly.  Measured on both text fixtures: the
+    #: fake returned the document as ``finish`` prose and the result was empty.
+    final_text: str
 
 
 def _writer() -> Callable[[dict[str, Any]], None]:
@@ -558,6 +568,9 @@ def build_react_graph(
         out: dict[str, Any] = {
             "finished": True,
             "finish_reason": "finish_action",
+            # The prose the model finished with.  For a text product this IS the
+            # deliverable; for a patch it is the plan's rationale and is ignored.
+            "final_text": str(gstate.get("action_input") or "").strip(),
             "plan": [
                 step.model_dump() if hasattr(step, "model_dump") else (
                     step.to_dict() if hasattr(step, "to_dict") else dict(step)
@@ -662,6 +675,10 @@ def _to_result(values: Mapping[str, Any]) -> ReActResult:
     # The files the episode wrote travel with the result: the pipeline turns
     # them into a diff, and the contract checks them instead of the worktree.
     result.written_files = list(values.get("written_files") or [])
+    # The episode's prose.  A text product's deliverable is this string, and the
+    # classic loop set it while this engine did not — so the product path
+    # returned an empty answer for every answer/document/analysis goal.
+    result.final_text = str(values.get("final_text") or "")
     result.error = str(values.get("error") or "")
     return result
 

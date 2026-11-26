@@ -746,7 +746,8 @@ class TaskPipeline:
                 fn=self._node_settle,
                 requires=("proposal", "validation", "fix_report", "review_verdict", "repair_report"),
                 provides=("final_diff", "accepted", "changed_files",
-                          "answer", "answer_citations", "answer_searched"),
+                          "answer", "answer_citations", "answer_searched",
+                          "answer_reason"),
                 retries=0,
                 description="join node: pick the diff that won, then apply the review veto",
             ),
@@ -3058,6 +3059,23 @@ class TaskPipeline:
                 accepted=False, applied=False,
                 reason="the run produced no answer text",
             )
+        # A reply that is a tool call is not a reply.  Measured live: the
+        # document goal returned
+        #
+        #     ```diff
+        #     write_file("how_gigaforge_run_works.md", """# How ...""")
+        #     ```
+        #
+        # and it was accepted, because the text was non-empty and the sections
+        # were in it.  The person asked for a document and got a code block
+        # describing how to write one.  The check is deterministic: a reply whose
+        # body is a fenced block containing a call-shaped line is an envelope,
+        # not a product.
+        envelope = _tool_envelope_issue(text)
+        if envelope:
+            return ValidateResult(
+                accepted=False, applied=False, reason=envelope,
+            )
         citations = list(ctx.extras.get("answer_citations") or [])
         searched = bool(ctx.extras.get("answer_searched"))
         if searched and not citations:
@@ -3590,15 +3608,27 @@ class TaskPipeline:
         # changed files.
         if _task_kind_for(self, ctx).is_text_product:
             answer = str(ctx.extras.get("answer_text") or "")
+            # The verdict's reason must survive into the result.  Measured live:
+            # a document reply that was a `write_file(...)` envelope was
+            # correctly rejected by `_validate_answer`, and the report said
+            # "the model did not produce a diff" — a message about a diff, for a
+            # run that never had one.  The rejection was right and the
+            # explanation was wrong, which is worse than either alone: the
+            # operator cannot tell a bad answer from a broken harness.
+            answer_reason = str(getattr(validation, "reason", "") or "")
+            if not validated and answer_reason:
+                ctx.extras["answer_reject_reason"] = answer_reason
             self._event(
                 "pipeline.settle_answer", run_id=ctx.run_id,
                 accepted=validated, chars=len(answer),
+                reason=answer_reason[:300],
             )
             return {
                 "accepted": validated,
                 "changed_files": [],
                 "final_diff": "",
                 "answer": answer,
+                "answer_reason": answer_reason,
                 "answer_citations": list(ctx.extras.get("answer_citations") or []),
                 "answer_searched": bool(ctx.extras.get("answer_searched")),
             }
@@ -3724,6 +3754,7 @@ class TaskPipeline:
             # Empty here: this is a diff-producing run, and an empty answer is
             # the honest value for it.
             "answer": "", "answer_citations": [], "answer_searched": False,
+            "answer_reason": "",
         }
 
     def _check_code_contract(self, ctx: RunContext, changed: Sequence[str]) -> list[str]:
@@ -4450,8 +4481,17 @@ class TaskPipeline:
         # A caller was told the run produced something un-validatable when the
         # truth was "found placeholders: 'feature 1', 'feature 2'".
         if not bool(artifacts.get("accepted")):
+            # A text product's rejection has its own reason, and it is the only
+            # correct one: the branches below all explain a *diff*, and a reply
+            # has none.  Measured live: a document reply that was a
+            # `write_file(...)` envelope was rejected for exactly that, and the
+            # report said "the model did not produce a diff" — true, irrelevant,
+            # and it hid the real defect.
+            answer_reason = str(artifacts.get("answer_reason") or "").strip()
+            if answer_reason:
+                error = answer_reason
             unmet = list(ctx.extras.get("contract_unmet") or [])
-            if unmet:
+            if unmet and not answer_reason:
                 contract_reason = "the artifact did not meet the goal: " + "; ".join(
                     str(item) for item in unmet[:6]
                 )
@@ -5252,6 +5292,49 @@ def _merge_focused_creation(
     result.reason = validation.reason or "focused creation was rejected"
     missing = sorted(requested.difference(all_files)) or ["focused file creation was rejected"]
     return {"accepted": False, "files": created_files, "missing": missing}
+
+
+def _tool_envelope_issue(text: str) -> str:
+    """The reason a reply is a tool call rather than an answer, or ``""``.
+
+    **The failure.**  A text product's reply is the deliverable, so a reply that
+    *describes* how to produce the deliverable is a miss.  Measured live on the
+    document goal: the answer was a fenced ``diff`` block containing
+    ``write_file("how_gigaforge_run_works.md", \"\"\"# How ...\"\"\")``.  Every
+    section title was in it, so the section check passed and the run was
+    accepted — the person asked for a document and got a code block.
+
+    **The rule.**  A reply is an envelope when its *body* is a fenced block and
+    that block contains a call-shaped line: an identifier followed by ``(`` at
+    the start of a line, or a ``write_file``/``create_file``/``apply_patch``
+    name anywhere.  Prose that happens to contain a code sample is not an
+    envelope — the check requires the fenced block to be most of the reply.
+    """
+    import re as _re
+
+    stripped = text.strip()
+    if not stripped:
+        return ""
+    fence = _re.match(r"^```[a-zA-Z0-9_-]*\s*\n(.*?)\n```\s*$", stripped, _re.DOTALL)
+    if not fence:
+        return ""
+    body = fence.group(1)
+    # The fenced block must be most of the reply: a short code sample inside a
+    # long answer is a sample, not an envelope.
+    if len(body) < 0.6 * len(stripped):
+        return ""
+    call_shaped = _re.search(
+        r"^\s*(?:write_file|create_file|apply_patch|edit_file|str_replace|"
+        r"[a-z_][a-z0-9_]*)\s*\(",
+        body,
+        _re.MULTILINE,
+    )
+    if not call_shaped:
+        return ""
+    return (
+        "the reply is a tool call, not an answer: it is a fenced block "
+        "containing a call-shaped line. Write the product itself."
+    )
 
 
 def _fallback_summary(accepted: bool, diff: str) -> str:

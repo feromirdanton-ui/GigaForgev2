@@ -621,7 +621,21 @@ class BenchFakeGigaClient:
         tokens_in = sum(len(str(m.get("content", "") or "")) for m in messages) // 4 + 4
         if phase == "react":
             self._react_calls += 1
-            if self._react_calls == 1:
+            # A text product's executor IS the ReAct episode: its ``finish``
+            # prose is the deliverable.  The fake used to answer every react
+            # call with a plan, so a text fixture produced no text at all and
+            # the bench reported "the run produced no text" — a bench defect
+            # masquerading as a harness defect.  Measured: both text fixtures
+            # failed for this reason and no product code was involved.
+            if self._fixture.text_responses:
+                body = {
+                    "thought": "The answer is ready.",
+                    "action": "finish",
+                    "action_input": self._fixture.text_responses.get(
+                        "summarize", ""
+                    ),
+                }
+            elif self._react_calls == 1:
                 body = {
                     "thought": "Locate the target before planning.",
                     "action": "grep",
