@@ -59,7 +59,7 @@ _CSS = """
      Measured before this split: ``#328df2`` as text on the diff background
      ``#f7fbff`` was 3.24 against the 4.5 AA floor -- the hunk header of every
      diff was the least readable line on the page.  ``#1766c2`` is 5.44 on the
-     same background and 5.23 on the page background, so one token covers
+     same background and 5.29 on the page background, so one token covers
      every surface the panel paints text on. */
   --accent:#328df2; --accent-ink:#1766c2; --accent2:#21b6d2;
   --ok:#1da96a; --ok-ink:#147a4c; --warn:#bd7b11; --warn-ink:#8a5a08;
