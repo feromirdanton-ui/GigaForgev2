@@ -4150,11 +4150,43 @@ class TaskPipeline:
                 "level": int(level) if level is not None else None,
                 "attempt": int(attempt),
                 "repeat": int(repeats),
-                "model": str(getattr(result, "model", "") or ""),
+                "model": str(
+                    getattr(result, "model", "")
+                    or getattr(usage, "model", "")
+                    or ""
+                ),
                 "tokens_in": int(getattr(usage, "prompt_tokens", 0) or 0),
                 "tokens_out": int(getattr(usage, "completion_tokens", 0) or 0),
                 "latency_ms": int(getattr(result, "latency_ms", 0) or 0),
             }
+            # The client's result does not always carry ``model``: the providers
+            # omit it on streamed answers, and a client that returns a plain
+            # dataclass may leave it ``None``.  Measured live: the routing table
+            # recorded an empty model string on a call that had just been served
+            # by GigaChat-2, which makes the measurement useless for the one
+            # question it exists to answer — which model actually served this?
+            if not row["model"]:
+                # The router already knows which model it used for this phase —
+                # it wrote it into the phase usage.  Reading it there is the same
+                # number from the same place, not a re-derivation.
+                entries = getattr(ctx.state, "phase_usages", None) or {}
+                entry = entries.get(phase) if isinstance(entries, Mapping) else None
+                if isinstance(entry, Mapping):
+                    row["model"] = str(entry.get("model", "") or "")
+                elif entry is not None:
+                    row["model"] = str(getattr(entry, "model", "") or "")
+            if not row["tokens_in"] and not row["tokens_out"]:
+                # Fall back to the router's own accounting for this phase: it is
+                # priced there already, and re-reading the provider response here
+                # would be a second source of truth for the same number.
+                accounted = getattr(self.router, "usage", None)
+                if callable(accounted):
+                    try:
+                        data = accounted(phase) or {}
+                        row["tokens_in"] = int(data.get("prompt_tokens", 0) or 0)
+                        row["tokens_out"] = int(data.get("completion_tokens", 0) or 0)
+                    except Exception:  # noqa: BLE001 - measurement only
+                        pass
             ctx.state.routing.append(row)
             self._event(
                 "pipeline.route",
