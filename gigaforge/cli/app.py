@@ -1403,6 +1403,65 @@ def search(
             typer.echo(f"  - {item}")
 
 
+@app.command()
+def lessons(
+    observation: Annotated[
+        str, typer.Argument(help="Path to a run observation JSON, or '-' for stdin.")
+    ] = "-",
+    task: Annotated[str, typer.Option("--task", help="Task name for the citation.")] = "",
+    store: Annotated[
+        Optional[Path],
+        typer.Option("--store", help="Improvement-harness JSON to read and update."),
+    ] = None,
+) -> None:
+    """Reflect on a run and update the improvement harness.
+
+    **The second level of recursion.**  ``search`` reads the trajectory of one
+    task's refinement; this reads across tasks.  A lesson is a claim *with a
+    citation* and running confirmations -- a reflection with no evidence is
+    advice that cannot be confirmed or removed, and after twenty tasks the
+    improvement harness is a pile of it.
+
+    Without ``--store`` it only reports what this run taught; with it, the run's
+    lessons are merged in and a lesson contradicted more often than confirmed is
+    retired.
+    """
+    import json
+    import sys as _sys
+
+    from gigaforge.harness.lessons import ImprovementHarness, reflect
+
+    raw = _sys.stdin.read() if observation == "-" else Path(observation).read_text(encoding="utf-8")
+    try:
+        payload = json.loads(raw or "{}")
+    except json.JSONDecodeError as exc:
+        typer.echo(f"the observation is not JSON: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    if not isinstance(payload, dict):
+        typer.echo("the observation must be a JSON object", err=True)
+        raise typer.Exit(code=2)
+
+    harness = ImprovementHarness.load(store) if store else ImprovementHarness()
+    found = reflect(payload, task=task)
+    for lesson in found:
+        harness.add(lesson)
+
+    if not found:
+        typer.echo("this run taught nothing: no pattern crossed the threshold")
+    for lesson in found:
+        typer.echo(f"{lesson.kind}: {lesson.claim}")
+        typer.echo(f"  evidence: {lesson.evidence}")
+    active = harness.active()
+    retired = harness.retired()
+    typer.echo(f"lessons active: {len(active)}, retired: {len(retired)}")
+    components = harness.components_to_try()
+    if components:
+        typer.echo("components these lessons point at: " + ", ".join(components))
+    if store:
+        harness.save(store)
+        typer.echo(f"saved to {store}")
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # desktop application
 # ══════════════════════════════════════════════════════════════════════════
