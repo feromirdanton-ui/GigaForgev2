@@ -155,6 +155,7 @@ def check_acceptance(
     *,
     accepted_paths: Sequence[str] = (),
     config: Any = None,
+    screen_leakage: bool = True,
 ) -> AcceptanceVerdict:
     """Decide whether one child's diff may be merged.
 
@@ -164,11 +165,19 @@ def check_acceptance(
       contribution, it is the output of a run the pipeline already refused;
     * it produced a diff at all;
     * the diff parses;
+    * **it does not encode the task** (the leakage screen, below);
     * every path it touches is inside ``item.owns_paths``;
     * no path it touches is already claimed by an accepted sibling.
 
     The last two are what make the merge safe.  Without them the merge is a
     race whose winner is whichever child was concatenated last.
+
+    **Why the leakage screen runs here and not after scoring.**  A change that
+    special-cases the task it was produced for can score perfectly and help
+    nobody.  Screening it *before* the verdict means a leaked diff is never
+    merged, so it can never become the thing the next run is measured against.
+    The screen is narrow on purpose — see ``harness/critic.py`` — and a finding
+    is a rejection with a reason, never a silent rewrite.
     """
     verdict = AcceptanceVerdict(accepted=False)
     if not bool(getattr(result, "ok", False)):
@@ -186,6 +195,22 @@ def check_acceptance(
         verdict.reasons.append("child's diff could not be parsed")
         return verdict
     verdict.paths = paths
+    if screen_leakage:
+        try:
+            from gigaforge.harness.critic import screen_diff
+
+            leak = screen_diff(
+                diff,
+                goal=str(getattr(item, "goal", "") or ""),
+                task_names=(str(getattr(item, "name", "") or ""),),
+            )
+            if leak.leaked:
+                verdict.reasons.append(
+                    "the change encodes the task instead of solving it: "
+                    + "; ".join(leak.reasons()[:3])
+                )
+        except Exception:  # noqa: BLE001 - a screen must not fail a merge
+            pass
     if item.owns_paths:
         outside = [p for p in paths if not _matches(p, item.owns_paths)]
         if outside:

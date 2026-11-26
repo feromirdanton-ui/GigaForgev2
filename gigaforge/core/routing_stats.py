@@ -21,7 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
-__all__ = ["LevelStats", "routing_table", "routing_advice"]
+__all__ = ["LevelStats", "CostVerdict", "routing_table", "routing_advice", "cost_rule"]
 
 #: The ladder's rungs, in order.  Kept as plain ints so this module does not
 #: import the ladder and cannot create a cycle.
@@ -153,3 +153,119 @@ def routing_advice(table: Sequence[LevelStats]) -> list[str]:
     if not table:
         notes.append("no levelled calls in this run: the ladder was not consulted")
     return notes
+
+
+#: How much more a rung may cost per accepted result before it is called out.
+#: 1.0 means "any extra cost must be paid for by extra acceptance"; a rung that
+#: costs 2x and accepts the same share is not buying anything.
+COST_RULE_TOLERANCE = 1.0
+
+
+@dataclass
+class CostVerdict:
+    """Whether a rung's extra tokens were paid for by extra acceptance.
+
+    **The rule.**  A higher rung is justified only when the *cost per accepted
+    result* is not worse than the rung below it.  That is the honest form of
+    "tokens must be paid for by improvement": a rung that costs twice as much
+    and accepts the same fraction of calls has bought nothing, and a rung that
+    costs twice as much and accepts twice the fraction has paid for itself
+    exactly.
+
+    **Why per accepted result and not per call.**  Per-call cost is the price of
+    asking; per-accepted is the price of *getting*.  A cheap model that fails
+    half the time is not cheap — the retries are the cost.  This is the number
+    that answers "is L3 worth it", and it is computable from the rows the
+    pipeline already writes.
+    """
+
+    level: int
+    baseline_level: int
+    cost_per_accepted: int
+    baseline_cost_per_accepted: int
+    justified: bool
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "level": self.level,
+            "baseline_level": self.baseline_level,
+            "cost_per_accepted_micros": self.cost_per_accepted,
+            "baseline_cost_per_accepted_micros": self.baseline_cost_per_accepted,
+            "justified": self.justified,
+            "reason": self.reason,
+        }
+
+
+def _cost_per_accepted(entry: LevelStats) -> int:
+    """Micro-USD per *accepted* call; 0 when nothing was accepted.
+
+    A rung with no accepted call has no price per result — it has an infinite
+    one.  Returning 0 would make it look free, so the caller treats 0 as
+    "unmeasurable" rather than "cheap".
+    """
+    if not entry.accepted:
+        return 0
+    return entry.cost_micros // entry.accepted
+
+
+def cost_rule(
+    table: Sequence[LevelStats],
+    *,
+    tolerance: float = COST_RULE_TOLERANCE,
+) -> list[CostVerdict]:
+    """Apply the cost rule to every rung above L1.
+
+    Each rung is compared with the highest rung below it that has an accepted
+    call — the rung it is actually an alternative to.  Comparing L3 with L1 when
+    L2 exists would flatter L3 by picking a weaker baseline.
+    """
+    verdicts: list[CostVerdict] = []
+    by_level = {entry.level: entry for entry in table}
+    for level in sorted(by_level):
+        if level <= 1:
+            continue
+        entry = by_level[level]
+        if not entry.calls:
+            continue
+        baseline: LevelStats | None = None
+        for lower in range(level - 1, 0, -1):
+            candidate = by_level.get(lower)
+            if candidate is not None and candidate.accepted:
+                baseline = candidate
+                break
+        if baseline is None:
+            continue
+        mine = _cost_per_accepted(entry)
+        theirs = _cost_per_accepted(baseline)
+        if not mine:
+            verdicts.append(CostVerdict(
+                level=level,
+                baseline_level=baseline.level,
+                cost_per_accepted=0,
+                baseline_cost_per_accepted=theirs,
+                justified=False,
+                reason=(
+                    f"{entry.name} produced no accepted result in {entry.calls} "
+                    f"call(s), so its cost per result is unbounded"
+                ),
+            ))
+            continue
+        if not theirs:
+            continue
+        ratio = mine / theirs
+        justified = ratio <= tolerance
+        verdicts.append(CostVerdict(
+            level=level,
+            baseline_level=baseline.level,
+            cost_per_accepted=mine,
+            baseline_cost_per_accepted=theirs,
+            justified=justified,
+            reason=(
+                f"{entry.name} costs {ratio:.2f}x {baseline.name} per accepted "
+                f"result ({mine} vs {theirs} micro-USD)"
+                + ("" if justified else " — the extra tokens were not paid for by "
+                   "extra acceptance")
+            ),
+        ))
+    return verdicts
