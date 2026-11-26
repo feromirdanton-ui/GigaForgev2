@@ -334,19 +334,66 @@ class SyncChatClient:
 
 # -- helpers ---------------------------------------------------------------
 def _coerce_provider(provider: Any) -> Any:
-    """Normalise a raw ``GigaClient`` (or a callable returning one) to a Provider."""
+    """Normalise a raw ``GigaClient`` (or a callable returning one) to a Provider.
+
+    **The defect this fixes.**  The class docstring promises that a raw
+    ``GigaClient`` is "wrapped into GigaChatProvider on the way in", and it was
+    not: the function checked only for ``chat`` and raised otherwise.  Measured
+    live: ``bench --live`` failed all five tasks with "provider must expose an
+    async chat(messages, *, model=...) coroutine; got GigaClient" — the one code
+    path that talks to the real provider was the one that could not be given it.
+    The offline bench passed because its fake client happens to expose ``chat``,
+    so the difference between the two providers was invisible to every test.
+
+    The synchronous client is accepted as well as the async one, because both
+    exist in this codebase and a caller has no reason to know which shape the
+    adapter wants.
+    """
     if provider is None:
         raise ValueError("SyncChatClient needs a provider, got None")
     if isinstance(provider, type):  # a factory was passed by mistake
         provider = provider()
-    if callable(provider) and not hasattr(provider, "chat"):
+    if callable(provider) and not (
+        hasattr(provider, "chat") or hasattr(provider, "complete")
+    ):
         provider = provider()
     if hasattr(provider, "chat"):
         return provider
+    # A synchronous client (``complete(messages, model=...)``) is a legitimate
+    # provider: adapt it rather than refusing it.
+    #
+    # The shim is used directly, not ``GigaChatProvider``: the provider wrapper
+    # assumes the client also exposes an async ``chat`` and calls it, so wrapping
+    # a client that has only ``complete`` moved the failure one layer down
+    # (measured: ``AttributeError: '_SyncClient' object has no attribute
+    # 'chat'``).  The adapter needs one method and the shim supplies exactly that
+    # one, from the method the client really has.
+    if hasattr(provider, "complete"):
+        return _SyncProviderShim(provider)
     raise TypeError(
-        "provider must expose an async chat(messages, *, model=...) coroutine; "
-        f"got {type(provider).__name__}"
+        "provider must expose an async chat(messages, *, model=...) coroutine, "
+        f"or a synchronous complete(...); got {type(provider).__name__}"
     )
+
+
+class _SyncProviderShim:
+    """A blocking ``complete``-only client presented with the provider protocol.
+
+    Used when :class:`GigaChatProvider` cannot be constructed around the client
+    (a client that is not a GigaChat client at all).  The adapter's only need is
+    ``chat``; this forwards to ``complete`` and returns the same value, so the
+    adapter's own normalisation still applies.
+    """
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    async def chat(self, messages: Any, **kwargs: Any) -> Any:
+        return self._client.complete(messages, **kwargs)
+
+    def capabilities(self) -> Any:
+        getter = getattr(self._client, "capabilities", None)
+        return getter() if callable(getter) else None
 
 
 def _as_message(message: Any) -> Dict[str, Any]:
