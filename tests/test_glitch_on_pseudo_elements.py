@@ -23,11 +23,12 @@ from __future__ import annotations
 
 import pytest
 
+from gigaforge.harness.browser_probe import chromium_available, unavailable_reason
 from gigaforge.harness.render_check import render_facts
 
 pytestmark = pytest.mark.skipif(
-    not __import__("importlib").util.find_spec("playwright"),
-    reason="playwright is not installed",
+    not chromium_available(),
+    reason=f"no launchable Chromium: {unavailable_reason()}",
 )
 
 

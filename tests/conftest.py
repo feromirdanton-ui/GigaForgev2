@@ -10,11 +10,31 @@ def _installed(name: str) -> bool:
     return importlib.util.find_spec(name) is not None
 
 
+def _chromium_launches() -> bool:
+    """True when Playwright *and* its Chromium build can actually start.
+
+    Delegates to :mod:`gigaforge.harness.browser_probe`, which launches the
+    browser once and caches the answer.  ``find_spec("playwright")`` answers a
+    different question than the one the tests need: the package installs
+    without a browser, so a guard built on it said "present" while
+    ``chromium.launch()`` raised ``Executable doesn't exist`` -- the tests
+    failed instead of skipping.
+    """
+    from gigaforge.harness.browser_probe import chromium_available
+
+    return chromium_available()
+
+
 #: True when the optional LangGraph extra is importable.
 HAS_LANGGRAPH = _installed("langgraph")
 
 #: True when the official GigaChat SDK is importable.
 HAS_GIGACHAT_SDK = _installed("gigachat")
+
+#: True when a real Chromium can be launched, not merely when the wheel is on
+#: disk.  Tests that render a page use this, so a missing browser binary skips
+#: them instead of failing them.
+HAS_BROWSER = _chromium_launches()
 
 #: Test modules that need the official ``gigachat`` SDK.
 _GIGACHAT_SDK_MODULES = frozenset(
